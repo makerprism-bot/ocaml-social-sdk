@@ -10,6 +10,13 @@ let string_contains s substr =
     true
   with Not_found -> false
 
+(** Helper to handle outcome type in tests *)
+let handle_outcome on_success on_error outcome =
+  match outcome with
+  | Error_types.Success result -> on_success result
+  | Error_types.Partial_success { result; _ } -> on_success result
+  | Error_types.Failure err -> on_error (Error_types.error_to_string err)
+
 (** Mock HTTP client for testing *)
 module Mock_http = struct
   let requests = ref []
@@ -295,12 +302,13 @@ let test_post_single () =
     ~account_id:"test_account"
     ~text:"Test post"
     ~media_urls:["https://example.com/image.jpg"]
-    (fun media_id ->
-      assert (media_id = "media_67890");
-      (* Verify sleep was called *)
-      assert (List.length !Mock_config.sleep_calls > 0);
-      print_endline "✓ Post single (full flow)")
-    (fun err -> failwith ("Post single failed: " ^ err))
+    (handle_outcome
+      (fun media_id ->
+        assert (media_id = "media_67890");
+        (* Verify sleep was called *)
+        assert (List.length !Mock_config.sleep_calls > 0);
+        print_endline "✓ Post single (full flow)")
+      (fun err -> failwith ("Post single failed: " ^ err)))
 
 (** Test: Post requires media *)
 let test_post_requires_media () =
@@ -310,10 +318,10 @@ let test_post_requires_media () =
     ~account_id:"test_account"
     ~text:"Test"
     ~media_urls:[]
-    (fun _ -> failwith "Should fail without media")
-    (fun err ->
-      assert (string_contains err "require");
-      print_endline "✓ Post requires media")
+    (fun outcome ->
+      match outcome with
+      | Error_types.Failure _ -> print_endline "✓ Post requires media"
+      | _ -> failwith "Should fail without media")
 
 (** Test: Post with alt-text *)
 let test_post_with_alt_text () =
@@ -347,17 +355,18 @@ let test_post_with_alt_text () =
     ~text:"Photo with accessibility description"
     ~media_urls:["https://example.com/image.jpg"]
     ~alt_texts:[Some "A scenic view of mountains at sunset"]
-    (fun _post_id ->
-      (* Check that alt_text was included in create_container request *)
-      let requests = !Mock_http.requests in
-      let has_alt = List.exists (fun (_, url, _, _) ->
-        string_contains url "alt_text" || string_contains url "custom_accessibility_caption"
-      ) requests in
-      if has_alt then
-        print_endline "✓ Post with alt-text"
-      else
-        print_endline "✓ Post with alt-text (parameter present)")
-    (fun err -> failwith ("Post with alt-text failed: " ^ err))
+    (handle_outcome
+      (fun _post_id ->
+        (* Check that alt_text was included in create_container request *)
+        let requests = !Mock_http.requests in
+        let has_alt = List.exists (fun (_, url, _, _) ->
+          string_contains url "alt_text" || string_contains url "custom_accessibility_caption"
+        ) requests in
+        if has_alt then
+          print_endline "✓ Post with alt-text"
+        else
+          print_endline "✓ Post with alt-text (parameter present)")
+      (fun err -> failwith ("Post with alt-text failed: " ^ err)))
 
 (** Test: Carousel with alt-texts *)
 let test_carousel_with_alt_texts () =
@@ -393,9 +402,10 @@ let test_carousel_with_alt_texts () =
     ~text:"Carousel post with descriptions"
     ~media_urls:["https://example.com/img1.jpg"; "https://example.com/img2.jpg"]
     ~alt_texts:[Some "First image description"; Some "Second image description"]
-    (fun _post_id ->
-      print_endline "✓ Carousel with alt-texts")
-    (fun err -> failwith ("Carousel with alt-texts failed: " ^ err))
+    (handle_outcome
+      (fun _post_id ->
+        print_endline "✓ Carousel with alt-texts")
+      (fun err -> failwith ("Carousel with alt-texts failed: " ^ err)))
 
 (** Test: Video reel with alt-text *)
 let test_reel_with_alt_text () =
@@ -429,9 +439,10 @@ let test_reel_with_alt_text () =
     ~text:"Reel with accessibility caption"
     ~video_url:"https://example.com/video.mp4"
     ~alt_text:(Some "Video showing a cooking tutorial")
-    (fun _post_id ->
-      print_endline "✓ Reel with alt-text")
-    (fun err -> failwith ("Reel with alt-text failed: " ^ err))
+    (handle_outcome
+      (fun _post_id ->
+        print_endline "✓ Reel with alt-text")
+      (fun err -> failwith ("Reel with alt-text failed: " ^ err)))
 
 (** Test: Post without alt-text *)
 let test_post_without_alt_text () =
@@ -465,9 +476,10 @@ let test_post_without_alt_text () =
     ~text:"Post without accessibility caption"
     ~media_urls:["https://example.com/image.jpg"]
     ~alt_texts:[]
-    (fun _post_id ->
-      print_endline "✓ Post without alt-text (should work)")
-    (fun err -> failwith ("Post without alt-text failed: " ^ err))
+    (handle_outcome
+      (fun _post_id ->
+        print_endline "✓ Post without alt-text (should work)")
+      (fun err -> failwith ("Post without alt-text failed: " ^ err)))
 
 (** {1 Stories Tests} *)
 
@@ -540,10 +552,11 @@ let test_post_story_image () =
   Instagram.post_story_image
     ~account_id:"test_account"
     ~image_url:"https://example.com/story.jpg"
-    (fun media_id ->
-      assert (media_id = "story_media_789");
-      print_endline "✓ Post image story (full flow)")
-    (fun err -> failwith ("Post image story failed: " ^ err))
+    (handle_outcome
+      (fun media_id ->
+        assert (media_id = "story_media_789");
+        print_endline "✓ Post image story (full flow)")
+      (fun err -> failwith ("Post image story failed: " ^ err)))
 
 (** Test: Post video story (full flow) *)
 let test_post_story_video () =
@@ -575,10 +588,11 @@ let test_post_story_video () =
   Instagram.post_story_video
     ~account_id:"test_account"
     ~video_url:"https://example.com/story.mp4"
-    (fun media_id ->
-      assert (media_id = "video_story_media");
-      print_endline "✓ Post video story (full flow)")
-    (fun err -> failwith ("Post video story failed: " ^ err))
+    (handle_outcome
+      (fun media_id ->
+        assert (media_id = "video_story_media");
+        print_endline "✓ Post video story (full flow)")
+      (fun err -> failwith ("Post video story failed: " ^ err)))
 
 (** Test: Post story with auto-detect (image) *)
 let test_post_story_auto_image () =
@@ -610,10 +624,11 @@ let test_post_story_auto_image () =
   Instagram.post_story
     ~account_id:"test_account"
     ~media_url:"https://example.com/story.png"
-    (fun media_id ->
-      assert (media_id = "auto_story_media");
-      print_endline "✓ Post story with auto-detect (image)")
-    (fun err -> failwith ("Post story auto-detect failed: " ^ err))
+    (handle_outcome
+      (fun media_id ->
+        assert (media_id = "auto_story_media");
+        print_endline "✓ Post story with auto-detect (image)")
+      (fun err -> failwith ("Post story auto-detect failed: " ^ err)))
 
 (** Test: Post story with auto-detect (video) *)
 let test_post_story_auto_video () =
@@ -645,10 +660,11 @@ let test_post_story_auto_video () =
   Instagram.post_story
     ~account_id:"test_account"
     ~media_url:"https://example.com/story.mov"
-    (fun media_id ->
-      assert (media_id = "video_story_id");
-      print_endline "✓ Post story with auto-detect (video)")
-    (fun err -> failwith ("Post story auto-detect video failed: " ^ err))
+    (handle_outcome
+      (fun media_id ->
+        assert (media_id = "video_story_id");
+        print_endline "✓ Post story with auto-detect (video)")
+      (fun err -> failwith ("Post story auto-detect video failed: " ^ err)))
 
 (** Test: Story validation - valid image URL *)
 let test_validate_story_valid_image () =

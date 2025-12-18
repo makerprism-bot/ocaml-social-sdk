@@ -421,6 +421,78 @@ end
 module Make (Config : CONFIG) = struct
   let graph_api_base = "https://graph.facebook.com/v21.0"
   
+  (** {1 Platform Constants} *)
+  
+  let max_caption_length = 2200
+  let max_carousel_items = 10
+  let max_hashtags = 30
+  let min_carousel_items = 2
+  
+  (** {1 Validation Functions} *)
+  
+  (** Validate a single post's content *)
+  let validate_post ~text ?(media_count=0) () =
+    let errors = ref [] in
+    
+    (* Check caption length *)
+    let text_len = String.length text in
+    if text_len > max_caption_length then
+      errors := Error_types.Text_too_long { length = text_len; max = max_caption_length } :: !errors;
+    
+    (* Count hashtags *)
+    let hashtag_count = 
+      let rec count_hashtags str pos acc =
+        try
+          let idx = String.index_from str pos '#' in
+          count_hashtags str (idx + 1) (acc + 1)
+        with Not_found -> acc
+      in
+      count_hashtags text 0 0
+    in
+    if hashtag_count > max_hashtags then
+      (* Reusing Too_many_media for hashtag limit - count/max fields work for this *)
+      errors := Error_types.Too_many_media { count = hashtag_count; max = max_hashtags } :: !errors;
+    
+    (* Check media requirement - Instagram requires at least one media item *)
+    if media_count = 0 then
+      errors := Error_types.Too_many_media { count = 0; max = 1 } :: !errors;
+    
+    (* Check carousel limits *)
+    if media_count > max_carousel_items then
+      errors := Error_types.Too_many_media { count = media_count; max = max_carousel_items } :: !errors;
+    
+    if !errors = [] then Ok ()
+    else Error (List.rev !errors)
+  
+  (** Validate thread content *)
+  let validate_thread ~texts ?(media_counts=[]) () =
+    if List.length texts = 0 then
+      Error [Error_types.Thread_empty]
+    else
+      let errors = ref [] in
+      List.iteri (fun i text ->
+        let media_count = 
+          try List.nth media_counts i 
+          with _ -> 0 
+        in
+        match validate_post ~text ~media_count () with
+        | Error post_errors ->
+            errors := Error_types.Thread_post_invalid { index = i; errors = post_errors } :: !errors
+        | Ok () -> ()
+      ) texts;
+      if !errors = [] then Ok ()
+      else Error (List.rev !errors)
+  
+  (** Validate media URLs *)
+  let validate_media ~media_urls =
+    let errors = ref [] in
+    List.iter (fun url ->
+      if not (String.starts_with ~prefix:"http://" url || String.starts_with ~prefix:"https://" url) then
+        errors := Error_types.Invalid_url url :: !errors
+    ) media_urls;
+    if !errors = [] then Ok ()
+    else Error (List.rev !errors)
+  
   (** {1 Rate Limiting} *)
   
   (** Parse X-App-Usage header *)
@@ -526,6 +598,58 @@ module Make (Config : CONFIG) = struct
     with _ ->
       (* Failed to parse JSON error - return raw response *)
       Printf.sprintf "Instagram API error (%d): %s" status_code response_body
+  
+  (** Parse API error response and return structured Error_types.error *)
+  let parse_api_error ~status_code ~response_body =
+    try
+      let json = Yojson.Basic.from_string response_body in
+      let open Yojson.Basic.Util in
+      let error_obj = json |> member "error" in
+      let error_code = 
+        try error_obj |> member "code" |> to_int
+        with _ -> 0
+      in
+      let error_message = 
+        try error_obj |> member "message" |> to_string
+        with _ -> response_body
+      in
+      
+      (* Map error codes to structured errors *)
+      match error_code with
+      (* Authentication errors *)
+      | 190 -> Error_types.Auth_error Error_types.Token_expired
+      | 102 -> Error_types.Auth_error Error_types.Token_invalid
+      
+      (* Rate limit errors *)
+      | 4 | 32 | 613 ->
+          Error_types.Rate_limited { 
+            retry_after_seconds = Some 300;  (* 5 minutes default *)
+            limit = Some 25;
+            remaining = Some 0;
+            reset_at = None;
+          }
+      
+      (* Permission errors *)
+      | 10 | 200 -> 
+          Error_types.Auth_error (Error_types.Insufficient_permissions ["instagram_content_publish"])
+      
+      (* Other API errors *)
+      | _ ->
+          Error_types.Api_error {
+            status_code;
+            message = error_message;
+            platform = Platform_types.Instagram;
+            raw_response = Some response_body;
+            request_id = None;
+          }
+    with _ ->
+      Error_types.Api_error {
+        status_code;
+        message = response_body;
+        platform = Platform_types.Instagram;
+        raw_response = Some response_body;
+        request_id = None;
+      }
   
   (** Check if token is expired or expiring soon *)
   let is_token_expired_buffer ~buffer_seconds expires_at_opt =
@@ -905,85 +1029,117 @@ module Make (Config : CONFIG) = struct
               on_error)
   
   (** Post to Instagram with two-step process *)
-  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_success on_error =
-    if List.length media_urls = 0 then
-      on_error "Instagram posts require at least one image or video"
-    else if List.length media_urls > 10 then
-      on_error "Instagram allows maximum 10 items in a carousel post"
-    else if List.length media_urls > 1 then
-      (* Carousel post with 2-10 items *)
-      ensure_valid_token ~account_id
-        (fun access_token ->
-          Config.get_ig_user_id ~account_id
-            (fun ig_user_id ->
-              (* Pair URLs with alt text *)
-              let media_urls_with_alt = List.mapi (fun i url ->
-                let alt_text = try List.nth alt_texts i with _ -> None in
-                (url, alt_text)
-              ) media_urls in
-              (* Step 1: Create child containers for each media item *)
-              create_carousel_children ~ig_user_id ~access_token ~media_urls_with_alt 
-                ~index:0 ~acc:[]
-                (fun children_ids ->
-                  (* Step 2: Create parent carousel container *)
-                  create_carousel_container ~ig_user_id ~access_token 
-                    ~children_ids ~caption:text
-                    (fun carousel_id ->
-                      (* Step 3: Poll carousel status and publish when ready *)
-                      poll_container_status ~container_id:carousel_id 
-                        ~access_token ~ig_user_id ~attempt:1 ~max_attempts:5 
-                        on_success on_error)
-                    on_error)
-                on_error)
-            on_error)
-        on_error
-    else
-      (* Single image or video post *)
-      ensure_valid_token ~account_id
-        (fun access_token ->
-          Config.get_ig_user_id ~account_id
-            (fun ig_user_id ->
-              let media_url = List.hd media_urls in
-              let media_type = detect_media_type media_url in
-              let alt_text = try List.nth alt_texts 0 with _ -> None in
-              
-              (* Step 1: Create container based on media type *)
-              (match media_type with
-              | "VIDEO" ->
-                  create_video_container ~ig_user_id ~access_token ~video_url:media_url 
-                    ~caption:text ~alt_text ~media_type:"VIDEO" ~is_carousel_item:false
-                    (fun container_id ->
-                      (* Step 2: Poll container status and publish when ready *)
-                      poll_container_status ~container_id ~access_token ~ig_user_id 
-                        ~attempt:1 ~max_attempts:5 on_success on_error)
-                    on_error
-              | _ ->
-                  create_image_container ~ig_user_id ~access_token ~image_url:media_url 
-                    ~caption:text ~alt_text ~is_carousel_item:false
-                    (fun container_id ->
-                      (* Step 2: Poll container status and publish when ready *)
-                      poll_container_status ~container_id ~access_token ~ig_user_id 
-                        ~attempt:1 ~max_attempts:5 on_success on_error)
-                    on_error))
-            on_error)
-        on_error
+  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_result =
+    let media_count = List.length media_urls in
+    
+    (* Validate content first - includes media count check *)
+    match validate_post ~text ~media_count () with
+    | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        (* Validate media URLs are accessible *)
+        match validate_media ~media_urls with
+        | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+        | Ok () ->
+            if media_count > 1 then
+              (* Carousel post with 2-10 items *)
+              ensure_valid_token ~account_id
+                (fun access_token ->
+                  Config.get_ig_user_id ~account_id
+                    (fun ig_user_id ->
+                      (* Pair URLs with alt text *)
+                      let media_urls_with_alt = List.mapi (fun i url ->
+                        let alt_text = try List.nth alt_texts i with _ -> None in
+                        (url, alt_text)
+                      ) media_urls in
+                      (* Step 1: Create child containers for each media item *)
+                      create_carousel_children ~ig_user_id ~access_token ~media_urls_with_alt 
+                        ~index:0 ~acc:[]
+                        (fun children_ids ->
+                          (* Step 2: Create parent carousel container *)
+                          create_carousel_container ~ig_user_id ~access_token 
+                            ~children_ids ~caption:text
+                            (fun carousel_id ->
+                              (* Step 3: Poll carousel status and publish when ready *)
+                              poll_container_status ~container_id:carousel_id 
+                                ~access_token ~ig_user_id ~attempt:1 ~max_attempts:5 
+                                (fun media_id -> on_result (Error_types.Success media_id))
+                                (fun err -> on_result (Error_types.Failure 
+                                  (Error_types.Internal_error err))))
+                            (fun err -> on_result (Error_types.Failure 
+                              (Error_types.Internal_error err))))
+                        (fun err -> on_result (Error_types.Failure 
+                          (Error_types.Internal_error err))))
+                    (fun err -> on_result (Error_types.Failure 
+                      (Error_types.Internal_error err))))
+                (fun err -> on_result (Error_types.Failure 
+                  (Error_types.Auth_error (Error_types.Refresh_failed err))))
+            else
+              (* Single image or video post *)
+              ensure_valid_token ~account_id
+                (fun access_token ->
+                  Config.get_ig_user_id ~account_id
+                    (fun ig_user_id ->
+                      let media_url = List.hd media_urls in
+                      let media_type = detect_media_type media_url in
+                      let alt_text = try List.nth alt_texts 0 with _ -> None in
+                      
+                      (* Step 1: Create container based on media type *)
+                      (match media_type with
+                      | "VIDEO" ->
+                          create_video_container ~ig_user_id ~access_token ~video_url:media_url 
+                            ~caption:text ~alt_text ~media_type:"VIDEO" ~is_carousel_item:false
+                            (fun container_id ->
+                              (* Step 2: Poll container status and publish when ready *)
+                              poll_container_status ~container_id ~access_token ~ig_user_id 
+                                ~attempt:1 ~max_attempts:5 
+                                (fun media_id -> on_result (Error_types.Success media_id))
+                                (fun err -> on_result (Error_types.Failure 
+                                  (Error_types.Internal_error err))))
+                            (fun err -> on_result (Error_types.Failure 
+                              (Error_types.Internal_error err)))
+                      | _ ->
+                          create_image_container ~ig_user_id ~access_token ~image_url:media_url 
+                            ~caption:text ~alt_text ~is_carousel_item:false
+                            (fun container_id ->
+                              (* Step 2: Poll container status and publish when ready *)
+                              poll_container_status ~container_id ~access_token ~ig_user_id 
+                                ~attempt:1 ~max_attempts:5 
+                                (fun media_id -> on_result (Error_types.Success media_id))
+                                (fun err -> on_result (Error_types.Failure 
+                                  (Error_types.Internal_error err))))
+                            (fun err -> on_result (Error_types.Failure 
+                              (Error_types.Internal_error err)))))
+                    (fun err -> on_result (Error_types.Failure 
+                      (Error_types.Internal_error err))))
+                (fun err -> on_result (Error_types.Failure 
+                  (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Post Reel (short-form video) *)
-  let post_reel ~account_id ~text ~video_url ?(alt_text=None) on_success on_error =
-    ensure_valid_token ~account_id
-      (fun access_token ->
-        Config.get_ig_user_id ~account_id
-          (fun ig_user_id ->
-            (* Create Reel container with REELS media type *)
-            create_video_container ~ig_user_id ~access_token ~video_url 
-              ~caption:text ~alt_text ~media_type:"REELS" ~is_carousel_item:false
-              (fun container_id ->
-                (* Poll and publish *)
-                poll_container_status ~container_id ~access_token ~ig_user_id 
-                  ~attempt:1 ~max_attempts:5 on_success on_error)
-              on_error)
-          on_error)
-      on_error
+  let post_reel ~account_id ~text ~video_url ?(alt_text=None) on_result =
+    (* Validate caption *)
+    match validate_post ~text ~media_count:1 () with
+    | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        ensure_valid_token ~account_id
+          (fun access_token ->
+            Config.get_ig_user_id ~account_id
+              (fun ig_user_id ->
+                (* Create Reel container with REELS media type *)
+                create_video_container ~ig_user_id ~access_token ~video_url 
+                  ~caption:text ~alt_text ~media_type:"REELS" ~is_carousel_item:false
+                  (fun container_id ->
+                    (* Poll and publish *)
+                    poll_container_status ~container_id ~access_token ~ig_user_id 
+                      ~attempt:1 ~max_attempts:5 
+                      (fun media_id -> on_result (Error_types.Success media_id))
+                      (fun err -> on_result (Error_types.Failure 
+                        (Error_types.Internal_error err))))
+                  (fun err -> on_result (Error_types.Failure 
+                    (Error_types.Internal_error err))))
+              (fun err -> on_result (Error_types.Failure 
+                (Error_types.Internal_error err))))
+          (fun err -> on_result (Error_types.Failure 
+            (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** {1 Instagram Stories} *)
   
@@ -1093,10 +1249,9 @@ module Make (Config : CONFIG) = struct
       
       @param account_id Internal account identifier
       @param image_url Publicly accessible URL of the image
-      @param on_success Continuation receiving the media ID
-      @param on_error Continuation receiving error message
+      @param on_result Continuation receiving outcome with media ID
   *)
-  let post_story_image ~account_id ~image_url on_success on_error =
+  let post_story_image ~account_id ~image_url on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         Config.get_ig_user_id ~account_id
@@ -1106,10 +1261,16 @@ module Make (Config : CONFIG) = struct
               (fun container_id ->
                 (* Poll and publish *)
                 poll_container_status ~container_id ~access_token ~ig_user_id 
-                  ~attempt:1 ~max_attempts:5 on_success on_error)
-              on_error)
-          on_error)
-      on_error
+                  ~attempt:1 ~max_attempts:5 
+                  (fun media_id -> on_result (Error_types.Success media_id))
+                  (fun err -> on_result (Error_types.Failure 
+                    (Error_types.Internal_error err))))
+              (fun err -> on_result (Error_types.Failure 
+                (Error_types.Internal_error err))))
+          (fun err -> on_result (Error_types.Failure 
+            (Error_types.Internal_error err))))
+      (fun err -> on_result (Error_types.Failure 
+        (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Post video story to Instagram
       
@@ -1126,10 +1287,9 @@ module Make (Config : CONFIG) = struct
       
       @param account_id Internal account identifier
       @param video_url Publicly accessible URL of the video
-      @param on_success Continuation receiving the media ID
-      @param on_error Continuation receiving error message
+      @param on_result Continuation receiving outcome with media ID
   *)
-  let post_story_video ~account_id ~video_url on_success on_error =
+  let post_story_video ~account_id ~video_url on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         Config.get_ig_user_id ~account_id
@@ -1139,10 +1299,16 @@ module Make (Config : CONFIG) = struct
               (fun container_id ->
                 (* Poll and publish - videos need more time to process *)
                 poll_container_status ~container_id ~access_token ~ig_user_id 
-                  ~attempt:1 ~max_attempts:10 on_success on_error)
-              on_error)
-          on_error)
-      on_error
+                  ~attempt:1 ~max_attempts:10 
+                  (fun media_id -> on_result (Error_types.Success media_id))
+                  (fun err -> on_result (Error_types.Failure 
+                    (Error_types.Internal_error err))))
+              (fun err -> on_result (Error_types.Failure 
+                (Error_types.Internal_error err))))
+          (fun err -> on_result (Error_types.Failure 
+            (Error_types.Internal_error err))))
+      (fun err -> on_result (Error_types.Failure 
+        (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Post story to Instagram (auto-detect media type)
       
@@ -1151,14 +1317,13 @@ module Make (Config : CONFIG) = struct
       
       @param account_id Internal account identifier
       @param media_url Publicly accessible URL of the image or video
-      @param on_success Continuation receiving the media ID
-      @param on_error Continuation receiving error message
+      @param on_result Continuation receiving outcome with media ID
   *)
-  let post_story ~account_id ~media_url on_success on_error =
+  let post_story ~account_id ~media_url on_result =
     let media_type = detect_media_type media_url in
     match media_type with
-    | "VIDEO" -> post_story_video ~account_id ~video_url:media_url on_success on_error
-    | _ -> post_story_image ~account_id ~image_url:media_url on_success on_error
+    | "VIDEO" -> post_story_video ~account_id ~video_url:media_url on_result
+    | _ -> post_story_image ~account_id ~image_url:media_url on_result
   
   (** Validate story media
       
@@ -1181,17 +1346,49 @@ module Make (Config : CONFIG) = struct
       else
         Ok ()
   
-  (** Post thread (Instagram doesn't support threads, posts only first item) *)
-  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_success on_error =
+  (** Post thread (Instagram doesn't support threads, posts only first item with warning) *)
+  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_result =
     if List.length texts = 0 then
-      on_error "No content to post"
+      on_result (Error_types.Failure (Error_types.Validation_error [Error_types.Thread_empty]))
     else
       let first_text = List.hd texts in
       let first_media = if List.length media_urls_per_post > 0 then List.hd media_urls_per_post else [] in
       let first_alt_texts = if List.length alt_texts_per_post > 0 then List.hd alt_texts_per_post else [] in
+      let total_posts = List.length texts in
+      
       post_single ~account_id ~text:first_text ~media_urls:first_media ~alt_texts:first_alt_texts
-        (fun post_id -> on_success [post_id])
-        on_error
+        (fun outcome ->
+          match outcome with
+          | Error_types.Success post_id ->
+              let thread_result = {
+                Error_types.posted_ids = [post_id];
+                failed_at_index = None;
+                total_requested = total_posts;
+              } in
+              if total_posts > 1 then
+                (* Warn that only first post was published *)
+                on_result (Error_types.Partial_success {
+                  result = thread_result;
+                  warnings = [Error_types.Enrichment_skipped 
+                    "Instagram does not support threads - only the first post was published"];
+                })
+              else
+                on_result (Error_types.Success thread_result)
+          | Error_types.Partial_success { result = post_id; warnings } ->
+              let thread_result = {
+                Error_types.posted_ids = [post_id];
+                failed_at_index = None;
+                total_requested = total_posts;
+              } in
+              let all_warnings = 
+                if total_posts > 1 then
+                  Error_types.Enrichment_skipped 
+                    "Instagram does not support threads - only the first post was published" :: warnings
+                else warnings
+              in
+              on_result (Error_types.Partial_success { result = thread_result; warnings = all_warnings })
+          | Error_types.Failure err ->
+              on_result (Error_types.Failure err))
   
   (** OAuth authorization URL *)
   let get_oauth_url ~redirect_uri ~state on_success on_error =

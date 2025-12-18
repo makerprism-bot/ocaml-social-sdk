@@ -10,6 +10,13 @@ let string_contains s substr =
     true
   with Not_found -> false
 
+(** Helper to handle outcome type in tests *)
+let handle_outcome on_success on_error outcome =
+  match outcome with
+  | Error_types.Success result -> on_success result
+  | Error_types.Partial_success { result; _ } -> on_success result
+  | Error_types.Failure err -> on_error (Error_types.error_to_string err)
+
 (** Mock HTTP client for testing *)
 module Mock_http = struct
   let requests = ref []
@@ -690,9 +697,10 @@ let test_post_with_alt_text () =
     ~text:"Check out this photo!"
     ~media_urls:["https://example.com/image.jpg"]
     ~alt_texts:[Some "Descriptive alt text for accessibility"]
-    (fun _post_id ->
-      print_endline "✓ Post with single image and alt-text")
-    (fun err -> failwith ("Post with alt-text failed: " ^ err))
+    (handle_outcome
+      (fun _post_id ->
+        print_endline "✓ Post with single image and alt-text")
+      (fun err -> failwith ("Post with alt-text failed: " ^ err)))
 
 (** Test: Post with multiple images and alt-texts *)
 let test_post_with_multiple_alt_texts () =
@@ -728,9 +736,10 @@ let test_post_with_multiple_alt_texts () =
     ~text:"Multiple photos with descriptions"
     ~media_urls:["https://example.com/img1.jpg"; "https://example.com/img2.jpg"]
     ~alt_texts:[Some "First image description"; Some "Second image description"]
-    (fun _post_id ->
-      print_endline "✓ Post with multiple images and alt-texts")
-    (fun err -> failwith ("Post with multiple alt-texts failed: " ^ err))
+    (handle_outcome
+      (fun _post_id ->
+        print_endline "✓ Post with multiple images and alt-texts")
+      (fun err -> failwith ("Post with multiple alt-texts failed: " ^ err)))
 
 (** Test: Post without alt-text *)
 let test_post_without_alt_text () =
@@ -764,9 +773,10 @@ let test_post_without_alt_text () =
     ~text:"Photo without description"
     ~media_urls:["https://example.com/image.jpg"]
     ~alt_texts:[]
-    (fun _post_id ->
-      print_endline "✓ Post without alt-text")
-    (fun err -> failwith ("Post without alt-text failed: " ^ err))
+    (handle_outcome
+      (fun _post_id ->
+        print_endline "✓ Post without alt-text")
+      (fun err -> failwith ("Post without alt-text failed: " ^ err)))
 
 (** Test: Alt-text with special characters *)
 let test_alt_text_special_characters () =
@@ -822,9 +832,10 @@ let test_partial_alt_texts () =
     ~text:"Three images, two alt-texts"
     ~media_urls:["https://example.com/img1.jpg"; "https://example.com/img2.jpg"; "https://example.com/img3.jpg"]
     ~alt_texts:[Some "First image"; Some "Second image"]
-    (fun _post_id ->
-      print_endline "✓ Post with partial alt-texts (3 images, 2 alt-texts)")
-    (fun err -> failwith ("Post with partial alt-texts failed: " ^ err))
+    (handle_outcome
+      (fun _post_id ->
+        print_endline "✓ Post with partial alt-texts (3 images, 2 alt-texts)")
+      (fun err -> failwith ("Post with partial alt-texts failed: " ^ err)))
 
 (** {1 Stories Tests} *)
 
@@ -907,10 +918,11 @@ let test_post_story_photo () =
   Facebook.post_story_photo
     ~account_id:"test_account"
     ~image_url:"https://example.com/story.jpg"
-    (fun story_id ->
-      assert (story_id = "photo_story_abc");
-      print_endline "✓ Post photo story (high-level)")
-    (fun err -> failwith ("Post photo story failed: " ^ err))
+    (handle_outcome
+      (fun story_id ->
+        assert (story_id = "photo_story_abc");
+        print_endline "✓ Post photo story (high-level)")
+      (fun err -> failwith ("Post photo story failed: " ^ err)))
 
 (** Test: Post video story (high-level) *)
 let test_post_story_video () =
@@ -943,10 +955,11 @@ let test_post_story_video () =
   Facebook.post_story_video
     ~account_id:"test_account"
     ~video_url:"https://example.com/story.mp4"
-    (fun story_id ->
-      assert (story_id = "video_story_xyz");
-      print_endline "✓ Post video story (high-level)")
-    (fun err -> failwith ("Post video story failed: " ^ err))
+    (handle_outcome
+      (fun story_id ->
+        assert (story_id = "video_story_xyz");
+        print_endline "✓ Post video story (high-level)")
+      (fun err -> failwith ("Post video story failed: " ^ err)))
 
 (** Test: Post story with auto-detect (image) *)
 let test_post_story_auto_image () =
@@ -977,10 +990,11 @@ let test_post_story_auto_image () =
   Facebook.post_story
     ~account_id:"test_account"
     ~media_url:"https://example.com/story.png"
-    (fun story_id ->
-      assert (story_id = "auto_story_img");
-      print_endline "✓ Post story with auto-detect (image)")
-    (fun err -> failwith ("Post story auto-detect failed: " ^ err))
+    (handle_outcome
+      (fun story_id ->
+        assert (story_id = "auto_story_img");
+        print_endline "✓ Post story with auto-detect (image)")
+      (fun err -> failwith ("Post story auto-detect failed: " ^ err)))
 
 (** Test: Post story with auto-detect (video) *)
 let test_post_story_auto_video () =
@@ -1013,10 +1027,11 @@ let test_post_story_auto_video () =
   Facebook.post_story
     ~account_id:"test_account"
     ~media_url:"https://example.com/story.mov"
-    (fun story_id ->
-      assert (story_id = "auto_story_vid");
-      print_endline "✓ Post story with auto-detect (video)")
-    (fun err -> failwith ("Post story auto-detect video failed: " ^ err))
+    (handle_outcome
+      (fun story_id ->
+        assert (story_id = "auto_story_vid");
+        print_endline "✓ Post story with auto-detect (video)")
+      (fun err -> failwith ("Post story auto-detect video failed: " ^ err)))
 
 (** Test: Story validation - valid image URL *)
 let test_validate_story_valid_image () =

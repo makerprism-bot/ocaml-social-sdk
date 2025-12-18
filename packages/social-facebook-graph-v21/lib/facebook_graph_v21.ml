@@ -362,6 +362,59 @@ end
 module Make (Config : CONFIG) = struct
   let graph_api_base = "https://graph.facebook.com/v21.0"
   
+  (** {1 Platform Constants} *)
+  
+  let max_post_length = 63206  (* Facebook's actual limit *)
+  let recommended_post_length = 5000  (* Recommended for engagement *)
+  let max_photos_per_post = 10
+  
+  (** {1 Validation Functions} *)
+  
+  (** Validate a single post's content *)
+  let validate_post ~text ?(media_count=0) () =
+    let errors = ref [] in
+    
+    (* Check text length *)
+    let text_len = String.length text in
+    if text_len > max_post_length then
+      errors := Error_types.Text_too_long { length = text_len; max = max_post_length } :: !errors;
+    
+    (* Check media count *)
+    if media_count > max_photos_per_post then
+      errors := Error_types.Too_many_media { count = media_count; max = max_photos_per_post } :: !errors;
+    
+    if !errors = [] then Ok ()
+    else Error (List.rev !errors)
+  
+  (** Validate thread content *)
+  let validate_thread ~texts ?(media_counts=[]) () =
+    if List.length texts = 0 then
+      Error [Error_types.Thread_empty]
+    else
+      let errors = ref [] in
+      List.iteri (fun i text ->
+        let media_count = 
+          try List.nth media_counts i 
+          with _ -> 0 
+        in
+        match validate_post ~text ~media_count () with
+        | Error post_errors ->
+            errors := Error_types.Thread_post_invalid { index = i; errors = post_errors } :: !errors
+        | Ok () -> ()
+      ) texts;
+      if !errors = [] then Ok ()
+      else Error (List.rev !errors)
+  
+  (** Validate media URLs *)
+  let validate_media ~media_urls =
+    let errors = ref [] in
+    List.iter (fun url ->
+      if not (String.starts_with ~prefix:"http://" url || String.starts_with ~prefix:"https://" url) then
+        errors := Error_types.Invalid_url url :: !errors
+    ) media_urls;
+    if !errors = [] then Ok ()
+    else Error (List.rev !errors)
+  
   (** {1 Error Handling} *)
   
   (** Parse Facebook error code into typed variant *)
@@ -409,6 +462,40 @@ module Make (Config : CONFIG) = struct
         retry_after_seconds = get_retry_delay code;
       }
     with _ -> None
+  
+  (** Parse API error response and return structured Error_types.error *)
+  let parse_api_error ~status_code ~response_body =
+    match parse_facebook_error response_body with
+    | Some fb_err ->
+        (match fb_err.code with
+        | Invalid_token -> Error_types.Auth_error Error_types.Token_expired
+        | Rate_limit_exceeded ->
+            Error_types.Rate_limited { 
+              retry_after_seconds = fb_err.retry_after_seconds;
+              limit = None;
+              remaining = Some 0;
+              reset_at = None;
+            }
+        | Permission_denied -> 
+            Error_types.Auth_error (Error_types.Insufficient_permissions ["pages_manage_posts"])
+        | Duplicate_post ->
+            Error_types.Duplicate_content
+        | _ ->
+            Error_types.Api_error {
+              status_code;
+              message = fb_err.message;
+              platform = Platform_types.FacebookPage;
+              raw_response = Some response_body;
+              request_id = fb_err.fbtrace_id;
+            })
+    | None ->
+        Error_types.Api_error {
+          status_code;
+          message = response_body;
+          platform = Platform_types.FacebookPage;
+          raw_response = Some response_body;
+          request_id = None;
+        }
   
   (** {1 Rate Limiting} *)
   
@@ -749,15 +836,21 @@ module Make (Config : CONFIG) = struct
       on_error
   
   (** Post Reel (short-form video) to Facebook Page *)
-  let post_reel ~account_id ~text ~video_url on_success on_error =
-    ensure_valid_token ~account_id
-      (fun page_access_token ->
-        Config.get_page_id ~account_id
-          (fun page_id ->
-            upload_video_reel ~page_id ~page_access_token ~video_url ~description:text
-              on_success on_error)
-          on_error)
-      on_error
+  let post_reel ~account_id ~text ~video_url on_result =
+    (* Validate caption *)
+    match validate_post ~text ~media_count:1 () with
+    | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        ensure_valid_token ~account_id
+          (fun page_access_token ->
+            Config.get_page_id ~account_id
+              (fun page_id ->
+                upload_video_reel ~page_id ~page_access_token ~video_url ~description:text
+                  (fun video_id -> on_result (Error_types.Success video_id))
+                  (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+              (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+          (fun err -> on_result (Error_types.Failure 
+            (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** {1 Facebook Page Stories} *)
   
@@ -967,35 +1060,37 @@ module Make (Config : CONFIG) = struct
       
       @param account_id Internal account identifier
       @param image_url Publicly accessible URL of the image
-      @param on_success Continuation receiving the story ID
-      @param on_error Continuation receiving error message
+      @param on_result Continuation receiving outcome with story ID
   *)
-  let post_story_photo ~account_id ~image_url on_success on_error =
+  let post_story_photo ~account_id ~image_url on_result =
     ensure_valid_token ~account_id
       (fun page_access_token ->
         Config.get_page_id ~account_id
           (fun page_id ->
             upload_photo_story ~page_id ~page_access_token ~image_url
-              on_success on_error)
-          on_error)
-      on_error
+              (fun story_id -> on_result (Error_types.Success story_id))
+              (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+          (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+      (fun err -> on_result (Error_types.Failure 
+        (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Post video story to Facebook Page (high-level)
       
       @param account_id Internal account identifier
       @param video_url Publicly accessible URL of the video
-      @param on_success Continuation receiving the story ID
-      @param on_error Continuation receiving error message
+      @param on_result Continuation receiving outcome with story ID
   *)
-  let post_story_video ~account_id ~video_url on_success on_error =
+  let post_story_video ~account_id ~video_url on_result =
     ensure_valid_token ~account_id
       (fun page_access_token ->
         Config.get_page_id ~account_id
           (fun page_id ->
             upload_video_story ~page_id ~page_access_token ~video_url
-              on_success on_error)
-          on_error)
-      on_error
+              (fun story_id -> on_result (Error_types.Success story_id))
+              (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+          (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+      (fun err -> on_result (Error_types.Failure 
+        (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Detect media type from URL extension *)
   let detect_media_type url =
@@ -1014,14 +1109,13 @@ module Make (Config : CONFIG) = struct
       
       @param account_id Internal account identifier
       @param media_url Publicly accessible URL of the image or video
-      @param on_success Continuation receiving the story ID
-      @param on_error Continuation receiving error message
+      @param on_result Continuation receiving outcome with story ID
   *)
-  let post_story ~account_id ~media_url on_success on_error =
+  let post_story ~account_id ~media_url on_result =
     let media_type = detect_media_type media_url in
     match media_type with
-    | "VIDEO" -> post_story_video ~account_id ~video_url:media_url on_success on_error
-    | _ -> post_story_photo ~account_id ~image_url:media_url on_success on_error
+    | "VIDEO" -> post_story_video ~account_id ~video_url:media_url on_result
+    | _ -> post_story_photo ~account_id ~image_url:media_url on_result
   
   (** Validate story media
       
@@ -1045,95 +1139,128 @@ module Make (Config : CONFIG) = struct
         Ok ()
   
   (** Post to Facebook Page *)
-  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_success on_error =
-    ensure_valid_token ~account_id
-      (fun page_access_token ->
-        Config.get_page_id ~account_id
-          (fun page_id ->
-            (* Upload all photos first *)
-            let rec upload_all_photos urls_with_alt acc on_complete =
-              match urls_with_alt with
-              | [] -> on_complete (List.rev acc)
-              | (url, alt_text) :: rest ->
-                  upload_photo ~page_id ~page_access_token ~image_url:url ~alt_text
-                    (fun photo_id -> upload_all_photos rest (photo_id :: acc) on_complete)
-                    on_error
-            in
-            
-            (* Pair URLs with alt text - use None if alt text list is shorter *)
-            let urls_with_alt = List.mapi (fun i url ->
-              let alt_text = try List.nth alt_texts i with _ -> None in
-              (url, alt_text)
-            ) media_urls in
-            
-            upload_all_photos urls_with_alt [] (fun photo_ids ->
-              (* Create Facebook Page post *)
-              let url = Printf.sprintf "%s/%s/feed" graph_api_base page_id in
-              
-              let params = 
-                [
-                  ("message", [text]);
-                ] @
-                (if List.length photo_ids > 0 then
-                  [("attached_media", [
-                    Yojson.Basic.to_string (`List (List.map (fun photo_id ->
-                      `Assoc [("media_fbid", `String photo_id)]
-                    ) photo_ids))
-                  ])]
-                else []) @
-                (* Add app secret proof *)
-                (match compute_app_secret_proof ~access_token:page_access_token with
-                 | Some proof -> [("appsecret_proof", [proof])]
-                 | None -> [])
-              in
-              
-              let body = Uri.encoded_of_query params in
-              let headers = [
-                ("Content-Type", "application/x-www-form-urlencoded");
-                ("Authorization", Printf.sprintf "Bearer %s" page_access_token);
-              ] in
-              
-              Config.Http.post ~headers ~body url
-                (fun response ->
-                  update_rate_limits response;
-                  if response.status >= 200 && response.status < 300 then
-                    try
-                      let open Yojson.Basic.Util in
-                      let json = Yojson.Basic.from_string response.body in
-                      let post_id = json |> member "id" |> to_string in
-                      on_success post_id
-                    with _e ->
-                      (* Post succeeded but couldn't parse ID *)
-                      on_success "unknown"
-                  else
-                    match parse_facebook_error response.body with
-                    | Some err ->
-                        let msg = Printf.sprintf "Post failed (%s): %s%s"
-                          err.error_type err.message
-                          (if err.should_retry then 
-                            match err.retry_after_seconds with
-                            | Some delay -> Printf.sprintf " (retry after %d seconds)" delay
-                            | None -> " (retry recommended)"
-                          else "")
+  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_result =
+    let media_count = List.length media_urls in
+    
+    (* Validate content first *)
+    match validate_post ~text ~media_count () with
+    | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        (* Validate media URLs *)
+        match validate_media ~media_urls with
+        | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+        | Ok () ->
+            ensure_valid_token ~account_id
+              (fun page_access_token ->
+                Config.get_page_id ~account_id
+                  (fun page_id ->
+                    (* Upload all photos first *)
+                    let rec upload_all_photos urls_with_alt acc on_complete on_upload_error =
+                      match urls_with_alt with
+                      | [] -> on_complete (List.rev acc)
+                      | (url, alt_text) :: rest ->
+                          upload_photo ~page_id ~page_access_token ~image_url:url ~alt_text
+                            (fun photo_id -> upload_all_photos rest (photo_id :: acc) on_complete on_upload_error)
+                            on_upload_error
+                    in
+                    
+                    (* Pair URLs with alt text - use None if alt text list is shorter *)
+                    let urls_with_alt = List.mapi (fun i url ->
+                      let alt_text = try List.nth alt_texts i with _ -> None in
+                      (url, alt_text)
+                    ) media_urls in
+                    
+                    upload_all_photos urls_with_alt [] 
+                      (fun photo_ids ->
+                        (* Create Facebook Page post *)
+                        let url = Printf.sprintf "%s/%s/feed" graph_api_base page_id in
+                        
+                        let params = 
+                          [
+                            ("message", [text]);
+                          ] @
+                          (if List.length photo_ids > 0 then
+                            [("attached_media", [
+                              Yojson.Basic.to_string (`List (List.map (fun photo_id ->
+                                `Assoc [("media_fbid", `String photo_id)]
+                              ) photo_ids))
+                            ])]
+                          else []) @
+                          (* Add app secret proof *)
+                          (match compute_app_secret_proof ~access_token:page_access_token with
+                           | Some proof -> [("appsecret_proof", [proof])]
+                           | None -> [])
                         in
-                        on_error msg
-                    | None ->
-                        on_error (Printf.sprintf "Facebook API error (%d): %s" response.status response.body))
-                on_error))
-          on_error)
-      on_error
+                        
+                        let body = Uri.encoded_of_query params in
+                        let headers = [
+                          ("Content-Type", "application/x-www-form-urlencoded");
+                          ("Authorization", Printf.sprintf "Bearer %s" page_access_token);
+                        ] in
+                        
+                        Config.Http.post ~headers ~body url
+                          (fun response ->
+                            update_rate_limits response;
+                            if response.status >= 200 && response.status < 300 then
+                              try
+                                let open Yojson.Basic.Util in
+                                let json = Yojson.Basic.from_string response.body in
+                                let post_id = json |> member "id" |> to_string in
+                                on_result (Error_types.Success post_id)
+                              with _e ->
+                                (* Post succeeded but couldn't parse ID *)
+                                on_result (Error_types.Success "unknown")
+                            else
+                              on_result (Error_types.Failure 
+                                (parse_api_error ~status_code:response.status ~response_body:response.body)))
+                          (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+                      (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+                  (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+              (fun err -> on_result (Error_types.Failure 
+                (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
-  (** Post thread (Facebook doesn't support threads, posts only first item) *)
-  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_success on_error =
+  (** Post thread (Facebook doesn't support threads, posts only first item with warning) *)
+  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_result =
     if List.length texts = 0 then
-      on_error "No content to post"
+      on_result (Error_types.Failure (Error_types.Validation_error [Error_types.Thread_empty]))
     else
       let first_text = List.hd texts in
       let first_media = if List.length media_urls_per_post > 0 then List.hd media_urls_per_post else [] in
       let first_alt_texts = if List.length alt_texts_per_post > 0 then List.hd alt_texts_per_post else [] in
+      let total_posts = List.length texts in
+      
       post_single ~account_id ~text:first_text ~media_urls:first_media ~alt_texts:first_alt_texts
-        (fun post_id -> on_success [post_id])
-        on_error
+        (fun outcome ->
+          match outcome with
+          | Error_types.Success post_id ->
+              let thread_result = {
+                Error_types.posted_ids = [post_id];
+                failed_at_index = None;
+                total_requested = total_posts;
+              } in
+              if total_posts > 1 then
+                on_result (Error_types.Partial_success {
+                  result = thread_result;
+                  warnings = [Error_types.Enrichment_skipped 
+                    "Facebook does not support threads - only the first post was published"];
+                })
+              else
+                on_result (Error_types.Success thread_result)
+          | Error_types.Partial_success { result = post_id; warnings } ->
+              let thread_result = {
+                Error_types.posted_ids = [post_id];
+                failed_at_index = None;
+                total_requested = total_posts;
+              } in
+              let all_warnings = 
+                if total_posts > 1 then
+                  Error_types.Enrichment_skipped 
+                    "Facebook does not support threads - only the first post was published" :: warnings
+                else warnings
+              in
+              on_result (Error_types.Partial_success { result = thread_result; warnings = all_warnings })
+          | Error_types.Failure err ->
+              on_result (Error_types.Failure err))
   
   (** OAuth authorization URL *)
   let get_oauth_url ~redirect_uri ~state on_success on_error =

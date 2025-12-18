@@ -9,4 +9,5 @@
   base64
   uri
   ptime
-  ptime.clock.os))
+  ptime.clock.os
+  str))

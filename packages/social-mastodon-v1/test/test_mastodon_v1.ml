@@ -1,11 +1,27 @@
 (** Tests for Mastodon API v1/v2 Provider *)
 
+open Social_core
+
 (** Helper function to check if string contains substring *)
 let string_contains s sub =
   try
     let _ = Str.search_forward (Str.regexp_string sub) s 0 in
     true
   with Not_found -> false
+
+(** Helper to handle outcome type for tests - converts to legacy on_success/on_error *)
+let handle_outcome on_success on_error outcome =
+  match outcome with
+  | Error_types.Success result -> on_success result
+  | Error_types.Partial_success { result; _ } -> on_success result
+  | Error_types.Failure err -> on_error (Error_types.error_to_string err)
+
+(** Helper to handle thread_result outcome *)
+let handle_thread_outcome on_success on_error outcome =
+  match outcome with
+  | Error_types.Success result -> on_success result.Error_types.posted_ids
+  | Error_types.Partial_success { result; _ } -> on_success result.Error_types.posted_ids
+  | Error_types.Failure err -> on_error (Error_types.error_to_string err)
 
 (** Mock HTTP client for testing *)
 module Mock_http : Social_core.HTTP_CLIENT = struct
@@ -122,12 +138,13 @@ let test_post_status () =
     ~account_id:"test_account"
     ~text:"Hello Mastodon!"
     ~media_urls:[]
-    (fun post_id ->
-      success_called := true;
-      Printf.printf "✓ (post_id: %s)\n" post_id)
-    (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
-      assert false);
+    (handle_outcome
+      (fun post_id ->
+        success_called := true;
+        Printf.printf "✓ (post_id: %s)\n" post_id)
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
   assert !success_called
 
 (** Test: Post a status with options *)
@@ -141,12 +158,13 @@ let test_post_status_with_options () =
     ~visibility:Social_mastodon_v1.Unlisted
     ~sensitive:true
     ~spoiler_text:(Some "Test warning")
-    (fun post_id ->
-      success_called := true;
-      Printf.printf "✓ (post_id: %s)\n" post_id)
-    (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
-      assert false);
+    (handle_outcome
+      (fun post_id ->
+        success_called := true;
+        Printf.printf "✓ (post_id: %s)\n" post_id)
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
   assert !success_called
 
 (** Test: Post a thread *)
@@ -157,12 +175,13 @@ let test_post_thread () =
     ~account_id:"test_account"
     ~texts:["First post"; "Second post"; "Third post"]
     ~media_urls_per_post:[[];  []; []]
-    (fun post_ids ->
-      success_called := true;
-      Printf.printf "✓ (%d posts)\n" (List.length post_ids))
-    (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
-      assert false);
+    (handle_thread_outcome
+      (fun post_ids ->
+        success_called := true;
+        Printf.printf "✓ (%d posts)\n" (List.length post_ids))
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
   assert !success_called
 
 (** Test: Delete a status *)
@@ -319,6 +338,31 @@ let test_character_limit () =
        Printf.printf "✗ Should have rejected text over 500 chars\n";
        assert false)
 
+(** Test: post_single returns validation error for long content *)
+let test_post_validation_error () =
+  Printf.printf "Test: Post returns validation error for long content... ";
+  let long_text = String.make 501 'a' in
+  let error_received = ref false in
+  Mastodon.post_single
+    ~account_id:"test_account"
+    ~text:long_text
+    ~media_urls:[]
+    (fun outcome ->
+      match outcome with
+      | Error_types.Failure (Error_types.Validation_error _) ->
+          error_received := true;
+          Printf.printf "✓ (validation error returned)\n"
+      | Error_types.Success _ ->
+          Printf.printf "✗ Should have returned validation error\n";
+          assert false
+      | Error_types.Partial_success _ ->
+          Printf.printf "✗ Should have returned validation error\n";
+          assert false
+      | Error_types.Failure err ->
+          Printf.printf "✗ Wrong error type: %s\n" (Error_types.error_to_string err);
+          assert false);
+  assert !error_received
+
 (** Test: Accept whitespace-only content (validation is length-based only) *)
 let test_whitespace_content () =
   Printf.printf "Test: Whitespace content validation... ";
@@ -439,8 +483,8 @@ let test_all_visibility_levels () =
     ~text:"Public post"
     ~media_urls:[]
     ~visibility:Social_mastodon_v1.Public
-    (fun _ -> incr success_count)
-    (fun err -> Printf.printf "✗ Public failed: %s\n" err; assert false);
+    (handle_outcome (fun _ -> incr success_count)
+      (fun err -> Printf.printf "✗ Public failed: %s\n" err; assert false));
   
   (* Test Unlisted *)
   Mastodon.post_single
@@ -448,8 +492,8 @@ let test_all_visibility_levels () =
     ~text:"Unlisted post"
     ~media_urls:[]
     ~visibility:Social_mastodon_v1.Unlisted
-    (fun _ -> incr success_count)
-    (fun err -> Printf.printf "✗ Unlisted failed: %s\n" err; assert false);
+    (handle_outcome (fun _ -> incr success_count)
+      (fun err -> Printf.printf "✗ Unlisted failed: %s\n" err; assert false));
   
   (* Test Private *)
   Mastodon.post_single
@@ -457,8 +501,8 @@ let test_all_visibility_levels () =
     ~text:"Private post"
     ~media_urls:[]
     ~visibility:Social_mastodon_v1.Private
-    (fun _ -> incr success_count)
-    (fun err -> Printf.printf "✗ Private failed: %s\n" err; assert false);
+    (handle_outcome (fun _ -> incr success_count)
+      (fun err -> Printf.printf "✗ Private failed: %s\n" err; assert false));
   
   (* Test Direct *)
   Mastodon.post_single
@@ -466,8 +510,8 @@ let test_all_visibility_levels () =
     ~text:"Direct post"
     ~media_urls:[]
     ~visibility:Social_mastodon_v1.Direct
-    (fun _ -> incr success_count)
-    (fun err -> Printf.printf "✗ Direct failed: %s\n" err; assert false);
+    (handle_outcome (fun _ -> incr success_count)
+      (fun err -> Printf.printf "✗ Direct failed: %s\n" err; assert false));
   
   if !success_count = 4 then
     Printf.printf "✓ (all 4 visibility levels)\n"
@@ -517,12 +561,13 @@ let test_thread_with_media () =
       ["https://example.com/video.mp4"];
       []
     ]
-    (fun post_ids ->
-      success_called := true;
-      Printf.printf "✓ (%d posts with media)\n" (List.length post_ids))
-    (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
-      assert false);
+    (handle_thread_outcome
+      (fun post_ids ->
+        success_called := true;
+        Printf.printf "✓ (%d posts with media)\n" (List.length post_ids))
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
   assert !success_called
 
 (** Test: Post with language specified *)
@@ -534,12 +579,13 @@ let test_post_with_language () =
     ~text:"Bonjour le monde!"
     ~media_urls:[]
     ~language:(Some "fr")
-    (fun post_id ->
-      success_called := true;
-      Printf.printf "✓ (post_id: %s)\n" post_id)
-    (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
-      assert false);
+    (handle_outcome
+      (fun post_id ->
+        success_called := true;
+        Printf.printf "✓ (post_id: %s)\n" post_id)
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
   assert !success_called
 
 (** Test: Post with content warning *)
@@ -551,12 +597,13 @@ let test_post_with_content_warning () =
     ~text:"Spoiler content here"
     ~media_urls:[]
     ~spoiler_text:(Some "Movie spoilers!")
-    (fun post_id ->
-      success_called := true;
-      Printf.printf "✓ (post_id: %s)\n" post_id)
-    (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
-      assert false);
+    (handle_outcome
+      (fun post_id ->
+        success_called := true;
+        Printf.printf "✓ (post_id: %s)\n" post_id)
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
   assert !success_called
 
 (** Test: Post with poll *)
@@ -578,12 +625,13 @@ let test_post_with_poll () =
     ~text:"What do you think?"
     ~media_urls:[]
     ~poll:(Some poll)
-    (fun post_id ->
-      success_called := true;
-      Printf.printf "✓ (post_id: %s)\n" post_id)
-    (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
-      assert false);
+    (handle_outcome
+      (fun post_id ->
+        success_called := true;
+        Printf.printf "✓ (post_id: %s)\n" post_id)
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
   assert !success_called
 
 (** Test: Boost (reblog) a status *)
@@ -818,12 +866,13 @@ let test_post_with_alt_text () =
     ~text:"Photo with accessibility description"
     ~media_urls:["https://example.com/image.jpg"]
     ~alt_texts:[Some "A beautiful sunset over the ocean"]
-    (fun post_id ->
-      success_called := true;
-      Printf.printf "✓ (post_id: %s)\n" post_id)
-    (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
-      assert false);
+    (handle_outcome
+      (fun post_id ->
+        success_called := true;
+        Printf.printf "✓ (post_id: %s)\n" post_id)
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
   assert !success_called
 
 (** Test: Post with multiple images and alt-texts *)
@@ -835,12 +884,13 @@ let test_post_with_multiple_alt_texts () =
     ~text:"Multiple photos with descriptions"
     ~media_urls:["https://example.com/img1.jpg"; "https://example.com/img2.jpg"]
     ~alt_texts:[Some "First photo description"; Some "Second photo description"]
-    (fun post_id ->
-      success_called := true;
-      Printf.printf "✓ (post_id: %s)\n" post_id)
-    (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
-      assert false);
+    (handle_outcome
+      (fun post_id ->
+        success_called := true;
+        Printf.printf "✓ (post_id: %s)\n" post_id)
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
   assert !success_called
 
 (** Test: Thread with alt-texts per post *)
@@ -852,12 +902,13 @@ let test_thread_with_different_alt_texts () =
     ~texts:["First toot with image"; "Second toot with image"]
     ~media_urls_per_post:[["https://example.com/img1.jpg"]; ["https://example.com/img2.jpg"]]
     ~alt_texts_per_post:[[Some "Alt text for first image"]; [Some "Alt text for second image"]]
-    (fun post_ids ->
-      success_called := true;
-      Printf.printf "✓ (%d posts)\n" (List.length post_ids))
-    (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
-      assert false);
+    (handle_thread_outcome
+      (fun post_ids ->
+        success_called := true;
+        Printf.printf "✓ (%d posts)\n" (List.length post_ids))
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
   assert !success_called
 
 (** Test: Post without alt-text *)
@@ -869,12 +920,13 @@ let test_post_image_without_alt_text () =
     ~text:"Image without description"
     ~media_urls:["https://example.com/image.jpg"]
     ~alt_texts:[]
-    (fun post_id ->
-      success_called := true;
-      Printf.printf "✓ (post_id: %s)\n" post_id)
-    (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
-      assert false);
+    (handle_outcome
+      (fun post_id ->
+        success_called := true;
+        Printf.printf "✓ (post_id: %s)\n" post_id)
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
   assert !success_called
 
 (** Test: Alt-text with Unicode and emojis *)
@@ -886,12 +938,13 @@ let test_alt_text_with_unicode () =
     ~text:"Post with Unicode alt-text"
     ~media_urls:["https://example.com/image.jpg"]
     ~alt_texts:[Some "Photo of 🌸 cherry blossoms (桜) in spring"]
-    (fun post_id ->
-      success_called := true;
-      Printf.printf "✓ (post_id: %s)\n" post_id)
-    (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
-      assert false);
+    (handle_outcome
+      (fun post_id ->
+        success_called := true;
+        Printf.printf "✓ (post_id: %s)\n" post_id)
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
   assert !success_called
 
 (** Test: Partial alt-texts (fewer than images) *)
@@ -903,12 +956,13 @@ let test_partial_alt_texts () =
     ~text:"Three images, two descriptions"
     ~media_urls:["https://example.com/img1.jpg"; "https://example.com/img2.jpg"; "https://example.com/img3.jpg"]
     ~alt_texts:[Some "First image"; Some "Second image"]
-    (fun post_id ->
-      success_called := true;
-      Printf.printf "✓ (post_id: %s)\n" post_id)
-    (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
-      assert false);
+    (handle_outcome
+      (fun post_id ->
+        success_called := true;
+        Printf.printf "✓ (post_id: %s)\n" post_id)
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
   assert !success_called
 
 (** Run all tests *)
@@ -943,6 +997,7 @@ let () =
   test_validate_content ();
   test_valid_content_lengths ();
   test_character_limit ();
+  test_post_validation_error ();
   test_whitespace_content ();
   test_validate_poll ();
   test_poll_too_few_options ();
@@ -976,4 +1031,4 @@ let () =
   test_alt_text_with_unicode ();
   test_partial_alt_texts ();
   
-  Printf.printf "\n✓ All 45 tests passed!\n"
+  Printf.printf "\n✓ All 46 tests passed!\n"

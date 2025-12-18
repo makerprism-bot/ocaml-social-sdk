@@ -81,6 +81,7 @@ type warning =
   | Thumbnail_skipped of string     (** Reason thumbnail was skipped *)
   | Media_resized                   (** Media was auto-resized *)
   | Enrichment_skipped of string    (** Generic enrichment failure *)
+  | Generic_warning of { code: string; message: string; recoverable: bool }
 
 (** {1 Outcome Type} *)
 
@@ -179,6 +180,8 @@ let warning_to_string = function
       "Media was automatically resized"
   | Enrichment_skipped reason -> 
       Printf.sprintf "Enrichment skipped: %s" reason
+  | Generic_warning { code; message; _ } ->
+      Printf.sprintf "%s: %s" code message
 
 (** {1 Error Classification} *)
 

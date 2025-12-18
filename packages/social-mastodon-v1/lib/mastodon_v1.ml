@@ -338,6 +338,91 @@ end
 (** Make functor to create Mastodon provider with given configuration *)
 module Make (Config : CONFIG) = struct
   
+  (** {1 Platform Constants} *)
+  
+  let default_max_status_length = 500  (* Many instances have higher limits *)
+  let max_media_per_status = 4
+  
+  (** {1 Validation Functions} *)
+  
+  (** Validate a single post's content *)
+  let validate_post ~text ?(media_count=0) ?(max_length=500) () =
+    let errors = ref [] in
+    
+    (* Check text length *)
+    let text_len = String.length text in
+    if text_len > max_length then
+      errors := Error_types.Text_too_long { length = text_len; max = max_length } :: !errors;
+    
+    (* Check media count *)
+    if media_count > max_media_per_status then
+      errors := Error_types.Too_many_media { count = media_count; max = max_media_per_status } :: !errors;
+    
+    if !errors = [] then Ok ()
+    else Error (List.rev !errors)
+  
+  (** Validate thread content *)
+  let validate_thread ~texts ?(media_counts=[]) ?(max_length=500) () =
+    if List.length texts = 0 then
+      Error [Error_types.Thread_empty]
+    else
+      let errors = ref [] in
+      List.iteri (fun i text ->
+        let media_count = 
+          try List.nth media_counts i 
+          with _ -> 0 
+        in
+        match validate_post ~text ~media_count ~max_length () with
+        | Error post_errors ->
+            errors := Error_types.Thread_post_invalid { index = i; errors = post_errors } :: !errors
+        | Ok () -> ()
+      ) texts;
+      if !errors = [] then Ok ()
+      else Error (List.rev !errors)
+  
+  (** Parse API error response and return structured Error_types.error *)
+  let parse_api_error ~status_code ~response_body =
+    try
+      let json = Yojson.Basic.from_string response_body in
+      let open Yojson.Basic.Util in
+      let error_msg = 
+        try json |> member "error" |> to_string
+        with _ -> response_body
+      in
+      
+      (* Map common Mastodon errors *)
+      if status_code = 401 then
+        Error_types.Auth_error Error_types.Token_invalid
+      else if status_code = 403 then
+        Error_types.Auth_error (Error_types.Insufficient_permissions ["write:statuses"])
+      else if status_code = 429 then
+        Error_types.Rate_limited { 
+          retry_after_seconds = Some 300;
+          limit = None;
+          remaining = Some 0;
+          reset_at = None;
+        }
+      else if status_code = 422 && String.lowercase_ascii error_msg |> fun s -> 
+          String.length s > 0 && (String.sub s 0 (min 9 (String.length s)) = "duplicate" ||
+                                   try ignore (Str.search_forward (Str.regexp_string "duplicate") s 0); true with Not_found -> false) then
+        Error_types.Duplicate_content
+      else
+        Error_types.Api_error {
+          status_code;
+          message = error_msg;
+          platform = Platform_types.Mastodon;
+          raw_response = Some response_body;
+          request_id = None;
+        }
+    with _ ->
+      Error_types.Api_error {
+        status_code;
+        message = response_body;
+        platform = Platform_types.Mastodon;
+        raw_response = Some response_body;
+        request_id = None;
+      }
+  
   (** Parse Mastodon credentials from core credentials type *)
   let parse_mastodon_credentials (credentials : credentials) on_success on_error =
     try
@@ -521,8 +606,12 @@ module Make (Config : CONFIG) = struct
       ?(poll=None)
       ?(scheduled_at=None)
       ?(idempotency_key=None)
-      on_success 
-      on_error =
+      on_result =
+    (* Validate content first *)
+    let media_count = List.length media_urls in
+    match validate_post ~text ~media_count ~max_length:default_max_status_length () with
+    | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
     ensure_valid_token ~account_id
       (fun mastodon_creds ->
         (* Pair URLs with alt text - use None if alt text list is shorter *)
@@ -557,6 +646,7 @@ module Make (Config : CONFIG) = struct
         
         (* Upload media if provided (max 4) *)
         let media_to_upload = List.filteri (fun i _ -> i < 4) urls_with_alt in
+        let on_media_error msg = on_result (Error_types.Failure (Error_types.Internal_error (Printf.sprintf "Media upload failed: %s" msg))) in
         upload_media_seq media_to_upload []
           (fun media_ids ->
             (* Create status *)
@@ -648,14 +738,14 @@ module Make (Config : CONFIG) = struct
                         else
                           Printf.sprintf "%s/statuses/%s" mastodon_creds.instance_url status_id
                     in
-                    on_success status_url
+                    on_result (Error_types.Success status_url)
                   with e ->
-                    on_error (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))
+                    on_result (Error_types.Failure (Error_types.Internal_error (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))))
                 else
-                  on_error (Printf.sprintf "Mastodon API error (%d): %s" response.status response.body))
-              on_error)
-          on_error)
-      on_error
+                  on_result (Error_types.Failure (parse_api_error ~status_code:response.status ~response_body:response.body)))
+              on_media_error)
+          on_media_error)
+      (fun err -> on_result (Error_types.Failure (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Post thread with full options *)
   let post_thread 
@@ -666,13 +756,14 @@ module Make (Config : CONFIG) = struct
       ?(visibility=Public)
       ?(sensitive=false)
       ?(spoiler_text=None)
-      on_success 
-      on_error =
-    if List.length texts = 0 then
-      on_error "No statuses in thread"
-    else
-      ensure_valid_token ~account_id
-        (fun mastodon_creds ->
+      on_result =
+    (* Validate thread content first *)
+    let media_counts = List.map List.length media_urls_per_post in
+    match validate_thread ~texts ~media_counts ~max_length:default_max_status_length () with
+    | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
           (* Helper to upload media from URLs for a single post *)
           let upload_post_media media_urls alt_texts on_complete on_err =
             (* Pair URLs with alt text *)
@@ -715,11 +806,41 @@ module Make (Config : CONFIG) = struct
             (text, media_urls, alt_texts)
           ) texts in
           
-          (* Helper to post statuses in sequence with reply references *)
-          let rec post_statuses_seq posts_with_media_and_alt reply_to_id acc on_complete on_err =
+          let total_requested = List.length texts in
+          
+          (* Helper to post statuses in sequence with reply references, tracking index *)
+          let rec post_statuses_seq posts_with_media_and_alt post_index reply_to_id acc =
             match posts_with_media_and_alt with
-            | [] -> on_complete (List.rev acc)
+            | [] -> 
+                let thread_result = {
+                  Error_types.posted_ids = List.rev acc;
+                  failed_at_index = None;
+                  total_requested;
+                } in
+                on_result (Error_types.Success thread_result)
             | (text, media_urls, alt_texts) :: rest ->
+                let on_post_error err_msg =
+                  let thread_result = {
+                    Error_types.posted_ids = List.rev acc;
+                    failed_at_index = Some post_index;
+                    total_requested;
+                  } in
+                  if List.length acc > 0 then
+                    (* Partial success - some posts were made *)
+                    on_result (Error_types.Partial_success { 
+                      result = thread_result; 
+                      warnings = [Error_types.Generic_warning { code = "thread_incomplete"; message = err_msg; recoverable = false }]
+                    })
+                  else
+                    (* Complete failure - no posts made *)
+                    on_result (Error_types.Failure (Error_types.Api_error {
+                      status_code = 0;
+                      message = err_msg;
+                      platform = Platform_types.Mastodon;
+                      raw_response = None;
+                      request_id = None;
+                    }))
+                in
                 (* Upload media for this post *)
                 upload_post_media media_urls alt_texts
                   (fun media_ids ->
@@ -783,17 +904,17 @@ module Make (Config : CONFIG) = struct
                                   Printf.sprintf "%s/statuses/%s" mastodon_creds.instance_url status_id
                             in
                             (* Continue with next status in thread, use ID for reply but accumulate URLs *)
-                            post_statuses_seq rest (Some status_id) (status_url :: acc) on_complete on_err
+                            post_statuses_seq rest (post_index + 1) (Some status_id) (status_url :: acc)
                           with e ->
-                            on_err (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))
+                            on_post_error (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))
                         else
-                          on_err (Printf.sprintf "Mastodon API error (%d): %s" response.status response.body))
-                      on_err)
-                      on_err
+                          on_post_error (Printf.sprintf "Mastodon API error (%d): %s" response.status response.body))
+                      on_post_error)
+                  on_post_error
           in
           
-          post_statuses_seq posts_with_media_and_alt None [] on_success on_error)
-        on_error
+          post_statuses_seq posts_with_media_and_alt 0 None [])
+      (fun err -> on_result (Error_types.Failure (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Validate content for Mastodon 
       Note: The actual character limit may vary by instance. 

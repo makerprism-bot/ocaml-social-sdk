@@ -440,30 +440,47 @@ module Make (Config : CONFIG) = struct
                       (fun img_response ->
                         if img_response.status >= 200 && img_response.status < 300 then
                           (* Get mime type from response headers *)
-                          let mime_type = 
+                          let raw_mime_type = 
                             List.assoc_opt "content-type" img_response.headers
                             |> Option.value ~default:"image/jpeg"
                           in
+                          (* Extract base MIME type (strip charset and other parameters) *)
+                          let mime_type = 
+                            match String.split_on_char ';' raw_mime_type with
+                            | base :: _ -> String.trim base
+                            | [] -> raw_mime_type
+                          in
                           
-                          (* Check size limit (1MB max for images) *)
-                          let img_size = String.length img_response.body in
-                          Printf.eprintf "[Bluesky] Thumbnail downloaded: %d bytes, mime: %s\n%!" img_size mime_type;
+                          (* Validate it's actually an image MIME type *)
+                          let is_image_mime = 
+                            String.length mime_type >= 6 && 
+                            String.lowercase_ascii (String.sub mime_type 0 6) = "image/"
+                          in
                           
-                          if img_size > 1000000 then
-                            (* Image too large, skip it *)
-                            (Printf.eprintf "[Bluesky] Thumbnail too large (%d bytes > 1MB), creating card without it\n%!" img_size;
+                          if not is_image_mime then
+                            (* Not an image, skip thumbnail *)
+                            (Printf.eprintf "[Bluesky] Thumbnail has non-image MIME type: %s, skipping\n%!" mime_type;
                              create_card None)
                           else
-                            (* Upload the image as a blob *)
-                            (Printf.eprintf "[Bluesky] Uploading thumbnail as blob...\n%!";
-                             upload_blob ~access_jwt ~blob_data:img_response.body 
-                               ~mime_type ~alt_text:None
-                               (fun (blob, _) -> 
-                                 Printf.eprintf "[Bluesky] Thumbnail uploaded successfully\n%!";
-                                 create_card (Some blob))
-                               (fun err -> 
-                                 Printf.eprintf "[Bluesky] Thumbnail upload failed: %s, creating card without it\n%!" err;
-                                 create_card None))
+                            (* Check size limit (1MB max for images) *)
+                            let img_size = String.length img_response.body in
+                            Printf.eprintf "[Bluesky] Thumbnail downloaded: %d bytes, mime: %s\n%!" img_size mime_type;
+                            
+                            if img_size > 1000000 then
+                              (* Image too large, skip it *)
+                              (Printf.eprintf "[Bluesky] Thumbnail too large (%d bytes > 1MB), creating card without it\n%!" img_size;
+                               create_card None)
+                            else
+                              (* Upload the image as a blob *)
+                              (Printf.eprintf "[Bluesky] Uploading thumbnail as blob...\n%!";
+                               upload_blob ~access_jwt ~blob_data:img_response.body 
+                                 ~mime_type ~alt_text:None
+                                 (fun (blob, _) -> 
+                                   Printf.eprintf "[Bluesky] Thumbnail uploaded successfully\n%!";
+                                   create_card (Some blob))
+                                 (fun err -> 
+                                   Printf.eprintf "[Bluesky] Thumbnail upload failed: %s, creating card without it\n%!" err;
+                                   create_card None))
                         else
                           (* Failed to fetch image, create card without it *)
                           (Printf.eprintf "[Bluesky] Failed to fetch thumbnail (HTTP %d), creating card without it\n%!" img_response.status;

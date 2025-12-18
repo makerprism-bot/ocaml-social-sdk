@@ -8,6 +8,7 @@ open Platform_types
 type validation_error =
   | Text_too_long of { length: int; max: int }
   | Text_empty
+  | Media_required  (** Platform requires media (e.g., Pinterest, TikTok, YouTube Shorts) *)
   | Media_too_large of { size_bytes: int; max_bytes: int }
   | Media_unsupported_format of string
   | Media_dimensions_invalid of { width: int; height: int; reason: string }
@@ -108,6 +109,8 @@ let rec validation_error_to_string = function
       Printf.sprintf "Text too long: %d characters (max %d)" length max
   | Text_empty -> 
       "Text cannot be empty"
+  | Media_required ->
+      "Media is required for this platform"
   | Media_too_large { size_bytes; max_bytes } ->
       Printf.sprintf "Media too large: %d bytes (max %d)" size_bytes max_bytes
   | Media_unsupported_format fmt ->

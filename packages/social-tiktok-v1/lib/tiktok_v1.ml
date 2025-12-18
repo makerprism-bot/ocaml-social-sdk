@@ -480,7 +480,7 @@ module Make (Config : CONFIG) = struct
     
     (* TikTok requires exactly one video - text-only posts not allowed *)
     if media_count < 1 then
-      errors := Error_types.Text_empty :: !errors;  (* Reusing Text_empty to mean "content incomplete" *)
+      errors := Error_types.Media_required :: !errors;
     
     if !errors = [] then Ok ()
     else Error (List.rev !errors)

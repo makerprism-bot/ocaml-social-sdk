@@ -148,13 +148,13 @@ let test_post_single_no_media () =
     (fun outcome ->
       match outcome with
       | Error_types.Failure (Error_types.Validation_error errs) ->
-          (* Should contain Text_empty since TikTok requires video *)
-          let has_text_empty = List.exists (function Error_types.Text_empty -> true | _ -> false) errs in
-          if has_text_empty then begin
+          (* Should contain Media_required since TikTok requires video *)
+          let has_media_required = List.exists (function Error_types.Media_required -> true | _ -> false) errs in
+          if has_media_required then begin
             error_received := true;
             print_endline "PASSED"
           end else
-            failwith "Expected Text_empty validation error"
+            failwith "Expected Media_required validation error"
       | _ ->
           failwith "Expected validation error");
   assert !error_received

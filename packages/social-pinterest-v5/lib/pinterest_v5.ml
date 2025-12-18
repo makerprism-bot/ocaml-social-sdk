@@ -341,7 +341,7 @@ module Make (Config : CONFIG) = struct
     
     (* Pinterest requires at least one image *)
     if media_count < 1 then
-      errors := Error_types.Text_empty :: !errors;  (* Reusing to mean "content incomplete" *)
+      errors := Error_types.Media_required :: !errors;
     
     if !errors = [] then Ok ()
     else Error (List.rev !errors)

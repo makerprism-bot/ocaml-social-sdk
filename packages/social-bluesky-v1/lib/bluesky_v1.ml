@@ -65,10 +65,9 @@ module Auth = struct
         @param pds_url Optional PDS URL (defaults to https://bsky.social)
         @param identifier User's handle (e.g., user.bsky.social) or DID
         @param app_password App password from https://bsky.app/settings/app-passwords
-        @param on_success Continuation receiving session info
-        @param on_error Continuation receiving error message
+        @param on_result Continuation receiving the outcome
     *)
-    let create_session ?(pds_url=Metadata.default_pds_url) ~identifier ~app_password on_success on_error =
+    let create_session ?(pds_url=Metadata.default_pds_url) ~identifier ~app_password on_result =
       let url = Printf.sprintf "%s%s" pds_url Metadata.create_session_path in
       let body = Yojson.Basic.to_string (`Assoc [
         ("identifier", `String identifier);
@@ -88,21 +87,30 @@ module Auth = struct
                 access_jwt = json |> member "accessJwt" |> to_string;
                 refresh_jwt = json |> member "refreshJwt" |> to_string;
               } in
-              on_success session
+              on_result (Error_types.Success session)
             with e ->
-              on_error (Printf.sprintf "Failed to parse session: %s" (Printexc.to_string e))
+              on_result (Error_types.Failure (Error_types.Internal_error 
+                (Printf.sprintf "Failed to parse session: %s" (Printexc.to_string e))))
+          else if response.status = 401 then
+            on_result (Error_types.Failure (Error_types.Auth_error Error_types.Token_invalid))
+          else if response.status = 429 then
+            on_result (Error_types.Failure (Error_types.make_rate_limited ()))
           else
-            on_error (Printf.sprintf "Session creation failed (%d): %s" response.status response.body))
-        on_error
+            on_result (Error_types.Failure (Error_types.make_api_error 
+              ~platform:Platform_types.Bluesky
+              ~status_code:response.status
+              ~message:"Session creation failed"
+              ~raw_response:response.body ())))
+        (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (Error_types.Connection_failed err))))
     
     (** Refresh an existing session
         
         @param pds_url Optional PDS URL (defaults to https://bsky.social)
         @param refresh_jwt The refresh JWT from a previous session
-        @param on_success Continuation receiving new session info
-        @param on_error Continuation receiving error message
+        @param on_result Continuation receiving the outcome
     *)
-    let refresh_session ?(pds_url=Metadata.default_pds_url) ~refresh_jwt on_success on_error =
+    let refresh_session ?(pds_url=Metadata.default_pds_url) ~refresh_jwt on_result =
       let url = Printf.sprintf "%s%s" pds_url Metadata.refresh_session_path in
       let headers = [
         ("Authorization", Printf.sprintf "Bearer %s" refresh_jwt);
@@ -120,21 +128,28 @@ module Auth = struct
                 access_jwt = json |> member "accessJwt" |> to_string;
                 refresh_jwt = json |> member "refreshJwt" |> to_string;
               } in
-              on_success session
+              on_result (Error_types.Success session)
             with e ->
-              on_error (Printf.sprintf "Failed to parse session: %s" (Printexc.to_string e))
+              on_result (Error_types.Failure (Error_types.Internal_error 
+                (Printf.sprintf "Failed to parse session: %s" (Printexc.to_string e))))
+          else if response.status = 401 then
+            on_result (Error_types.Failure (Error_types.Auth_error Error_types.Token_expired))
           else
-            on_error (Printf.sprintf "Session refresh failed (%d): %s" response.status response.body))
-        on_error
+            on_result (Error_types.Failure (Error_types.make_api_error
+              ~platform:Platform_types.Bluesky
+              ~status_code:response.status
+              ~message:"Session refresh failed"
+              ~raw_response:response.body ())))
+        (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (Error_types.Connection_failed err))))
     
     (** Delete/invalidate a session
         
         @param pds_url Optional PDS URL (defaults to https://bsky.social)
         @param refresh_jwt The refresh JWT of the session to delete
-        @param on_success Continuation called on successful deletion
-        @param on_error Continuation receiving error message
+        @param on_result Continuation receiving the outcome
     *)
-    let delete_session ?(pds_url=Metadata.default_pds_url) ~refresh_jwt on_success on_error =
+    let delete_session ?(pds_url=Metadata.default_pds_url) ~refresh_jwt on_result =
       let url = Printf.sprintf "%s%s" pds_url Metadata.delete_session_path in
       let headers = [
         ("Authorization", Printf.sprintf "Bearer %s" refresh_jwt);
@@ -143,10 +158,15 @@ module Auth = struct
       Http.post ~headers url
         (fun response ->
           if response.status >= 200 && response.status < 300 then
-            on_success ()
+            on_result (Error_types.Success ())
           else
-            on_error (Printf.sprintf "Session deletion failed (%d): %s" response.status response.body))
-        on_error
+            on_result (Error_types.Failure (Error_types.make_api_error
+              ~platform:Platform_types.Bluesky
+              ~status_code:response.status
+              ~message:"Session deletion failed"
+              ~raw_response:response.body ())))
+        (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (Error_types.Connection_failed err))))
     
     (** Convert session to Social_core.credentials for storage
         
@@ -179,8 +199,102 @@ end
 module Make (Config : CONFIG) = struct
   let pds_url = "https://bsky.social"
   
+  (** Platform-specific constants *)
+  let max_text_length = 300
+  let max_images = 4
+  let max_image_size_bytes = 1024 * 1024  (* 1MB *)
+  let max_video_size_bytes = 50 * 1024 * 1024  (* 50MB *)
+  let max_video_duration_seconds = 60
+  
+  (** {1 Validation} *)
+  
+  (** Validate a single post's content *)
+  let validate_post ~text ?(media_count=0) () =
+    let errors = ref [] in
+    let text_len = String.length text in
+    if text_len > max_text_length then
+      errors := Error_types.Text_too_long { length = text_len; max = max_text_length } :: !errors;
+    if media_count > max_images then
+      errors := Error_types.Too_many_media { count = media_count; max = max_images } :: !errors;
+    if !errors = [] then Ok ()
+    else Error (List.rev !errors)
+  
+  (** Validate a thread before posting *)
+  let validate_thread ~texts ?(media_counts=[]) () =
+    if texts = [] then
+      Error [Error_types.Thread_empty]
+    else
+      let errors = List.mapi (fun i text ->
+        let media_count = try List.nth media_counts i with _ -> 0 in
+        match validate_post ~text ~media_count () with
+        | Ok () -> None
+        | Error errs -> Some (Error_types.Thread_post_invalid { index = i; errors = errs })
+      ) texts |> List.filter_map Fun.id in
+      if errors = [] then Ok ()
+      else Error errors
+  
+  (** Validate media constraints *)
+  let validate_media ~(media : Platform_types.post_media) =
+    match media.Platform_types.media_type with
+    | Platform_types.Image ->
+        if media.file_size_bytes > max_image_size_bytes then
+          Error [Error_types.Media_too_large { 
+            size_bytes = media.file_size_bytes; 
+            max_bytes = max_image_size_bytes 
+          }]
+        else
+          Ok ()
+    | Platform_types.Video ->
+        let errors = ref [] in
+        if media.file_size_bytes > max_video_size_bytes then
+          errors := Error_types.Media_too_large { 
+            size_bytes = media.file_size_bytes; 
+            max_bytes = max_video_size_bytes 
+          } :: !errors;
+        (match media.duration_seconds with
+         | Some duration when duration > float_of_int max_video_duration_seconds ->
+             errors := Error_types.Video_too_long { 
+               duration_seconds = duration; 
+               max_seconds = max_video_duration_seconds 
+             } :: !errors
+         | _ -> ());
+        if !errors = [] then Ok ()
+        else Error (List.rev !errors)
+    | Platform_types.Gif ->
+        if media.file_size_bytes > max_image_size_bytes then
+          Error [Error_types.Media_too_large { 
+            size_bytes = media.file_size_bytes; 
+            max_bytes = max_image_size_bytes 
+          }]
+        else
+          Ok ()
+  
+  (** Legacy validation function for backwards compatibility *)
+  let validate_content ~text =
+    match validate_post ~text () with
+    | Ok () -> Ok ()
+    | Error errs -> Error (String.concat "; " (List.map Error_types.validation_error_to_string errs))
+  
+  (** {1 Internal Helpers} *)
+  
+  (** Parse API error from response *)
+  let parse_api_error ~status_code ~body =
+    if status_code = 401 then
+      Error_types.Auth_error Error_types.Token_invalid
+    else if status_code = 429 then
+      Error_types.make_rate_limited ()
+    else
+      Error_types.make_api_error
+        ~platform:Platform_types.Bluesky
+        ~status_code
+        ~message:(try
+          let json = Yojson.Basic.from_string body in
+          json |> Yojson.Basic.Util.member "message" |> Yojson.Basic.Util.to_string
+        with _ -> "API error")
+        ~raw_response:body ()
+  
   (** Resolve handle to DID *)
-  let resolve_handle ~handle on_success on_error =
+  let resolve_handle ~handle on_result =
     let url = Printf.sprintf "%s/xrpc/com.atproto.identity.resolveHandle?handle=%s" 
       pds_url (Uri.pct_encode handle) in
     Config.Http.get url
@@ -189,12 +303,14 @@ module Make (Config : CONFIG) = struct
           try
             let json = Yojson.Basic.from_string response.body in
             let did = json |> Yojson.Basic.Util.member "did" |> Yojson.Basic.Util.to_string in
-            on_success did
+            on_result (Error_types.Success did)
           with e ->
-            on_error (Printf.sprintf "Failed to parse DID: %s" (Printexc.to_string e))
+            on_result (Error_types.Failure (Error_types.Internal_error 
+              (Printf.sprintf "Failed to parse DID: %s" (Printexc.to_string e))))
         else
-          on_error (Printf.sprintf "Handle resolution failed: %s" response.body))
-      on_error
+          on_result (Error_types.Failure (parse_api_error ~status_code:response.status ~body:response.body)))
+      (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+        (Error_types.Connection_failed err))))
   
   (** Extract facets from text (URLs, mentions, hashtags) *)
   let extract_facets text on_success on_error =
@@ -263,16 +379,16 @@ module Make (Config : CONFIG) = struct
       match mentions with
       | [] -> on_complete (List.rev acc)
       | (byte_start, byte_end, handle) :: rest ->
-          resolve_handle ~handle
-            (fun did ->
-              let facet = (byte_start, byte_end, `Assoc [
-                ("$type", `String "app.bsky.richtext.facet#mention");
-                ("did", `String did);
-              ]) in
-              resolve_mentions rest (facet :: acc) on_complete on_err)
-            (fun _err ->
-              (* Skip mentions that fail to resolve *)
-              resolve_mentions rest acc on_complete on_err)
+          resolve_handle ~handle (function
+            | Error_types.Success did ->
+                let facet = (byte_start, byte_end, `Assoc [
+                  ("$type", `String "app.bsky.richtext.facet#mention");
+                  ("did", `String did);
+                ]) in
+                resolve_mentions rest (facet :: acc) on_complete on_err
+            | _ ->
+                (* Skip mentions that fail to resolve *)
+                resolve_mentions rest acc on_complete on_err)
     in
     
     resolve_mentions mention_handles []
@@ -358,10 +474,10 @@ module Make (Config : CONFIG) = struct
     in
     try_patterns patterns
 
-  (** Fetch link card metadata by scraping OpenGraph tags *)
-  let fetch_link_card ~access_jwt ~url on_success _on_error =
-    (* Log link card fetch attempt *)
-    Printf.eprintf "[Bluesky] Attempting to fetch link card for URL: %s\n%!" url;
+  (** Fetch link card metadata by scraping OpenGraph tags.
+      Returns (card option, warnings list) *)
+  let fetch_link_card ~access_jwt ~url on_success =
+    let warnings = ref [] in
     
     (* Fetch the HTML content of the URL *)
     Config.Http.get url
@@ -375,19 +491,13 @@ module Make (Config : CONFIG) = struct
             let description = extract_og_tag html "description" in
             let image_url = extract_og_tag html "image" in
             
-            (* Log extracted metadata *)
-            Printf.eprintf "[Bluesky] Link card metadata - title: %s, description: %s, image: %s\n%!"
-              (Option.value title ~default:"(none)")
-              (Option.value description ~default:"(none)")
-              (Option.value image_url ~default:"(none)");
-            
             (* Only create card if we have at least a title *)
             match title with
             | None -> 
-                Printf.eprintf "[Bluesky] No og:title found, skipping link card for %s\n%!" url;
-                on_success None
+                warnings := Error_types.Link_card_failed 
+                  (Printf.sprintf "No og:title found for %s" url) :: !warnings;
+                on_success (None, !warnings)
             | Some title_str ->
-                Printf.eprintf "[Bluesky] Creating link card with title: %s\n%!" title_str;
                 let description_str = match description with
                   | Some d -> d
                   | None -> ""
@@ -408,15 +518,12 @@ module Make (Config : CONFIG) = struct
                     ("$type", `String "app.bsky.embed.external");
                     ("external", `Assoc external_with_thumb);
                   ] in
-                  Printf.eprintf "[Bluesky] Link card created successfully (with%s thumbnail)\n%!" 
-                    (if thumb_blob = None then "out" else "");
-                  on_success (Some card)
+                  on_success (Some card, !warnings)
                 in
                 
                 (* If there's an image, fetch and upload it *)
                 match image_url with
                 | None -> 
-                    Printf.eprintf "[Bluesky] No og:image found, creating card without thumbnail\n%!";
                     create_card None
                 | Some img_url ->
                     (* Handle relative URLs *)
@@ -432,8 +539,6 @@ module Make (Config : CONFIG) = struct
                         else
                           Printf.sprintf "%s://%s/%s" scheme host img_url
                     in
-                    
-                    Printf.eprintf "[Bluesky] Fetching thumbnail image: %s\n%!" full_img_url;
                     
                     (* Fetch the image *)
                     Config.Http.get full_img_url
@@ -457,48 +562,51 @@ module Make (Config : CONFIG) = struct
                             String.lowercase_ascii (String.sub mime_type 0 6) = "image/"
                           in
                           
-                          if not is_image_mime then
-                            (* Not an image, skip thumbnail *)
-                            (Printf.eprintf "[Bluesky] Thumbnail has non-image MIME type: %s, skipping\n%!" mime_type;
-                             create_card None)
+                          if not is_image_mime then begin
+                            warnings := Error_types.Thumbnail_skipped 
+                              (Printf.sprintf "Non-image MIME type: %s" mime_type) :: !warnings;
+                            create_card None
+                          end
                           else
                             (* Check size limit (1MB max for images) *)
                             let img_size = String.length img_response.body in
-                            Printf.eprintf "[Bluesky] Thumbnail downloaded: %d bytes, mime: %s\n%!" img_size mime_type;
                             
-                            if img_size > 1000000 then
-                              (* Image too large, skip it *)
-                              (Printf.eprintf "[Bluesky] Thumbnail too large (%d bytes > 1MB), creating card without it\n%!" img_size;
-                               create_card None)
+                            if img_size > 1000000 then begin
+                              warnings := Error_types.Thumbnail_skipped 
+                                (Printf.sprintf "Image too large: %d bytes" img_size) :: !warnings;
+                              create_card None
+                            end
                             else
                               (* Upload the image as a blob *)
-                              (Printf.eprintf "[Bluesky] Uploading thumbnail as blob...\n%!";
-                               upload_blob ~access_jwt ~blob_data:img_response.body 
-                                 ~mime_type ~alt_text:None
-                                 (fun (blob, _) -> 
-                                   Printf.eprintf "[Bluesky] Thumbnail uploaded successfully\n%!";
-                                   create_card (Some blob))
-                                 (fun err -> 
-                                   Printf.eprintf "[Bluesky] Thumbnail upload failed: %s, creating card without it\n%!" err;
-                                   create_card None))
-                        else
-                          (* Failed to fetch image, create card without it *)
-                          (Printf.eprintf "[Bluesky] Failed to fetch thumbnail (HTTP %d), creating card without it\n%!" img_response.status;
-                           create_card None))
+                              upload_blob ~access_jwt ~blob_data:img_response.body 
+                                ~mime_type ~alt_text:None
+                                (fun (blob, _) -> create_card (Some blob))
+                                (fun err -> 
+                                  warnings := Error_types.Thumbnail_skipped 
+                                    (Printf.sprintf "Upload failed: %s" err) :: !warnings;
+                                  create_card None)
+                        else begin
+                          warnings := Error_types.Thumbnail_skipped 
+                            (Printf.sprintf "HTTP %d fetching thumbnail" img_response.status) :: !warnings;
+                          create_card None
+                        end)
                       (fun err -> 
-                        Printf.eprintf "[Bluesky] HTTP error fetching thumbnail: %s, creating card without it\n%!" err;
+                        warnings := Error_types.Thumbnail_skipped 
+                          (Printf.sprintf "Network error: %s" err) :: !warnings;
                         create_card None)
           with e ->
-            (* Don't fail post if link card parsing fails *)
-            Printf.eprintf "[Bluesky] Exception parsing link card: %s, skipping card\n%!" (Printexc.to_string e);
-            on_success None
-        else
-          (* Don't fail post if URL fetch fails *)
-          Printf.eprintf "[Bluesky] Failed to fetch URL (HTTP %d), skipping link card\n%!" response.status;
-          on_success None)
+            warnings := Error_types.Link_card_failed 
+              (Printf.sprintf "Parse error: %s" (Printexc.to_string e)) :: !warnings;
+            on_success (None, !warnings)
+        else begin
+          warnings := Error_types.Link_card_failed 
+            (Printf.sprintf "HTTP %d fetching URL" response.status) :: !warnings;
+          on_success (None, !warnings)
+        end)
       (fun err -> 
-        Printf.eprintf "[Bluesky] HTTP error fetching URL: %s, skipping link card\n%!" err;
-        on_success None)
+        warnings := Error_types.Link_card_failed 
+          (Printf.sprintf "Network error: %s" err) :: !warnings;
+        on_success (None, !warnings))
   
   (** Ensure valid session token *)
   let ensure_valid_token ~account_id on_success on_error =
@@ -509,249 +617,326 @@ module Make (Config : CONFIG) = struct
         | None ->
             Config.update_health_status ~account_id ~status:"refresh_failed" 
               ~error_message:(Some "No app password available")
-              (fun () -> on_error "No app password available - please reconnect")
-              on_error
+              (fun () -> on_error (Error_types.Auth_error Error_types.Missing_credentials))
+              (fun _ -> on_error (Error_types.Auth_error Error_types.Missing_credentials))
         | Some password ->
             (* Create new session *)
             create_session ~identifier:creds.access_token ~password
               (fun (_did, access_jwt) ->
                 Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
                   (fun () -> on_success access_jwt)
-                  on_error)
+                  (fun _ -> on_success access_jwt))
               (fun err ->
                 Config.update_health_status ~account_id ~status:"refresh_failed" 
                   ~error_message:(Some ("Session creation failed: " ^ err))
-                  (fun () -> on_error err)
-                  on_error))
-      on_error
+                  (fun () -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err)))
+                  (fun _ -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err)))))
+      (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
   
-  (** Post with optional reply references *)
-  let post_with_reply ~account_id ~text ~media_urls ?(alt_texts=[]) ~reply_refs on_success on_error =
-    ensure_valid_token ~account_id
-      (fun access_jwt ->
-        Config.get_credentials ~account_id
-          (fun creds ->
-            let identifier = creds.access_token in
-            
-            (* Pair URLs with alt text - use None if alt text list is shorter *)
-            let urls_with_alt = List.mapi (fun i url ->
-              let alt_text = try List.nth alt_texts i with _ -> None in
-              (url, alt_text)
-            ) media_urls in
-            
-            (* Helper to upload multiple blobs in sequence *)
-            let rec upload_blobs_seq urls_with_alt acc on_complete on_err =
-              match urls_with_alt with
-              | [] -> on_complete (List.rev acc)
-              | (url, alt_text) :: rest ->
-                  (* Fetch media from URL *)
-                  Config.Http.get url
-                    (fun media_resp ->
-                      if media_resp.status >= 200 && media_resp.status < 300 then
-                        let mime_type = 
-                          List.assoc_opt "content-type" media_resp.headers 
-                          |> Option.value ~default:"application/octet-stream"
-                        in
-                        (* Upload blob with alt text *)
-                        upload_blob ~access_jwt ~blob_data:media_resp.body ~mime_type ~alt_text
-                          (fun (blob, alt) -> upload_blobs_seq rest ((blob, alt) :: acc) on_complete on_err)
-                          on_err
-                      else
-                        on_err (Printf.sprintf "Failed to fetch media from %s" url))
-                    on_err
-            in
-            
-            (* Upload media if provided (max 4 images) *)
-            let media_to_upload = List.filteri (fun i _ -> i < 4) urls_with_alt in
-            upload_blobs_seq media_to_upload []
-              (fun blobs ->
-                (* Extract facets from text *)
-                extract_facets text
-                  (fun facets ->
-                    (* Create post record *)
-                    let now = Ptime.to_rfc3339 ~frac_s:6 ~tz_offset_s:0 (Ptime_clock.now ()) in
-                    
-                    let base_record = [
-                      ("$type", `String "app.bsky.feed.post");
-                      ("text", `String text);
-                      ("createdAt", `String now);
-                    ] in
-                    
-                    let base_with_facets = 
-                      if List.length facets > 0 then
-                        base_record @ [("facets", `List facets)]
-                      else
-                        base_record
-                    in
-                    
-                    (* Add reply references if provided *)
-                    let base_with_reply = match reply_refs with
-                      | None -> base_with_facets
-                      | Some (root_uri, root_cid, parent_uri, parent_cid) ->
-                          base_with_facets @ [
-                            ("reply", `Assoc [
-                              ("root", `Assoc [
-                                ("uri", `String root_uri);
-                                ("cid", `String root_cid);
-                              ]);
-                              ("parent", `Assoc [
-                                ("uri", `String parent_uri);
-                                ("cid", `String parent_cid);
-                              ]);
-                            ])
-                          ]
-                    in
+  (** {1 Public API - Posting} *)
+  
+  (** Post with optional reply references (internal implementation) *)
+  let post_with_reply_impl ~account_id ~text ~media_urls ?(alt_texts=[]) ?(skip_enrichments=false) ~reply_refs on_result =
+    (* Validate first *)
+    match validate_post ~text ~media_count:(List.length media_urls) () with
+    | Error errs ->
+        on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        let accumulated_warnings = ref [] in
+        
+        ensure_valid_token ~account_id
+          (fun access_jwt ->
+            Config.get_credentials ~account_id
+              (fun creds ->
+                let identifier = creds.access_token in
                 
-                (* Add embed based on content *)
-                let post_record_cont =
-                  if List.length blobs > 0 then
-                    (* Images present *)
-                    (Printf.eprintf "[Bluesky] Post has %d images, skipping link card extraction\n%!" (List.length blobs);
-                     let images_json = `List (List.map (fun (blob, alt_text_opt) ->
-                       let alt_text = match alt_text_opt with
-                         | Some alt when String.length alt > 0 -> alt
-                         | _ -> ""
-                       in
-                       `Assoc [
-                         ("alt", `String alt_text);
-                         ("image", blob);
-                       ]
-                     ) blobs) in
-                     fun on_rec_success ->
-                       on_rec_success (`Assoc (base_with_reply @ [
-                         ("embed", `Assoc [
-                           ("$type", `String "app.bsky.embed.images");
-                           ("images", images_json);
-                         ])
-                       ])))
-                  else
-                    (* Try external link card *)
-                    (Printf.eprintf "[Bluesky] No images attached, checking for URLs in text...\n%!";
-                     let first_url =
-                       try
-                         let url_pattern = Re.Pcre.regexp 
-                           "https?://[a-zA-Z0-9][-a-zA-Z0-9@:%._\\+~#=]{0,256}\\.[a-zA-Z0-9()]{1,6}\\b[-a-zA-Z0-9()@:%_\\+.~#?&/=]*"
-                         in
-                         let group = Re.exec url_pattern text in
-                         Some (Re.Group.get group 0)
-                       with Not_found -> None
-                     in
-                     match first_url with
-                     | None -> 
-                         (Printf.eprintf "[Bluesky] No URLs found in text, posting without embed\n%!";
-                          fun on_rec_success -> on_rec_success (`Assoc base_with_reply))
-                     | Some url ->
-                         (Printf.eprintf "[Bluesky] Found URL in text: %s\n%!" url;
-                          fun on_rec_success ->
-                            fetch_link_card ~access_jwt ~url
-                              (fun card_opt ->
-                                match card_opt with
-                                | None -> on_rec_success (`Assoc base_with_reply)
-                                | Some card_json ->
-                                    (* card_json is already the complete embed structure *)
-                                    try
-                                      let embed = card_json in
-                                      on_rec_success (`Assoc (base_with_reply @ [("embed", embed)]))
-                                    with _ ->
-                                      on_rec_success (`Assoc base_with_reply))
-                              (fun _ -> on_rec_success (`Assoc base_with_reply))))
+                (* Pair URLs with alt text - use None if alt text list is shorter *)
+                let urls_with_alt = List.mapi (fun i url ->
+                  let alt_text = try List.nth alt_texts i with _ -> None in
+                  (url, alt_text)
+                ) media_urls in
+                
+                (* Helper to upload multiple blobs in sequence *)
+                let rec upload_blobs_seq urls_with_alt acc on_complete on_err =
+                  match urls_with_alt with
+                  | [] -> on_complete (List.rev acc)
+                  | (url, alt_text) :: rest ->
+                      (* Fetch media from URL *)
+                      Config.Http.get url
+                        (fun media_resp ->
+                          if media_resp.status >= 200 && media_resp.status < 300 then
+                            let mime_type = 
+                              List.assoc_opt "content-type" media_resp.headers 
+                              |> Option.value ~default:"application/octet-stream"
+                            in
+                            (* Upload blob with alt text *)
+                            upload_blob ~access_jwt ~blob_data:media_resp.body ~mime_type ~alt_text
+                              (fun (blob, alt) -> upload_blobs_seq rest ((blob, alt) :: acc) on_complete on_err)
+                              (fun err -> on_err (Error_types.Internal_error err))
+                          else
+                            on_err (Error_types.make_api_error
+                              ~platform:Platform_types.Bluesky
+                              ~status_code:media_resp.status
+                              ~message:(Printf.sprintf "Failed to fetch media from %s" url) ()))
+                        (fun err -> on_err (Error_types.Network_error (Error_types.Connection_failed err)))
                 in
                 
-                (* Continue with post creation *)
-                post_record_cont
-                  (fun post_record ->
-                    let url = Printf.sprintf "%s/xrpc/com.atproto.repo.createRecord" pds_url in
-                    let body = `Assoc [
-                      ("repo", `String identifier);
-                      ("collection", `String "app.bsky.feed.post");
-                      ("record", post_record);
-                    ] in
-                    let body_str = Yojson.Basic.to_string body in
-                    let headers = [
-                      ("Authorization", Printf.sprintf "Bearer %s" access_jwt);
-                      ("Content-Type", "application/json");
-                    ] in
+                (* Upload media if provided (max 4 images) *)
+                let media_to_upload = List.filteri (fun i _ -> i < 4) urls_with_alt in
+                upload_blobs_seq media_to_upload []
+                  (fun blobs ->
+                    (* Extract facets from text *)
+                    extract_facets text
+                      (fun facets ->
+                        (* Create post record *)
+                        let now = Ptime.to_rfc3339 ~frac_s:6 ~tz_offset_s:0 (Ptime_clock.now ()) in
+                        
+                        let base_record = [
+                          ("$type", `String "app.bsky.feed.post");
+                          ("text", `String text);
+                          ("createdAt", `String now);
+                        ] in
+                        
+                        let base_with_facets = 
+                          if List.length facets > 0 then
+                            base_record @ [("facets", `List facets)]
+                          else
+                            base_record
+                        in
+                        
+                        (* Add reply references if provided *)
+                        let base_with_reply = match reply_refs with
+                          | None -> base_with_facets
+                          | Some (root_uri, root_cid, parent_uri, parent_cid) ->
+                              base_with_facets @ [
+                                ("reply", `Assoc [
+                                  ("root", `Assoc [
+                                    ("uri", `String root_uri);
+                                    ("cid", `String root_cid);
+                                  ]);
+                                  ("parent", `Assoc [
+                                    ("uri", `String parent_uri);
+                                    ("cid", `String parent_cid);
+                                  ]);
+                                ])
+                              ]
+                        in
                     
-                    Config.Http.post ~headers ~body:body_str url
-                      (fun response ->
-                        if response.status >= 200 && response.status < 300 then
+                    (* Add embed based on content *)
+                    let post_record_cont =
+                      if List.length blobs > 0 then
+                        (* Images present - skip link card *)
+                        let images_json = `List (List.map (fun (blob, alt_text_opt) ->
+                          let alt_text = match alt_text_opt with
+                            | Some alt when String.length alt > 0 -> alt
+                            | _ -> ""
+                          in
+                          `Assoc [
+                            ("alt", `String alt_text);
+                            ("image", blob);
+                          ]
+                        ) blobs) in
+                        fun on_rec_success ->
+                          on_rec_success (`Assoc (base_with_reply @ [
+                            ("embed", `Assoc [
+                              ("$type", `String "app.bsky.embed.images");
+                              ("images", images_json);
+                            ])
+                          ]))
+                      else if skip_enrichments then
+                        (* Skip link card extraction *)
+                        fun on_rec_success -> on_rec_success (`Assoc base_with_reply)
+                      else
+                        (* Try external link card *)
+                        let first_url =
                           try
-                            let json = Yojson.Basic.from_string response.body in
-                            let open Yojson.Basic.Util in
-                            let post_uri = json |> member "uri" |> to_string in
-                            let post_cid = json |> member "cid" |> to_string in
-                            (* Return both URI and CID as "uri|cid" *)
-                            on_success (Printf.sprintf "%s|%s" post_uri post_cid)
-                          with e ->
-                            on_error (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))
-                        else
-                          on_error (Printf.sprintf "Bluesky API error (%d): %s" response.status response.body))
-                      on_error))
-                  on_error) (* Close extract_facets callback *)
-              on_error)
-          on_error)
-      on_error
-  
-  (** Post single post without reply refs *)
-  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_success on_error =
-    post_with_reply ~account_id ~text ~media_urls ~alt_texts ~reply_refs:None on_success on_error
-  
-  (** Post thread to Bluesky *)
-  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_success on_error =
-    if List.length texts = 0 then
-      on_error "No posts in thread"
-    else
-      (* Pair media URLs with alt text for each post *)
-      let media_with_alt_per_post = List.map2 (fun media_urls alt_texts ->
-        (media_urls, alt_texts)
-      ) media_urls_per_post (alt_texts_per_post @ List.init (List.length media_urls_per_post - List.length alt_texts_per_post) (fun _ -> [])) in
-      
-      (* Helper to post thread items sequentially *)
-      let rec post_thread_items remaining_texts remaining_media root_ref parent_ref acc_uris =
-        match remaining_texts with
-        | [] -> on_success (List.rev acc_uris)
-        | text :: rest_texts ->
-            let (media, alt_texts) = match remaining_media with
-              | [] -> ([], [])
-              | (m, a) :: _ -> (m, a)
-            in
-            let rest_media = match remaining_media with
-              | [] -> []
-              | _ :: r -> r
-            in
-            
-            let reply_refs = match root_ref with
-              | None -> None  (* First post, no reply *)
-              | Some (root_uri, root_cid) ->
-                  (* Subsequent posts are replies *)
-                  match parent_ref with
-                  | Some (parent_uri, parent_cid) ->
-                      Some (root_uri, root_cid, parent_uri, parent_cid)
-                  | None -> 
-                      (* Should not happen, but use root as parent *)
-                      Some (root_uri, root_cid, root_uri, root_cid)
-            in
-            
-            post_with_reply ~account_id ~text ~media_urls:media ~alt_texts ~reply_refs
-              (fun uri_cid ->
-                (* Parse URI and CID from "uri|cid" format *)
-                match String.split_on_char '|' uri_cid with
-                | [uri; cid] ->
-                    let new_root_ref = match root_ref with
-                      | None -> Some (uri, cid)  (* First post becomes root *)
-                      | Some r -> Some r  (* Keep existing root *)
+                            let url_pattern = Re.Pcre.regexp 
+                              "https?://[a-zA-Z0-9][-a-zA-Z0-9@:%._\\+~#=]{0,256}\\.[a-zA-Z0-9()]{1,6}\\b[-a-zA-Z0-9()@:%_\\+.~#?&/=]*"
+                            in
+                            let group = Re.exec url_pattern text in
+                            Some (Re.Group.get group 0)
+                          with Not_found -> None
+                        in
+                        match first_url with
+                        | None -> 
+                            fun on_rec_success -> on_rec_success (`Assoc base_with_reply)
+                        | Some url ->
+                            fun on_rec_success ->
+                              fetch_link_card ~access_jwt ~url
+                                (fun (card_opt, card_warnings) ->
+                                  accumulated_warnings := !accumulated_warnings @ card_warnings;
+                                  match card_opt with
+                                  | None -> on_rec_success (`Assoc base_with_reply)
+                                  | Some card_json ->
+                                      on_rec_success (`Assoc (base_with_reply @ [("embed", card_json)])))
                     in
-                    let new_parent_ref = Some (uri, cid) in
-                    post_thread_items rest_texts rest_media new_root_ref new_parent_ref (uri_cid :: acc_uris)
-                | _ ->
-                    on_error "Failed to parse post response (expected uri|cid format)")
-              on_error
-      in
+                    
+                    (* Continue with post creation *)
+                    post_record_cont
+                      (fun post_record ->
+                        let url = Printf.sprintf "%s/xrpc/com.atproto.repo.createRecord" pds_url in
+                        let body = `Assoc [
+                          ("repo", `String identifier);
+                          ("collection", `String "app.bsky.feed.post");
+                          ("record", post_record);
+                        ] in
+                        let body_str = Yojson.Basic.to_string body in
+                        let headers = [
+                          ("Authorization", Printf.sprintf "Bearer %s" access_jwt);
+                          ("Content-Type", "application/json");
+                        ] in
+                        
+                        Config.Http.post ~headers ~body:body_str url
+                          (fun response ->
+                            if response.status >= 200 && response.status < 300 then
+                              try
+                                let json = Yojson.Basic.from_string response.body in
+                                let open Yojson.Basic.Util in
+                                let post_uri = json |> member "uri" |> to_string in
+                                let post_cid = json |> member "cid" |> to_string in
+                                (* Return both URI and CID as "uri|cid" *)
+                                let result = Printf.sprintf "%s|%s" post_uri post_cid in
+                                if !accumulated_warnings = [] then
+                                  on_result (Error_types.Success result)
+                                else
+                                  on_result (Error_types.Partial_success { 
+                                    result; 
+                                    warnings = !accumulated_warnings 
+                                  })
+                              with e ->
+                                on_result (Error_types.Failure (Error_types.Internal_error 
+                                  (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))))
+                            else
+                              on_result (Error_types.Failure (parse_api_error 
+                                ~status_code:response.status ~body:response.body)))
+                          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                            (Error_types.Connection_failed err))))))
+                      (fun _ -> on_result (Error_types.Failure (Error_types.Internal_error 
+                        "Facet extraction failed"))))
+                  (fun err -> on_result (Error_types.Failure err)))
+              (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                (Error_types.Connection_failed err)))))
+          (fun err -> on_result (Error_types.Failure err))
+  
+  (** Post a single post to Bluesky
       
-      post_thread_items texts media_with_alt_per_post None None []
+      @param account_id The account identifier
+      @param text The post text (max 300 characters)
+      @param media_urls List of media URLs to attach (max 4)
+      @param alt_texts Optional alt text for each media item
+      @param skip_enrichments Skip link card fetching (default: false)
+      @param on_result Callback receiving the outcome
+  *)
+  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) ?(skip_enrichments=false) on_result =
+    post_with_reply_impl ~account_id ~text ~media_urls ~alt_texts ~skip_enrichments ~reply_refs:None on_result
+  
+  (** Post a thread to Bluesky
+      
+      @param account_id The account identifier
+      @param texts List of post texts
+      @param media_urls_per_post Media URLs for each post
+      @param alt_texts_per_post Alt texts for each post's media
+      @param skip_enrichments Skip link card fetching (default: false)
+      @param on_result Callback receiving the outcome with thread_result
+  *)
+  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) ?(skip_enrichments=false) on_result =
+    (* Validate entire thread upfront *)
+    let media_counts = List.map List.length media_urls_per_post in
+    match validate_thread ~texts ~media_counts () with
+    | Error errs ->
+        on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        let total_requested = List.length texts in
+        let accumulated_warnings = ref [] in
+        
+        (* Pair media URLs with alt text for each post *)
+        let media_with_alt_per_post = List.mapi (fun i media_urls ->
+          let alt_texts = try List.nth alt_texts_per_post i with _ -> [] in
+          (media_urls, alt_texts)
+        ) media_urls_per_post in
+        
+        (* Helper to post thread items sequentially *)
+        let rec post_thread_items remaining_texts remaining_media root_ref parent_ref acc_uris =
+          match remaining_texts with
+          | [] -> 
+              let result = { 
+                Error_types.posted_ids = List.rev acc_uris; 
+                failed_at_index = None;
+                total_requested;
+              } in
+              if !accumulated_warnings = [] then
+                on_result (Error_types.Success result)
+              else
+                on_result (Error_types.Partial_success { result; warnings = !accumulated_warnings })
+          | text :: rest_texts ->
+              let (media, alt_texts) = match remaining_media with
+                | [] -> ([], [])
+                | (m, a) :: _ -> (m, a)
+              in
+              let rest_media = match remaining_media with
+                | [] -> []
+                | _ :: r -> r
+              in
+              
+              let reply_refs = match root_ref with
+                | None -> None  (* First post, no reply *)
+                | Some (root_uri, root_cid) ->
+                    (* Subsequent posts are replies *)
+                    match parent_ref with
+                    | Some (parent_uri, parent_cid) ->
+                        Some (root_uri, root_cid, parent_uri, parent_cid)
+                    | None -> 
+                        (* Should not happen, but use root as parent *)
+                        Some (root_uri, root_cid, root_uri, root_cid)
+              in
+              
+              post_with_reply_impl ~account_id ~text ~media_urls:media ~alt_texts ~skip_enrichments ~reply_refs
+                (function
+                  | Error_types.Success uri_cid ->
+                      process_post_result uri_cid [] rest_texts rest_media root_ref acc_uris
+                  | Error_types.Partial_success { result = uri_cid; warnings } ->
+                      accumulated_warnings := !accumulated_warnings @ warnings;
+                      process_post_result uri_cid warnings rest_texts rest_media root_ref acc_uris
+                  | Error_types.Failure err ->
+                      (* Thread failed mid-way - return partial result *)
+                      let result = { 
+                        Error_types.posted_ids = List.rev acc_uris;
+                        failed_at_index = Some (total_requested - List.length remaining_texts);
+                        total_requested;
+                      } in
+                      if acc_uris = [] then
+                        (* No posts succeeded - this is a full failure *)
+                        on_result (Error_types.Failure err)
+                      else
+                        (* Some posts succeeded - partial success with the error info in warnings *)
+                        on_result (Error_types.Partial_success { 
+                          result; 
+                          warnings = !accumulated_warnings @ [
+                            Error_types.Enrichment_skipped (Error_types.error_to_string err)
+                          ]
+                        }))
+        
+        and process_post_result uri_cid _warnings rest_texts rest_media root_ref acc_uris =
+          (* Parse URI and CID from "uri|cid" format *)
+          match String.split_on_char '|' uri_cid with
+          | [uri; cid] ->
+              let new_root_ref = match root_ref with
+                | None -> Some (uri, cid)  (* First post becomes root *)
+                | Some r -> Some r  (* Keep existing root *)
+              in
+              let new_parent_ref = Some (uri, cid) in
+              post_thread_items rest_texts rest_media new_root_ref new_parent_ref (uri_cid :: acc_uris)
+          | _ ->
+              on_result (Error_types.Failure (Error_types.Internal_error 
+                "Failed to parse post response (expected uri|cid format)"))
+        in
+        
+        post_thread_items texts media_with_alt_per_post None None []
+  
+  (** {1 Public API - Post Management} *)
   
   (** Delete a post from Bluesky *)
-  let delete_post ~account_id ~post_uri on_success on_error =
+  let delete_post ~account_id ~post_uri on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         Config.get_credentials ~account_id
@@ -775,15 +960,20 @@ module Make (Config : CONFIG) = struct
             Config.Http.post ~headers ~body:body_str url
               (fun response ->
                 if response.status >= 200 && response.status < 300 then
-                  on_success ()
+                  on_result (Error_types.Success ())
                 else
-                  on_error (Printf.sprintf "Delete failed (%d): %s" response.status response.body))
-              on_error)
-          on_error)
-      on_error
+                  on_result (Error_types.Failure (parse_api_error 
+                    ~status_code:response.status ~body:response.body)))
+              (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                (Error_types.Connection_failed err)))))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
+  
+  (** {1 Public API - Interactions} *)
   
   (** Like a post *)
-  let like_post ~account_id ~post_uri ~post_cid on_success on_error =
+  let like_post ~account_id ~post_uri ~post_cid on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         Config.get_credentials ~account_id
@@ -818,17 +1008,21 @@ module Make (Config : CONFIG) = struct
                     let like_uri = json 
                       |> Yojson.Basic.Util.member "uri" 
                       |> Yojson.Basic.Util.to_string in
-                    on_success like_uri
+                    on_result (Error_types.Success like_uri)
                   with e ->
-                    on_error (Printf.sprintf "Failed to parse like response: %s" (Printexc.to_string e))
+                    on_result (Error_types.Failure (Error_types.Internal_error 
+                      (Printf.sprintf "Failed to parse like response: %s" (Printexc.to_string e))))
                 else
-                  on_error (Printf.sprintf "Like failed (%d): %s" response.status response.body))
-              on_error)
-          on_error)
-      on_error
+                  on_result (Error_types.Failure (parse_api_error 
+                    ~status_code:response.status ~body:response.body)))
+              (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                (Error_types.Connection_failed err)))))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Unlike a post *)
-  let unlike_post ~account_id ~like_uri on_success on_error =
+  let unlike_post ~account_id ~like_uri on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         Config.get_credentials ~account_id
@@ -852,15 +1046,18 @@ module Make (Config : CONFIG) = struct
             Config.Http.post ~headers ~body:body_str url
               (fun response ->
                 if response.status >= 200 && response.status < 300 then
-                  on_success ()
+                  on_result (Error_types.Success ())
                 else
-                  on_error (Printf.sprintf "Unlike failed (%d): %s" response.status response.body))
-              on_error)
-          on_error)
-      on_error
+                  on_result (Error_types.Failure (parse_api_error 
+                    ~status_code:response.status ~body:response.body)))
+              (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                (Error_types.Connection_failed err)))))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Repost a post *)
-  let repost ~account_id ~post_uri ~post_cid on_success on_error =
+  let repost ~account_id ~post_uri ~post_cid on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         Config.get_credentials ~account_id
@@ -895,17 +1092,21 @@ module Make (Config : CONFIG) = struct
                     let repost_uri = json 
                       |> Yojson.Basic.Util.member "uri" 
                       |> Yojson.Basic.Util.to_string in
-                    on_success repost_uri
+                    on_result (Error_types.Success repost_uri)
                   with e ->
-                    on_error (Printf.sprintf "Failed to parse repost response: %s" (Printexc.to_string e))
+                    on_result (Error_types.Failure (Error_types.Internal_error 
+                      (Printf.sprintf "Failed to parse repost response: %s" (Printexc.to_string e))))
                 else
-                  on_error (Printf.sprintf "Repost failed (%d): %s" response.status response.body))
-              on_error)
-          on_error)
-      on_error
+                  on_result (Error_types.Failure (parse_api_error 
+                    ~status_code:response.status ~body:response.body)))
+              (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                (Error_types.Connection_failed err)))))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Unrepost *)
-  let unrepost ~account_id ~repost_uri on_success on_error =
+  let unrepost ~account_id ~repost_uri on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         Config.get_credentials ~account_id
@@ -929,15 +1130,20 @@ module Make (Config : CONFIG) = struct
             Config.Http.post ~headers ~body:body_str url
               (fun response ->
                 if response.status >= 200 && response.status < 300 then
-                  on_success ()
+                  on_result (Error_types.Success ())
                 else
-                  on_error (Printf.sprintf "Unrepost failed (%d): %s" response.status response.body))
-              on_error)
-          on_error)
-      on_error
+                  on_result (Error_types.Failure (parse_api_error 
+                    ~status_code:response.status ~body:response.body)))
+              (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                (Error_types.Connection_failed err)))))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
+  
+  (** {1 Public API - Social Graph} *)
   
   (** Follow a user *)
-  let follow ~account_id ~did on_success on_error =
+  let follow ~account_id ~did on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         Config.get_credentials ~account_id
@@ -969,17 +1175,21 @@ module Make (Config : CONFIG) = struct
                     let follow_uri = json 
                       |> Yojson.Basic.Util.member "uri" 
                       |> Yojson.Basic.Util.to_string in
-                    on_success follow_uri
+                    on_result (Error_types.Success follow_uri)
                   with e ->
-                    on_error (Printf.sprintf "Failed to parse follow response: %s" (Printexc.to_string e))
+                    on_result (Error_types.Failure (Error_types.Internal_error 
+                      (Printf.sprintf "Failed to parse follow response: %s" (Printexc.to_string e))))
                 else
-                  on_error (Printf.sprintf "Follow failed (%d): %s" response.status response.body))
-              on_error)
-          on_error)
-      on_error
+                  on_result (Error_types.Failure (parse_api_error 
+                    ~status_code:response.status ~body:response.body)))
+              (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                (Error_types.Connection_failed err)))))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Unfollow a user *)
-  let unfollow ~account_id ~follow_uri on_success on_error =
+  let unfollow ~account_id ~follow_uri on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         Config.get_credentials ~account_id
@@ -1003,15 +1213,20 @@ module Make (Config : CONFIG) = struct
             Config.Http.post ~headers ~body:body_str url
               (fun response ->
                 if response.status >= 200 && response.status < 300 then
-                  on_success ()
+                  on_result (Error_types.Success ())
                 else
-                  on_error (Printf.sprintf "Unfollow failed (%d): %s" response.status response.body))
-              on_error)
-          on_error)
-      on_error
+                  on_result (Error_types.Failure (parse_api_error 
+                    ~status_code:response.status ~body:response.body)))
+              (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                (Error_types.Connection_failed err)))))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
+  
+  (** {1 Public API - Read Operations} *)
   
   (** Get a user profile *)
-  let get_profile ~account_id ~actor on_success on_error =
+  let get_profile ~account_id ~actor on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         let url = Printf.sprintf "%s/xrpc/app.bsky.actor.getProfile?actor=%s" 
@@ -1023,16 +1238,19 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Error_types.Success json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse profile: %s" (Printexc.to_string e))
+                on_result (Error_types.Failure (Error_types.Internal_error 
+                  (Printf.sprintf "Failed to parse profile: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Get profile failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error_types.Failure (parse_api_error 
+                ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Get a post thread *)
-  let get_post_thread ~account_id ~post_uri on_success on_error =
+  let get_post_thread ~account_id ~post_uri on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         let url = Printf.sprintf "%s/xrpc/app.bsky.feed.getPostThread?uri=%s" 
@@ -1044,16 +1262,19 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Error_types.Success json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse thread: %s" (Printexc.to_string e))
+                on_result (Error_types.Failure (Error_types.Internal_error 
+                  (Printf.sprintf "Failed to parse thread: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Get thread failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error_types.Failure (parse_api_error 
+                ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Get timeline *)
-  let get_timeline ~account_id ?limit on_success on_error =
+  let get_timeline ~account_id ?limit on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         let limit_param = match limit with
@@ -1068,144 +1289,163 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Error_types.Success json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse timeline: %s" (Printexc.to_string e))
+                on_result (Error_types.Failure (Error_types.Internal_error 
+                  (Printf.sprintf "Failed to parse timeline: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Get timeline failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error_types.Failure (parse_api_error 
+                ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Quote a post with optional text and media *)
-  let quote_post ~account_id ~post_uri ~post_cid ~text ~media_urls ?(alt_texts=[]) on_success on_error =
-    ensure_valid_token ~account_id
-      (fun access_jwt ->
-        Config.get_credentials ~account_id
-          (fun creds ->
-            let identifier = creds.access_token in
-            
-            (* Pair URLs with alt text *)
-            let urls_with_alt = List.mapi (fun i url ->
-              let alt_text = try List.nth alt_texts i with _ -> None in
-              (url, alt_text)
-            ) media_urls in
-            
-            (* Helper to upload blobs *)
-            let rec upload_blobs_seq urls_with_alt acc on_complete on_err =
-              match urls_with_alt with
-              | [] -> on_complete (List.rev acc)
-              | (url, alt_text) :: rest ->
-                  Config.Http.get url
-                    (fun media_resp ->
-                      if media_resp.status >= 200 && media_resp.status < 300 then
-                        let mime_type = 
-                          List.assoc_opt "content-type" media_resp.headers 
-                          |> Option.value ~default:"application/octet-stream"
+  let quote_post ~account_id ~post_uri ~post_cid ~text ~media_urls ?(alt_texts=[]) ?(skip_enrichments=false) on_result =
+    (* Validate first *)
+    match validate_post ~text ~media_count:(List.length media_urls) () with
+    | Error errs ->
+        on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        ensure_valid_token ~account_id
+          (fun access_jwt ->
+            Config.get_credentials ~account_id
+              (fun creds ->
+                let identifier = creds.access_token in
+                let _ = skip_enrichments in (* Quote posts don't use link cards *)
+                
+                (* Pair URLs with alt text *)
+                let urls_with_alt = List.mapi (fun i url ->
+                  let alt_text = try List.nth alt_texts i with _ -> None in
+                  (url, alt_text)
+                ) media_urls in
+                
+                (* Helper to upload blobs *)
+                let rec upload_blobs_seq urls_with_alt acc on_complete on_err =
+                  match urls_with_alt with
+                  | [] -> on_complete (List.rev acc)
+                  | (url, alt_text) :: rest ->
+                      Config.Http.get url
+                        (fun media_resp ->
+                          if media_resp.status >= 200 && media_resp.status < 300 then
+                            let mime_type = 
+                              List.assoc_opt "content-type" media_resp.headers 
+                              |> Option.value ~default:"application/octet-stream"
+                            in
+                            (* Upload with alt text *)
+                            upload_blob ~access_jwt ~blob_data:media_resp.body ~mime_type ~alt_text
+                              (fun (blob, alt) -> upload_blobs_seq rest ((blob, alt) :: acc) on_complete on_err)
+                              (fun err -> on_err (Error_types.Internal_error err))
+                          else
+                            on_err (Error_types.make_api_error
+                              ~platform:Platform_types.Bluesky
+                              ~status_code:media_resp.status
+                              ~message:(Printf.sprintf "Failed to fetch media from %s" url) ()))
+                        (fun err -> on_err (Error_types.Network_error (Error_types.Connection_failed err)))
+                in
+                
+                let media_to_upload = List.filteri (fun i _ -> i < 4) urls_with_alt in
+                upload_blobs_seq media_to_upload []
+                  (fun blobs ->
+                    extract_facets text
+                      (fun facets ->
+                        let now = Ptime.to_rfc3339 ~frac_s:6 ~tz_offset_s:0 (Ptime_clock.now ()) in
+                        
+                        let base_record = [
+                          ("$type", `String "app.bsky.feed.post");
+                          ("text", `String text);
+                          ("createdAt", `String now);
+                        ] in
+                        
+                        let base_with_facets = 
+                          if List.length facets > 0 then
+                            base_record @ [("facets", `List facets)]
+                          else
+                            base_record
                         in
-                        (* Upload with alt text *)
-                        upload_blob ~access_jwt ~blob_data:media_resp.body ~mime_type ~alt_text
-                          (fun (blob, alt) -> upload_blobs_seq rest ((blob, alt) :: acc) on_complete on_err)
-                          on_err
-                      else
-                        on_err (Printf.sprintf "Failed to fetch media from %s" url))
-                    on_err
-            in
-            
-            let media_to_upload = List.filteri (fun i _ -> i < 4) urls_with_alt in
-            upload_blobs_seq media_to_upload []
-              (fun blobs ->
-                extract_facets text
-                  (fun facets ->
-                    let now = Ptime.to_rfc3339 ~frac_s:6 ~tz_offset_s:0 (Ptime_clock.now ()) in
-                    
-                    let base_record = [
-                      ("$type", `String "app.bsky.feed.post");
-                      ("text", `String text);
-                      ("createdAt", `String now);
-                    ] in
-                    
-                    let base_with_facets = 
-                      if List.length facets > 0 then
-                        base_record @ [("facets", `List facets)]
-                      else
-                        base_record
-                    in
-                    
-                    (* Create embed for quote post *)
-                    let quote_embed = `Assoc [
-                      ("$type", `String "app.bsky.embed.record");
-                      ("record", `Assoc [
-                        ("uri", `String post_uri);
-                        ("cid", `String post_cid);
-                      ]);
-                    ] in
-                    
-                    (* If we have media, use recordWithMedia *)
-                    let final_record = 
-                      if List.length blobs > 0 then
-                        let images_json = `List (List.map (fun (blob, alt_text_opt) ->
-                          let alt_text = match alt_text_opt with
-                            | Some alt when String.length alt > 0 -> alt
-                            | _ -> ""
-                          in
-                          `Assoc [
-                            ("alt", `String alt_text);
-                            ("image", blob);
-                          ]
-                        ) blobs) in
-                        base_with_facets @ [
-                          ("embed", `Assoc [
-                            ("$type", `String "app.bsky.embed.recordWithMedia");
-                            ("record", `Assoc [
-                              ("$type", `String "app.bsky.embed.record");
-                              ("record", `Assoc [
-                                ("uri", `String post_uri);
-                                ("cid", `String post_cid);
-                              ]);
-                            ]);
-                            ("media", `Assoc [
-                              ("$type", `String "app.bsky.embed.images");
-                              ("images", images_json);
-                            ]);
-                          ])
-                        ]
-                      else
-                        base_with_facets @ [("embed", quote_embed)]
-                    in
-                    
-                    let url = Printf.sprintf "%s/xrpc/com.atproto.repo.createRecord" pds_url in
-                    let body = `Assoc [
-                      ("repo", `String identifier);
-                      ("collection", `String "app.bsky.feed.post");
-                      ("record", `Assoc final_record);
-                    ] in
-                    let body_str = Yojson.Basic.to_string body in
-                    let headers = [
-                      ("Authorization", Printf.sprintf "Bearer %s" access_jwt);
-                      ("Content-Type", "application/json");
-                    ] in
-                    
-                    Config.Http.post ~headers ~body:body_str url
-                      (fun response ->
-                        if response.status >= 200 && response.status < 300 then
-                          try
-                            let json = Yojson.Basic.from_string response.body in
-                            let post_uri = json 
-                              |> Yojson.Basic.Util.member "uri" 
-                              |> Yojson.Basic.Util.to_string in
-                            on_success post_uri
-                          with e ->
-                            on_error (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))
-                        else
-                          on_error (Printf.sprintf "Quote post failed (%d): %s" response.status response.body))
-                      on_error)
-                  on_error)
-              on_error)
-          on_error)
-      on_error
+                        
+                        (* Create embed for quote post *)
+                        let quote_embed = `Assoc [
+                          ("$type", `String "app.bsky.embed.record");
+                          ("record", `Assoc [
+                            ("uri", `String post_uri);
+                            ("cid", `String post_cid);
+                          ]);
+                        ] in
+                        
+                        (* If we have media, use recordWithMedia *)
+                        let final_record = 
+                          if List.length blobs > 0 then
+                            let images_json = `List (List.map (fun (blob, alt_text_opt) ->
+                              let alt_text = match alt_text_opt with
+                                | Some alt when String.length alt > 0 -> alt
+                                | _ -> ""
+                              in
+                              `Assoc [
+                                ("alt", `String alt_text);
+                                ("image", blob);
+                              ]
+                            ) blobs) in
+                            base_with_facets @ [
+                              ("embed", `Assoc [
+                                ("$type", `String "app.bsky.embed.recordWithMedia");
+                                ("record", `Assoc [
+                                  ("$type", `String "app.bsky.embed.record");
+                                  ("record", `Assoc [
+                                    ("uri", `String post_uri);
+                                    ("cid", `String post_cid);
+                                  ]);
+                                ]);
+                                ("media", `Assoc [
+                                  ("$type", `String "app.bsky.embed.images");
+                                  ("images", images_json);
+                                ]);
+                              ])
+                            ]
+                          else
+                            base_with_facets @ [("embed", quote_embed)]
+                        in
+                        
+                        let url = Printf.sprintf "%s/xrpc/com.atproto.repo.createRecord" pds_url in
+                        let body = `Assoc [
+                          ("repo", `String identifier);
+                          ("collection", `String "app.bsky.feed.post");
+                          ("record", `Assoc final_record);
+                        ] in
+                        let body_str = Yojson.Basic.to_string body in
+                        let headers = [
+                          ("Authorization", Printf.sprintf "Bearer %s" access_jwt);
+                          ("Content-Type", "application/json");
+                        ] in
+                        
+                        Config.Http.post ~headers ~body:body_str url
+                          (fun response ->
+                            if response.status >= 200 && response.status < 300 then
+                              try
+                                let json = Yojson.Basic.from_string response.body in
+                                let result_uri = json 
+                                  |> Yojson.Basic.Util.member "uri" 
+                                  |> Yojson.Basic.Util.to_string in
+                                on_result (Error_types.Success result_uri)
+                              with e ->
+                                on_result (Error_types.Failure (Error_types.Internal_error 
+                                  (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))))
+                            else
+                              on_result (Error_types.Failure (parse_api_error 
+                                ~status_code:response.status ~body:response.body)))
+                          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                            (Error_types.Connection_failed err)))))
+                      (fun _ -> on_result (Error_types.Failure (Error_types.Internal_error 
+                        "Facet extraction failed"))))
+                  (fun err -> on_result (Error_types.Failure err)))
+              (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                (Error_types.Connection_failed err)))))
+          (fun err -> on_result (Error_types.Failure err))
+  
+  (** {1 Public API - Notifications} *)
   
   (** List notifications *)
-  let list_notifications ~account_id ?limit ?cursor on_success on_error =
+  let list_notifications ~account_id ?limit ?cursor on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         let params = [] in
@@ -1231,16 +1471,19 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Error_types.Success json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse notifications: %s" (Printexc.to_string e))
+                on_result (Error_types.Failure (Error_types.Internal_error 
+                  (Printf.sprintf "Failed to parse notifications: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "List notifications failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error_types.Failure (parse_api_error 
+                ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Count unread notifications *)
-  let count_unread_notifications ~account_id on_success on_error =
+  let count_unread_notifications ~account_id on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         let url = Printf.sprintf "%s/xrpc/app.bsky.notification.getUnreadCount" pds_url in
@@ -1254,16 +1497,19 @@ module Make (Config : CONFIG) = struct
                 let count = json 
                   |> Yojson.Basic.Util.member "count" 
                   |> Yojson.Basic.Util.to_int in
-                on_success count
+                on_result (Error_types.Success count)
               with e ->
-                on_error (Printf.sprintf "Failed to parse unread count: %s" (Printexc.to_string e))
+                on_result (Error_types.Failure (Error_types.Internal_error 
+                  (Printf.sprintf "Failed to parse unread count: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Get unread count failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error_types.Failure (parse_api_error 
+                ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Update seen notifications *)
-  let update_seen_notifications ~account_id on_success on_error =
+  let update_seen_notifications ~account_id on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         let now = Ptime.to_rfc3339 ~frac_s:6 ~tz_offset_s:0 (Ptime_clock.now ()) in
@@ -1278,14 +1524,18 @@ module Make (Config : CONFIG) = struct
         Config.Http.post ~headers ~body:body_str url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              on_success ()
+              on_result (Error_types.Success ())
             else
-              on_error (Printf.sprintf "Update seen failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error_types.Failure (parse_api_error 
+                ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
+  
+  (** {1 Public API - Search} *)
   
   (** Search for actors *)
-  let search_actors ~account_id ~query ?limit ?cursor on_success on_error =
+  let search_actors ~account_id ~query ?limit ?cursor on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         let params = [("q", query)] in
@@ -1308,16 +1558,19 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Error_types.Success json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse search results: %s" (Printexc.to_string e))
+                on_result (Error_types.Failure (Error_types.Internal_error 
+                  (Printf.sprintf "Failed to parse search results: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Search actors failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error_types.Failure (parse_api_error 
+                ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Search for posts *)
-  let search_posts ~account_id ~query ?limit ?cursor on_success on_error =
+  let search_posts ~account_id ~query ?limit ?cursor on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         let params = [("q", query)] in
@@ -1340,16 +1593,21 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Error_types.Success json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse search results: %s" (Printexc.to_string e))
+                on_result (Error_types.Failure (Error_types.Internal_error 
+                  (Printf.sprintf "Failed to parse search results: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Search posts failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error_types.Failure (parse_api_error 
+                ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
+  
+  (** {1 Public API - Moderation} *)
   
   (** Mute an actor *)
-  let mute_actor ~account_id ~actor on_success on_error =
+  let mute_actor ~account_id ~actor on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         let url = Printf.sprintf "%s/xrpc/app.bsky.graph.muteActor" pds_url in
@@ -1363,14 +1621,16 @@ module Make (Config : CONFIG) = struct
         Config.Http.post ~headers ~body:body_str url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              on_success ()
+              on_result (Error_types.Success ())
             else
-              on_error (Printf.sprintf "Mute failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error_types.Failure (parse_api_error 
+                ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Unmute an actor *)
-  let unmute_actor ~account_id ~actor on_success on_error =
+  let unmute_actor ~account_id ~actor on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         let url = Printf.sprintf "%s/xrpc/app.bsky.graph.unmuteActor" pds_url in
@@ -1384,14 +1644,16 @@ module Make (Config : CONFIG) = struct
         Config.Http.post ~headers ~body:body_str url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              on_success ()
+              on_result (Error_types.Success ())
             else
-              on_error (Printf.sprintf "Unmute failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error_types.Failure (parse_api_error 
+                ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Block an actor *)
-  let block_actor ~account_id ~actor on_success on_error =
+  let block_actor ~account_id ~actor on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         Config.get_credentials ~account_id
@@ -1423,17 +1685,21 @@ module Make (Config : CONFIG) = struct
                     let block_uri = json 
                       |> Yojson.Basic.Util.member "uri" 
                       |> Yojson.Basic.Util.to_string in
-                    on_success block_uri
+                    on_result (Error_types.Success block_uri)
                   with e ->
-                    on_error (Printf.sprintf "Failed to parse block response: %s" (Printexc.to_string e))
+                    on_result (Error_types.Failure (Error_types.Internal_error 
+                      (Printf.sprintf "Failed to parse block response: %s" (Printexc.to_string e))))
                 else
-                  on_error (Printf.sprintf "Block failed (%d): %s" response.status response.body))
-              on_error)
-          on_error)
-      on_error
+                  on_result (Error_types.Failure (parse_api_error 
+                    ~status_code:response.status ~body:response.body)))
+              (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                (Error_types.Connection_failed err)))))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Unblock an actor *)
-  let unblock_actor ~account_id ~block_uri on_success on_error =
+  let unblock_actor ~account_id ~block_uri on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         Config.get_credentials ~account_id
@@ -1457,15 +1723,20 @@ module Make (Config : CONFIG) = struct
             Config.Http.post ~headers ~body:body_str url
               (fun response ->
                 if response.status >= 200 && response.status < 300 then
-                  on_success ()
+                  on_result (Error_types.Success ())
                 else
-                  on_error (Printf.sprintf "Unblock failed (%d): %s" response.status response.body))
-              on_error)
-          on_error)
-      on_error
+                  on_result (Error_types.Failure (parse_api_error 
+                    ~status_code:response.status ~body:response.body)))
+              (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                (Error_types.Connection_failed err)))))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
+  
+  (** {1 Public API - Feed Operations} *)
   
   (** Get author feed *)
-  let get_author_feed ~account_id ~actor ?limit ?cursor on_success on_error =
+  let get_author_feed ~account_id ~actor ?limit ?cursor on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         let params = [("actor", actor)] in
@@ -1488,16 +1759,19 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Error_types.Success json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse author feed: %s" (Printexc.to_string e))
+                on_result (Error_types.Failure (Error_types.Internal_error 
+                  (Printf.sprintf "Failed to parse author feed: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Get author feed failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error_types.Failure (parse_api_error 
+                ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Get likes for a post *)
-  let get_likes ~account_id ~post_uri ?limit ?cursor on_success on_error =
+  let get_likes ~account_id ~post_uri ?limit ?cursor on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         let params = [("uri", post_uri)] in
@@ -1520,16 +1794,19 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Error_types.Success json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse likes: %s" (Printexc.to_string e))
+                on_result (Error_types.Failure (Error_types.Internal_error 
+                  (Printf.sprintf "Failed to parse likes: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Get likes failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error_types.Failure (parse_api_error 
+                ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Get reposts for a post *)
-  let get_reposted_by ~account_id ~post_uri ?limit ?cursor on_success on_error =
+  let get_reposted_by ~account_id ~post_uri ?limit ?cursor on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         let params = [("uri", post_uri)] in
@@ -1552,16 +1829,19 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Error_types.Success json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse reposts: %s" (Printexc.to_string e))
+                on_result (Error_types.Failure (Error_types.Internal_error 
+                  (Printf.sprintf "Failed to parse reposts: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Get reposts failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error_types.Failure (parse_api_error 
+                ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Get followers *)
-  let get_followers ~account_id ~actor ?limit ?cursor on_success on_error =
+  let get_followers ~account_id ~actor ?limit ?cursor on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         let params = [("actor", actor)] in
@@ -1584,16 +1864,19 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Error_types.Success json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse followers: %s" (Printexc.to_string e))
+                on_result (Error_types.Failure (Error_types.Internal_error 
+                  (Printf.sprintf "Failed to parse followers: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Get followers failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error_types.Failure (parse_api_error 
+                ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Get follows *)
-  let get_follows ~account_id ~actor ?limit ?cursor on_success on_error =
+  let get_follows ~account_id ~actor ?limit ?cursor on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
         let params = [("actor", actor)] in
@@ -1616,41 +1899,14 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Error_types.Success json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse follows: %s" (Printexc.to_string e))
+                on_result (Error_types.Failure (Error_types.Internal_error 
+                  (Printf.sprintf "Failed to parse follows: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Get follows failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
-  
-  (** Validate content for Bluesky *)
-  let validate_content ~text =
-    let max_length = 300 in
-    if String.length text > max_length then
-      Error (Printf.sprintf "Post exceeds %d character limit" max_length)
-    else
-      Ok ()
-  
-  (** Validate media for Bluesky *)
-  let validate_media ~(media : Platform_types.post_media) =
-    match media.Platform_types.media_type with
-    | Image ->
-        if media.file_size_bytes > 1024 * 1024 then
-          Error "Image exceeds 1MB limit"
-        else
-          Ok ()
-    | Video ->
-        if media.file_size_bytes > 50 * 1024 * 1024 then
-          Error "Video exceeds 50MB limit"
-        else
-          (match media.duration_seconds with
-          | Some duration when duration > 60.0 ->
-              Error "Video exceeds 60 second limit"
-          | _ -> Ok ())
-    | Gif ->
-        if media.file_size_bytes > 1024 * 1024 then
-          Error "GIF exceeds 1MB limit"
-        else
-          Ok ()
+              on_result (Error_types.Failure (parse_api_error 
+                ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure err))
 end

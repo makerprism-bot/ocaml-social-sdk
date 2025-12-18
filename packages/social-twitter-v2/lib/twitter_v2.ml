@@ -373,6 +373,133 @@ module Make (Config : CONFIG) = struct
     posts_in_window := !posts_in_window + 1;
     last_post_time := Some (Ptime_clock.now ())
   
+  (** {1 Platform Constants} *)
+  
+  (** Maximum tweet length (Twitter counts characters specially - see Twitter_char_counter) *)
+  let max_tweet_length = 280
+  
+  (** Maximum number of images per tweet *)
+  let max_images = 4
+  
+  (** Maximum video size in bytes (512MB for Twitter Blue, 512MB for non-Blue with some limits) *)
+  let max_video_size_bytes = 512 * 1024 * 1024
+  
+  (** Maximum video duration in seconds (140s for most users, 10 min for Blue) *)
+  let max_video_duration_seconds = 140
+  
+  (** {1 Validation} *)
+  
+  (** Validate a single tweet's content *)
+  let validate_post ~text ?(media_count=0) ?(is_reply=false) () =
+    let errors = ref [] in
+    let char_count = Twitter_char_counter.count ~is_reply text in
+    if char_count > max_tweet_length then
+      errors := Error_types.Text_too_long { length = char_count; max = max_tweet_length } :: !errors;
+    if media_count > max_images then
+      errors := Error_types.Too_many_media { count = media_count; max = max_images } :: !errors;
+    if !errors = [] then Ok ()
+    else Error (List.rev !errors)
+  
+  (** Validate a thread before posting *)
+  let validate_thread ~texts ?(media_counts=[]) () =
+    if texts = [] then
+      Error [Error_types.Thread_empty]
+    else
+      let errors = List.mapi (fun i text ->
+        let media_count = try List.nth media_counts i with _ -> 0 in
+        let is_reply = i > 0 in  (* Replies in thread don't count leading @mentions *)
+        match validate_post ~text ~media_count ~is_reply () with
+        | Ok () -> None
+        | Error errs -> Some (Error_types.Thread_post_invalid { index = i; errors = errs })
+      ) texts |> List.filter_map Fun.id in
+      if errors = [] then Ok ()
+      else Error errors
+  
+  (** Validate media constraints
+      
+      Exported for use by callers who want to pre-validate media before uploading.
+  *)
+  let validate_media ~(media : Platform_types.post_media) =
+    match media.Platform_types.media_type with
+    | Platform_types.Image ->
+        (* Twitter's image size limits depend on format, but generally 5MB for images *)
+        let max_image_bytes = 5 * 1024 * 1024 in
+        if media.file_size_bytes > max_image_bytes then
+          Error [Error_types.Media_too_large { 
+            size_bytes = media.file_size_bytes; 
+            max_bytes = max_image_bytes 
+          }]
+        else
+          Ok ()
+    | Platform_types.Video ->
+        let errors = ref [] in
+        if media.file_size_bytes > max_video_size_bytes then
+          errors := Error_types.Media_too_large { 
+            size_bytes = media.file_size_bytes; 
+            max_bytes = max_video_size_bytes 
+          } :: !errors;
+        (match media.duration_seconds with
+         | Some duration when duration > float_of_int max_video_duration_seconds ->
+             errors := Error_types.Video_too_long { 
+               duration_seconds = duration; 
+               max_seconds = max_video_duration_seconds 
+             } :: !errors
+         | _ -> ());
+        if !errors = [] then Ok ()
+        else Error (List.rev !errors)
+    | Platform_types.Gif ->
+        (* GIFs on Twitter limited to 15MB *)
+        let max_gif_bytes = 15 * 1024 * 1024 in
+        if media.file_size_bytes > max_gif_bytes then
+          Error [Error_types.Media_too_large { 
+            size_bytes = media.file_size_bytes; 
+            max_bytes = max_gif_bytes 
+          }]
+        else
+          Ok ()
+  
+  (** Suppress warning for validate_media - exported for public use *)
+  let _ = validate_media
+  
+  (** {1 Internal Helpers} *)
+  
+  (** Parse API error from response *)
+  let parse_api_error ~status_code ~body =
+    if status_code = 401 then
+      Error_types.Auth_error Error_types.Token_invalid
+    else if status_code = 403 then
+      (* Check for specific Twitter 403 errors *)
+      (try
+        let json = Yojson.Basic.from_string body in
+        let detail = json |> Yojson.Basic.Util.member "detail" |> Yojson.Basic.Util.to_string in
+        if String.length detail > 0 && (String.sub detail 0 (min 10 (String.length detail)) = "Forbidden") then
+          Error_types.Auth_error (Error_types.Insufficient_permissions ["tweet.write"])
+        else
+          Error_types.make_api_error
+            ~platform:Platform_types.Twitter
+            ~status_code
+            ~message:detail
+            ~raw_response:body ()
+      with _ ->
+        Error_types.Auth_error (Error_types.Insufficient_permissions ["tweet.write"]))
+    else if status_code = 429 then
+      Error_types.make_rate_limited ()
+    else
+      Error_types.make_api_error
+        ~platform:Platform_types.Twitter
+        ~status_code
+        ~message:(try
+          let json = Yojson.Basic.from_string body in
+          let detail = json |> Yojson.Basic.Util.member "detail" |> Yojson.Basic.Util.to_string in
+          if detail <> "" then detail
+          else
+            let errors = json |> Yojson.Basic.Util.member "errors" |> Yojson.Basic.Util.to_list in
+            match errors with
+            | err :: _ -> err |> Yojson.Basic.Util.member "message" |> Yojson.Basic.Util.to_string
+            | [] -> "API error"
+        with _ -> "API error")
+        ~raw_response:body ()
+  
   (** Check if token is expired or expiring soon *)
   let is_token_expired_buffer ~buffer_seconds expires_at_opt =
     match expires_at_opt with
@@ -472,8 +599,11 @@ module Make (Config : CONFIG) = struct
             on_error)
       on_error
   
-  (** Update media metadata with alt text using X API v2 *)
-  let update_media_metadata ~access_token ~media_id ~alt_text on_success _on_error =
+  (** Update media metadata with alt text using X API v2 
+      
+      @param on_success Called with `true` if alt-text was set, `false` if it failed
+  *)
+  let update_media_metadata ~access_token ~media_id ~alt_text on_success =
     let url = Printf.sprintf "%s/media/metadata" twitter_upload_base in
     
     (* v2 format: id and metadata object *)
@@ -492,22 +622,14 @@ module Make (Config : CONFIG) = struct
       ("Content-Type", "application/json");
     ] in
     
-    Printf.printf "[Twitter] Updating media metadata for media_id=%s with alt_text=%s\n%!" media_id alt_text;
-    
     Config.Http.post ~headers ~body url
       (fun response ->
-        if response.status >= 200 && response.status < 300 then begin
-          Printf.printf "[Twitter] Alt text update succeeded for media_id=%s\n%!" media_id;
-          on_success ()
-        end else begin
-          Printf.printf "[Twitter] Alt text update failed (%d): %s\n%!" response.status response.body;
-          (* Don't fail the entire upload if alt text update fails, but log it *)
-          on_success ()
-        end)
-      (fun err -> 
-        Printf.printf "[Twitter] Alt text HTTP error: %s\n%!" err;
-        (* Don't fail the entire upload if alt text update fails, but log it *)
-        on_success ())
+        if response.status >= 200 && response.status < 300 then
+          on_success true  (* Alt-text set successfully *)
+        else
+          on_success false)  (* Alt-text failed, but don't block the upload *)
+      (fun _err -> 
+        on_success false)  (* Network error for alt-text, don't block *)
   
   (** Upload media to X API v2 (requires S256 PKCE tokens)
       
@@ -553,12 +675,8 @@ module Make (Config : CONFIG) = struct
       ("Content-Type", "application/json");
     ] in
     
-    Printf.printf "[Twitter] Uploading media to X API v2 (url=%s, category=%s, mime=%s, size=%d, base64_size=%d)\n%!" 
-      url media_category mime_type (String.length media_data) (String.length media_base64);
-    
     Config.Http.post ~headers ~body url
       (fun response ->
-        Printf.printf "[Twitter] Media upload response: status=%d, body=%s\n%!" response.status response.body;
         if response.status >= 200 && response.status < 300 then
           try
             let json = Yojson.Basic.from_string response.body in
@@ -571,14 +689,14 @@ module Make (Config : CONFIG) = struct
                 try json |> Yojson.Basic.Util.member "id" |> Yojson.Basic.Util.to_string
                 with _ -> json |> Yojson.Basic.Util.member "media_id_string" |> Yojson.Basic.Util.to_string
             in
-            Printf.printf "[Twitter] Media upload succeeded: media_id=%s\n%!" media_id;
             (* If alt text provided, update media metadata via POST /2/media/metadata *)
             (match alt_text with
             | Some alt when String.length alt > 0 ->
                 update_media_metadata ~access_token ~media_id ~alt_text:alt
-                  (fun () -> on_success media_id)
-                  on_error
-            | _ -> on_success media_id)
+                  (fun alt_text_succeeded -> 
+                    (* Return tuple of (media_id, alt_text_failed) *)
+                    on_success (media_id, not alt_text_succeeded))
+            | _ -> on_success (media_id, false))  (* No alt-text requested, no failure *)
           with e ->
             on_error (Printf.sprintf "Failed to parse media response: %s\nBody: %s" (Printexc.to_string e) response.body)
         else if response.status = 403 then
@@ -604,8 +722,6 @@ module Make (Config : CONFIG) = struct
       else "tweet_image" in
     let total_bytes = String.length media_data in
     
-    Printf.printf "[Twitter] Starting chunked upload (url=%s, category=%s, mime=%s, total_bytes=%d)\n%!" url media_category mime_type total_bytes;
-    
     (* Phase 1: INIT - use multipart/form-data per v2 docs *)
     let init_parts = [
       { Social_core.name = "command"; content = "INIT"; filename = None; content_type = None };
@@ -619,7 +735,6 @@ module Make (Config : CONFIG) = struct
     
     Config.Http.post_multipart ~headers ~parts:init_parts url
       (fun init_response ->
-        Printf.printf "[Twitter] INIT response: status=%d, body=%s\n%!" init_response.status init_response.body;
         if init_response.status >= 200 && init_response.status < 300 then
           try
             let init_json = Yojson.Basic.from_string init_response.body in
@@ -628,14 +743,12 @@ module Make (Config : CONFIG) = struct
               try init_json |> Yojson.Basic.Util.member "data" |> Yojson.Basic.Util.member "id" |> Yojson.Basic.Util.to_string
               with _ -> init_json |> Yojson.Basic.Util.member "media_id_string" |> Yojson.Basic.Util.to_string
             in
-            Printf.printf "[Twitter] INIT succeeded: media_id=%s\n%!" media_id_string;
             
             (* Phase 2: APPEND chunks - use multipart with actual file data *)
             let chunk_size = 5 * 1024 * 1024 in (* 5MB chunks *)
             let rec upload_chunks offset segment_index =
               if offset >= total_bytes then begin
                 (* Phase 3: FINALIZE *)
-                Printf.printf "[Twitter] All chunks uploaded, sending FINALIZE\n%!";
                 let finalize_parts = [
                   { Social_core.name = "command"; content = "FINALIZE"; filename = None; content_type = None };
                   { name = "media_id"; content = media_id_string; filename = None; content_type = None };
@@ -643,15 +756,14 @@ module Make (Config : CONFIG) = struct
                 
                 Config.Http.post_multipart ~headers ~parts:finalize_parts url
                   (fun finalize_response ->
-                    Printf.printf "[Twitter] FINALIZE response: status=%d, body=%s\n%!" finalize_response.status finalize_response.body;
                     if finalize_response.status >= 200 && finalize_response.status < 300 then
                       (* Optionally add alt text *)
                       (match alt_text with
                        | Some text ->
                            update_media_metadata ~access_token ~media_id:media_id_string ~alt_text:text
-                             (fun () -> on_success media_id_string)
-                             on_error
-                       | None -> on_success media_id_string)
+                             (fun alt_text_succeeded -> 
+                               on_success (media_id_string, not alt_text_succeeded))
+                       | None -> on_success (media_id_string, false))
                     else
                       on_error (Printf.sprintf "Failed to finalize upload (%d): %s" 
                         finalize_response.status finalize_response.body))
@@ -661,8 +773,6 @@ module Make (Config : CONFIG) = struct
                 let remaining = total_bytes - offset in
                 let current_chunk_size = min chunk_size remaining in
                 let chunk = String.sub media_data offset current_chunk_size in
-                
-                Printf.printf "[Twitter] Uploading chunk %d (offset=%d, size=%d)\n%!" segment_index offset current_chunk_size;
                 
                 (* v2 APPEND uses multipart with raw media data *)
                 let append_parts = [
@@ -674,7 +784,6 @@ module Make (Config : CONFIG) = struct
                 
                 Config.Http.post_multipart ~headers ~parts:append_parts url
                   (fun append_response ->
-                    Printf.printf "[Twitter] APPEND response: status=%d\n%!" append_response.status;
                     if append_response.status >= 200 && append_response.status < 300 then
                       upload_chunks (offset + current_chunk_size) (segment_index + 1)
                     else
@@ -693,67 +802,156 @@ module Make (Config : CONFIG) = struct
             init_response.status init_response.body))
       on_error
   
-  (** Post single tweet *)
-  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_success on_error =
-    match check_rate_limit () with
-    | Error msg -> on_error msg
+  (** Post single tweet
+      
+      @param account_id The account identifier
+      @param text The tweet text (max 280 weighted characters)
+      @param media_urls List of media URLs to attach (max 4)
+      @param alt_texts Optional alt text for each media item
+      @param on_result Callback receiving the outcome with tweet ID
+  *)
+  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_result =
+    (* Validate before making any API calls *)
+    let media_count = List.length media_urls in
+    match validate_post ~text ~media_count () with
+    | Error errs ->
+        on_result (Error_types.Failure (Error_types.Validation_error errs))
     | Ok () ->
-        ensure_valid_token ~account_id
-          (fun access_token ->
-            (* Helper to fetch media with retry logic *)
-            let fetch_media_with_retry url max_retries on_success on_err =
-              let rec attempt retry_count =
-                Config.Http.get url
-                  (fun media_resp ->
-                    if media_resp.status >= 200 && media_resp.status < 300 then
-                      on_success media_resp
-                    else if retry_count < max_retries && 
-                            (media_resp.status >= 500 || media_resp.status = 429) then
-                      (* Retry on server errors and rate limits *)
-                      attempt (retry_count + 1)
-                    else
-                      on_err (Printf.sprintf "Failed to fetch media from %s (status: %d, retries: %d)" 
-                        url media_resp.status retry_count))
-                  (fun err ->
-                    if retry_count < max_retries then
-                      attempt (retry_count + 1)
-                    else
-                      on_err (Printf.sprintf "Failed to fetch media from %s after %d retries: %s" 
-                        url max_retries err))
-              in
-              attempt 0
-            in
-            
-            (* Pair URLs with alt text - use None if alt text list is shorter *)
-            let urls_with_alt = List.mapi (fun i url ->
-              let alt_text = try List.nth alt_texts i with _ -> None in
-              (url, alt_text)
-            ) media_urls in
-            
-            (* Helper to upload multiple media in sequence *)
-            let rec upload_media_seq urls_with_alt acc on_complete on_err =
-              match urls_with_alt with
-              | [] -> on_complete (List.rev acc)
-              | (url, alt_text) :: rest ->
-                  (* Fetch media from URL with retry *)
-                  fetch_media_with_retry url 3
-                    (fun media_resp ->
-                      let mime_type = 
-                        List.assoc_opt "content-type" media_resp.headers 
-                        |> Option.value ~default:"image/jpeg"
-                      in
-                      (* Upload to Twitter with alt text *)
-                      upload_media ~access_token ~media_data:media_resp.body ~mime_type ~alt_text
-                        (fun media_id -> upload_media_seq rest (media_id :: acc) on_complete on_err)
-                        on_err)
-                    on_err
-            in
-            
-            (* Upload media if provided (max 4) *)
-            let media_to_upload = List.filteri (fun i _ -> i < 4) urls_with_alt in
-            upload_media_seq media_to_upload []
-              (fun media_ids ->
-                (* Create tweet *)
+        match check_rate_limit () with
+        | Error _msg -> 
+            on_result (Error_types.Failure (Error_types.make_rate_limited 
+              ~retry_after_seconds:3600 ()))  (* Suggest retry after 1 hour *)
+        | Ok () ->
+            ensure_valid_token ~account_id
+              (fun access_token ->
+                let accumulated_warnings = ref [] in
+                
+                (* Helper to fetch media with retry logic *)
+                let fetch_media_with_retry url max_retries on_success on_err =
+                  let rec attempt retry_count =
+                    Config.Http.get url
+                      (fun media_resp ->
+                        if media_resp.status >= 200 && media_resp.status < 300 then
+                          on_success media_resp
+                        else if retry_count < max_retries && 
+                                (media_resp.status >= 500 || media_resp.status = 429) then
+                          attempt (retry_count + 1)
+                        else
+                          on_err (Printf.sprintf "Failed to fetch media from %s (status: %d)" 
+                            url media_resp.status))
+                      (fun err ->
+                        if retry_count < max_retries then
+                          attempt (retry_count + 1)
+                        else
+                          on_err (Printf.sprintf "Failed to fetch media from %s: %s" url err))
+                  in
+                  attempt 0
+                in
+                
+                (* Pair URLs with alt text - use None if alt text list is shorter *)
+                let urls_with_alt = List.mapi (fun i url ->
+                  let alt_text = try List.nth alt_texts i with _ -> None in
+                  (url, alt_text)
+                ) media_urls in
+                
+                (* Helper to upload multiple media in sequence, accumulating warnings for alt text failures *)
+                let rec upload_media_seq urls_with_alt acc on_complete on_err =
+                  match urls_with_alt with
+                  | [] -> on_complete (List.rev acc)
+                  | (url, alt_text) :: rest ->
+                      fetch_media_with_retry url 3
+                        (fun media_resp ->
+                          let mime_type = 
+                            List.assoc_opt "content-type" media_resp.headers 
+                            |> Option.value ~default:"image/jpeg"
+                          in
+                          (* Upload to Twitter - alt text failures become warnings, not errors *)
+                          upload_media ~access_token ~media_data:media_resp.body ~mime_type ~alt_text
+                            (fun (media_id, alt_text_failed) -> 
+                              if alt_text_failed then
+                                accumulated_warnings := Error_types.Alt_text_failed media_id :: !accumulated_warnings;
+                              upload_media_seq rest (media_id :: acc) on_complete on_err)
+                            on_err)
+                        on_err
+                in
+                
+                (* Upload media if provided (max 4) *)
+                let media_to_upload = List.filteri (fun i _ -> i < 4) urls_with_alt in
+                upload_media_seq media_to_upload []
+                  (fun media_ids ->
+                    (* Create tweet *)
+                    let url = Printf.sprintf "%s/tweets" twitter_api_base in
+                    
+                    let base_fields = [("text", `String text)] in
+                    let body_json = 
+                      if List.length media_ids > 0 then
+                        `Assoc (("media", `Assoc [
+                          ("media_ids", `List (List.map (fun id -> `String id) media_ids))
+                        ]) :: base_fields)
+                      else
+                        `Assoc base_fields
+                    in
+                    let body = Yojson.Basic.to_string body_json in
+                    
+                    let headers = [
+                      ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                      ("Content-Type", "application/json");
+                    ] in
+                    
+                    Config.Http.post ~headers ~body url
+                      (fun response ->
+                        if response.status >= 200 && response.status < 300 then
+                          try
+                            let json = Yojson.Basic.from_string response.body in
+                            let tweet_id = json
+                              |> Yojson.Basic.Util.member "data"
+                              |> Yojson.Basic.Util.member "id"
+                              |> Yojson.Basic.Util.to_string in
+                            record_post ();
+                            if !accumulated_warnings = [] then
+                              on_result (Error_types.Success tweet_id)
+                            else
+                              on_result (Error_types.Partial_success { 
+                                result = tweet_id; 
+                                warnings = !accumulated_warnings 
+                              })
+                          with e ->
+                            on_result (Error_types.Failure (Error_types.Internal_error 
+                              (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))))
+                        else
+                          on_result (Error_types.Failure (parse_api_error 
+                            ~status_code:response.status ~body:response.body)))
+                      (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                        (Error_types.Connection_failed err)))))
+                  (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                    (Error_types.Connection_failed err)))))
+              (fun err -> on_result (Error_types.Failure (Error_types.Auth_error 
+                (Error_types.Refresh_failed err))))
+  
+  (** Post single tweet with pre-uploaded media IDs 
+      
+      This function is for when media has already been uploaded to Twitter
+      and you have the media_ids. Use this when the backend handles media
+      upload separately from posting.
+      
+      @param account_id The account identifier
+      @param text The tweet text
+      @param media_ids List of pre-uploaded media IDs
+      @param on_result Callback receiving the outcome with tweet ID
+  *)
+  let post_single_with_media_ids ~account_id ~text ~media_ids on_result =
+    let media_count = List.length media_ids in
+    match validate_post ~text ~media_count () with
+    | Error errs ->
+        on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        match check_rate_limit () with
+        | Error _ -> 
+            on_result (Error_types.Failure (Error_types.make_rate_limited 
+              ~retry_after_seconds:3600 ()))
+        | Ok () ->
+            ensure_valid_token ~account_id
+              (fun access_token ->
                 let url = Printf.sprintf "%s/tweets" twitter_api_base in
                 
                 let base_fields = [("text", `String text)] in
@@ -782,252 +980,333 @@ module Make (Config : CONFIG) = struct
                           |> Yojson.Basic.Util.member "id"
                           |> Yojson.Basic.Util.to_string in
                         record_post ();
-                        on_success tweet_id
+                        on_result (Error_types.Success tweet_id)
                       with e ->
-                        on_error (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))
-                    else if response.status = 429 then
-                      on_error "Twitter rate limit exceeded"
+                        on_result (Error_types.Failure (Error_types.Internal_error 
+                          (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))))
                     else
-                      on_error (Printf.sprintf "Twitter API error (%d): %s" response.status response.body))
-                  on_error)
-              on_error)
-          on_error
-  
-  (** Post single tweet with pre-uploaded media IDs 
-      
-      This function is for when media has already been uploaded to Twitter
-      and you have the media_ids. Use this when the backend handles media
-      upload separately from posting.
-  *)
-  let post_single_with_media_ids ~account_id ~text ~media_ids on_success on_error =
-    match check_rate_limit () with
-    | Error msg -> on_error msg
-    | Ok () ->
-        ensure_valid_token ~account_id
-          (fun access_token ->
-            (* Create tweet with pre-uploaded media IDs *)
-            let url = Printf.sprintf "%s/tweets" twitter_api_base in
-            
-            let base_fields = [("text", `String text)] in
-            let body_json = 
-              if List.length media_ids > 0 then
-                `Assoc (("media", `Assoc [
-                  ("media_ids", `List (List.map (fun id -> `String id) media_ids))
-                ]) :: base_fields)
-              else
-                `Assoc base_fields
-            in
-            let body = Yojson.Basic.to_string body_json in
-            
-            let headers = [
-              ("Authorization", Printf.sprintf "Bearer %s" access_token);
-              ("Content-Type", "application/json");
-            ] in
-            
-            Config.Http.post ~headers ~body url
-              (fun response ->
-                if response.status >= 200 && response.status < 300 then
-                  try
-                    let json = Yojson.Basic.from_string response.body in
-                    let tweet_id = json
-                      |> Yojson.Basic.Util.member "data"
-                      |> Yojson.Basic.Util.member "id"
-                      |> Yojson.Basic.Util.to_string in
-                    record_post ();
-                    on_success tweet_id
-                  with e ->
-                    on_error (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))
-                else if response.status = 429 then
-                  on_error "Twitter rate limit exceeded"
-                else
-                  on_error (Printf.sprintf "Twitter API error (%d): %s" response.status response.body))
-              on_error)
-          on_error
+                      on_result (Error_types.Failure (parse_api_error 
+                        ~status_code:response.status ~body:response.body)))
+                  (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                    (Error_types.Connection_failed err)))))
+              (fun err -> on_result (Error_types.Failure (Error_types.Auth_error 
+                (Error_types.Refresh_failed err))))
   
   (** Post thread with pre-uploaded media IDs 
       
       Each text gets paired with its corresponding media_ids list.
       The first tweet in the thread can have media, subsequent tweets
       are replies.
+      
+      @param account_id The account identifier
+      @param texts List of tweet texts
+      @param media_ids_per_post Media IDs for each post
+      @param on_result Callback receiving the outcome with thread_result
   *)
-  let post_thread_with_media_ids ~account_id ~texts ~media_ids_per_post on_success on_error =
-    if List.length texts = 0 then
-      on_error "No tweets in thread"
-    else
-      ensure_valid_token ~account_id
-        (fun access_token ->
-          (* Helper to post tweets in sequence with reply references *)
-          let rec post_tweets_seq texts_remaining media_remaining reply_to_id acc_ids =
-            match texts_remaining with
-            | [] -> on_success (List.rev acc_ids)
-            | text :: rest_texts ->
-                let current_media = match media_remaining with
-                  | media :: rest_media -> (media, rest_media)
-                  | [] -> ([], [])
-                in
-                let (media_ids, next_media) = current_media in
-                
-                (* Create tweet *)
-                let url = Printf.sprintf "%s/tweets" twitter_api_base in
-                
-                let base_fields = [("text", `String text)] in
-                let base_with_reply = match reply_to_id with
-                  | Some id -> ("reply", `Assoc [("in_reply_to_tweet_id", `String id)]) :: base_fields
-                  | None -> base_fields
-                in
-                let body_json = 
-                  if List.length media_ids > 0 then
-                    `Assoc (("media", `Assoc [
-                      ("media_ids", `List (List.map (fun id -> `String id) media_ids))
-                    ]) :: base_with_reply)
-                  else
-                    `Assoc base_with_reply
-                in
-                let body = Yojson.Basic.to_string body_json in
-                
-                let headers = [
-                  ("Authorization", Printf.sprintf "Bearer %s" access_token);
-                  ("Content-Type", "application/json");
-                ] in
-                
-                Config.Http.post ~headers ~body url
-                  (fun response ->
-                    if response.status >= 200 && response.status < 300 then
-                      try
-                        let json = Yojson.Basic.from_string response.body in
-                        let tweet_id = json
-                          |> Yojson.Basic.Util.member "data"
-                          |> Yojson.Basic.Util.member "id"
-                          |> Yojson.Basic.Util.to_string in
-                        record_post ();
-                        (* Continue with next tweet *)
-                        post_tweets_seq rest_texts next_media (Some tweet_id) (tweet_id :: acc_ids)
-                      with e ->
-                        on_error (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))
-                    else if response.status = 429 then
-                      on_error "Twitter rate limit exceeded"
+  let post_thread_with_media_ids ~account_id ~texts ~media_ids_per_post on_result =
+    let media_counts = List.map List.length media_ids_per_post in
+    match validate_thread ~texts ~media_counts () with
+    | Error errs ->
+        on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        ensure_valid_token ~account_id
+          (fun access_token ->
+            let total_requested = List.length texts in
+            
+            (* Helper to post tweets in sequence with reply references *)
+            let rec post_tweets_seq texts_remaining media_remaining reply_to_id acc_ids =
+              match texts_remaining with
+              | [] -> 
+                  let result = { 
+                    Error_types.posted_ids = List.rev acc_ids; 
+                    failed_at_index = None;
+                    total_requested;
+                  } in
+                  on_result (Error_types.Success result)
+              | text :: rest_texts ->
+                  let current_media = match media_remaining with
+                    | media :: rest_media -> (media, rest_media)
+                    | [] -> ([], [])
+                  in
+                  let (media_ids, next_media) = current_media in
+                  
+                  (* Create tweet *)
+                  let url = Printf.sprintf "%s/tweets" twitter_api_base in
+                  
+                  let base_fields = [("text", `String text)] in
+                  let base_with_reply = match reply_to_id with
+                    | Some id -> ("reply", `Assoc [("in_reply_to_tweet_id", `String id)]) :: base_fields
+                    | None -> base_fields
+                  in
+                  let body_json = 
+                    if List.length media_ids > 0 then
+                      `Assoc (("media", `Assoc [
+                        ("media_ids", `List (List.map (fun id -> `String id) media_ids))
+                      ]) :: base_with_reply)
                     else
-                      on_error (Printf.sprintf "Twitter API error (%d): %s" response.status response.body))
-                  on_error
-          in
-          
-          post_tweets_seq texts media_ids_per_post None [])
-        on_error
-  
-  (** Post thread with media URLs *)
-  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_success on_error =
-    if List.length texts = 0 then
-      on_error "No tweets in thread"
-    else
-      ensure_valid_token ~account_id
-        (fun access_token ->
-          (* Helper to fetch media with retry logic *)
-          let fetch_media_with_retry url max_retries on_success on_err =
-            let rec attempt retry_count =
-              Config.Http.get url
-                (fun media_resp ->
-                  if media_resp.status >= 200 && media_resp.status < 300 then
-                    on_success media_resp
-                  else if retry_count < max_retries && 
-                          (media_resp.status >= 500 || media_resp.status = 429) then
-                    attempt (retry_count + 1)
-                  else
-                    on_err (Printf.sprintf "Failed to fetch media from %s (status: %d)" url media_resp.status))
-                on_err
-            in
-            attempt 0
-          in
-          
-          (* Helper to upload multiple media in sequence with alt text *)
-          let rec upload_media_seq urls_with_alt acc on_complete on_err =
-            match urls_with_alt with
-            | [] -> on_complete (List.rev acc)
-            | (url, alt_text) :: rest ->
-                fetch_media_with_retry url 3
-                  (fun media_resp ->
-                    let mime_type = 
-                      List.assoc_opt "content-type" media_resp.headers 
-                      |> Option.value ~default:"image/jpeg"
-                    in
-                    (* Upload with alt text *)
-                    upload_media ~access_token ~media_data:media_resp.body ~mime_type ~alt_text
-                      (fun media_id -> upload_media_seq rest (media_id :: acc) on_complete on_err)
-                      on_err)
-                  on_err
-          in
-          
-          (* Pair media URLs with alt text for each post *)
-          let media_with_alt_per_post = List.map2 (fun media_urls alt_texts ->
-            List.mapi (fun i url ->
-              let alt_text = try List.nth alt_texts i with _ -> None in
-              (url, alt_text)
-            ) media_urls
-          ) media_urls_per_post (alt_texts_per_post @ List.init (List.length media_urls_per_post - List.length alt_texts_per_post) (fun _ -> [])) in
-          
-          (* Post tweets in sequence with reply references *)
-          let rec post_tweets_seq texts_remaining media_remaining reply_to_id acc_ids =
-            match texts_remaining with
-            | [] -> on_success (List.rev acc_ids)
-            | text :: rest_texts ->
-                let current_media = match media_remaining with
-                  | media :: rest_media -> (media, rest_media)
-                  | [] -> ([], [])
-                in
-                let (media_with_alt, next_media) = current_media in
-                
-                (* Upload media for this tweet *)
-                let media_to_upload = List.filteri (fun i _ -> i < 4) media_with_alt in
-                upload_media_seq media_to_upload []
-                  (fun media_ids ->
-                    (* Create tweet *)
-                    let url = Printf.sprintf "%s/tweets" twitter_api_base in
-                    
-                    let base_fields = [("text", `String text)] in
-                    let base_with_reply = match reply_to_id with
-                      | Some id -> ("reply", `Assoc [("in_reply_to_tweet_id", `String id)]) :: base_fields
-                      | None -> base_fields
-                    in
-                    let body_json = 
-                      if List.length media_ids > 0 then
-                        `Assoc (("media", `Assoc [
-                          ("media_ids", `List (List.map (fun id -> `String id) media_ids))
-                        ]) :: base_with_reply)
+                      `Assoc base_with_reply
+                  in
+                  let body = Yojson.Basic.to_string body_json in
+                  
+                  let headers = [
+                    ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                    ("Content-Type", "application/json");
+                  ] in
+                  
+                  Config.Http.post ~headers ~body url
+                    (fun response ->
+                      if response.status >= 200 && response.status < 300 then
+                        try
+                          let json = Yojson.Basic.from_string response.body in
+                          let tweet_id = json
+                            |> Yojson.Basic.Util.member "data"
+                            |> Yojson.Basic.Util.member "id"
+                            |> Yojson.Basic.Util.to_string in
+                          record_post ();
+                          post_tweets_seq rest_texts next_media (Some tweet_id) (tweet_id :: acc_ids)
+                        with e ->
+                          let result = { 
+                            Error_types.posted_ids = List.rev acc_ids;
+                            failed_at_index = Some (total_requested - List.length texts_remaining);
+                            total_requested;
+                          } in
+                          if acc_ids = [] then
+                            on_result (Error_types.Failure (Error_types.Internal_error 
+                              (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))))
+                          else
+                            on_result (Error_types.Partial_success { 
+                              result; 
+                              warnings = [Error_types.Enrichment_skipped 
+                                (Printf.sprintf "Parse error: %s" (Printexc.to_string e))]
+                            })
                       else
-                        `Assoc base_with_reply
-                    in
-                    let body = Yojson.Basic.to_string body_json in
-                    
-                    let headers = [
-                      ("Authorization", Printf.sprintf "Bearer %s" access_token);
-                      ("Content-Type", "application/json");
-                    ] in
-                    
-                    Config.Http.post ~headers ~body url
-                      (fun response ->
-                        if response.status >= 200 && response.status < 300 then
-                          try
-                            let json = Yojson.Basic.from_string response.body in
-                            let tweet_id = json
-                              |> Yojson.Basic.Util.member "data"
-                              |> Yojson.Basic.Util.member "id"
-                              |> Yojson.Basic.Util.to_string in
-                            record_post ();
-                            post_tweets_seq rest_texts next_media (Some tweet_id) (tweet_id :: acc_ids)
-                          with e ->
-                            on_error (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))
-                        else if response.status = 429 then
-                          on_error "Twitter rate limit exceeded"
+                        let result = { 
+                          Error_types.posted_ids = List.rev acc_ids;
+                          failed_at_index = Some (total_requested - List.length texts_remaining);
+                          total_requested;
+                        } in
+                        let err = parse_api_error ~status_code:response.status ~body:response.body in
+                        if acc_ids = [] then
+                          on_result (Error_types.Failure err)
                         else
-                          on_error (Printf.sprintf "Twitter API error (%d): %s" response.status response.body))
-                      on_error)
-                  on_error
-          in
-          
-          post_tweets_seq texts media_with_alt_per_post None [])
-        on_error
+                          on_result (Error_types.Partial_success { 
+                            result; 
+                            warnings = [Error_types.Enrichment_skipped (Error_types.error_to_string err)]
+                          }))
+                    (fun err ->
+                      let result = { 
+                        Error_types.posted_ids = List.rev acc_ids;
+                        failed_at_index = Some (total_requested - List.length texts_remaining);
+                        total_requested;
+                      } in
+                      if acc_ids = [] then
+                        on_result (Error_types.Failure (Error_types.Network_error 
+                          (Error_types.Connection_failed err)))
+                      else
+                        on_result (Error_types.Partial_success { 
+                          result; 
+                          warnings = [Error_types.Enrichment_skipped err]
+                        }))
+            in
+            
+            post_tweets_seq texts media_ids_per_post None [])
+          (fun err -> on_result (Error_types.Failure (Error_types.Auth_error 
+            (Error_types.Refresh_failed err))))
   
-  (** Delete a tweet *)
-  let delete_tweet ~account_id ~tweet_id on_success on_error =
+  (** Post thread with media URLs
+      
+      @param account_id The account identifier
+      @param texts List of tweet texts
+      @param media_urls_per_post Media URLs for each post
+      @param alt_texts_per_post Alt texts for each post's media
+      @param on_result Callback receiving the outcome with thread_result
+  *)
+  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_result =
+    let media_counts = List.map List.length media_urls_per_post in
+    match validate_thread ~texts ~media_counts () with
+    | Error errs ->
+        on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        ensure_valid_token ~account_id
+          (fun access_token ->
+            let total_requested = List.length texts in
+            let accumulated_warnings = ref [] in
+            
+            (* Helper to fetch media with retry logic *)
+            let fetch_media_with_retry url max_retries on_success on_err =
+              let rec attempt retry_count =
+                Config.Http.get url
+                  (fun media_resp ->
+                    if media_resp.status >= 200 && media_resp.status < 300 then
+                      on_success media_resp
+                    else if retry_count < max_retries && 
+                            (media_resp.status >= 500 || media_resp.status = 429) then
+                      attempt (retry_count + 1)
+                    else
+                      on_err (Printf.sprintf "Failed to fetch media from %s (status: %d)" url media_resp.status))
+                  on_err
+              in
+              attempt 0
+            in
+            
+            (* Helper to upload multiple media in sequence with alt text *)
+            let rec upload_media_seq urls_with_alt acc on_complete on_err =
+              match urls_with_alt with
+              | [] -> on_complete (List.rev acc)
+              | (url, alt_text) :: rest ->
+                  fetch_media_with_retry url 3
+                    (fun media_resp ->
+                      let mime_type = 
+                        List.assoc_opt "content-type" media_resp.headers 
+                        |> Option.value ~default:"image/jpeg"
+                      in
+                      (* Upload with alt text - failures become warnings *)
+                      upload_media ~access_token ~media_data:media_resp.body ~mime_type ~alt_text
+                        (fun (media_id, alt_text_failed) -> 
+                          if alt_text_failed then
+                            accumulated_warnings := Error_types.Alt_text_failed media_id :: !accumulated_warnings;
+                          upload_media_seq rest (media_id :: acc) on_complete on_err)
+                        on_err)
+                    on_err
+            in
+            
+            (* Pair media URLs with alt text for each post *)
+            let media_with_alt_per_post = List.map2 (fun media_urls alt_texts ->
+              List.mapi (fun i url ->
+                let alt_text = try List.nth alt_texts i with _ -> None in
+                (url, alt_text)
+              ) media_urls
+            ) media_urls_per_post (alt_texts_per_post @ List.init (List.length media_urls_per_post - List.length alt_texts_per_post) (fun _ -> [])) in
+            
+            (* Post tweets in sequence with reply references *)
+            let rec post_tweets_seq texts_remaining media_remaining reply_to_id acc_ids =
+              match texts_remaining with
+              | [] -> 
+                  let result = { 
+                    Error_types.posted_ids = List.rev acc_ids; 
+                    failed_at_index = None;
+                    total_requested;
+                  } in
+                  if !accumulated_warnings = [] then
+                    on_result (Error_types.Success result)
+                  else
+                    on_result (Error_types.Partial_success { result; warnings = !accumulated_warnings })
+              | text :: rest_texts ->
+                  let current_media = match media_remaining with
+                    | media :: rest_media -> (media, rest_media)
+                    | [] -> ([], [])
+                  in
+                  let (media_with_alt, next_media) = current_media in
+                  
+                  (* Upload media for this tweet *)
+                  let media_to_upload = List.filteri (fun i _ -> i < 4) media_with_alt in
+                  upload_media_seq media_to_upload []
+                    (fun media_ids ->
+                      (* Create tweet *)
+                      let url = Printf.sprintf "%s/tweets" twitter_api_base in
+                      
+                      let base_fields = [("text", `String text)] in
+                      let base_with_reply = match reply_to_id with
+                        | Some id -> ("reply", `Assoc [("in_reply_to_tweet_id", `String id)]) :: base_fields
+                        | None -> base_fields
+                      in
+                      let body_json = 
+                        if List.length media_ids > 0 then
+                          `Assoc (("media", `Assoc [
+                            ("media_ids", `List (List.map (fun id -> `String id) media_ids))
+                          ]) :: base_with_reply)
+                        else
+                          `Assoc base_with_reply
+                      in
+                      let body = Yojson.Basic.to_string body_json in
+                      
+                      let headers = [
+                        ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                        ("Content-Type", "application/json");
+                      ] in
+                      
+                      Config.Http.post ~headers ~body url
+                        (fun response ->
+                          if response.status >= 200 && response.status < 300 then
+                            try
+                              let json = Yojson.Basic.from_string response.body in
+                              let tweet_id = json
+                                |> Yojson.Basic.Util.member "data"
+                                |> Yojson.Basic.Util.member "id"
+                                |> Yojson.Basic.Util.to_string in
+                              record_post ();
+                              post_tweets_seq rest_texts next_media (Some tweet_id) (tweet_id :: acc_ids)
+                            with e ->
+                              let result = { 
+                                Error_types.posted_ids = List.rev acc_ids;
+                                failed_at_index = Some (total_requested - List.length texts_remaining);
+                                total_requested;
+                              } in
+                              if acc_ids = [] then
+                                on_result (Error_types.Failure (Error_types.Internal_error 
+                                  (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))))
+                              else
+                                on_result (Error_types.Partial_success { 
+                                  result; 
+                                  warnings = !accumulated_warnings @ [Error_types.Enrichment_skipped 
+                                    (Printf.sprintf "Parse error: %s" (Printexc.to_string e))]
+                                })
+                          else
+                            let result = { 
+                              Error_types.posted_ids = List.rev acc_ids;
+                              failed_at_index = Some (total_requested - List.length texts_remaining);
+                              total_requested;
+                            } in
+                            let err = parse_api_error ~status_code:response.status ~body:response.body in
+                            if acc_ids = [] then
+                              on_result (Error_types.Failure err)
+                            else
+                              on_result (Error_types.Partial_success { 
+                                result; 
+                                warnings = !accumulated_warnings @ [Error_types.Enrichment_skipped 
+                                  (Error_types.error_to_string err)]
+                              }))
+                        (fun err ->
+                          let result = { 
+                            Error_types.posted_ids = List.rev acc_ids;
+                            failed_at_index = Some (total_requested - List.length texts_remaining);
+                            total_requested;
+                          } in
+                          if acc_ids = [] then
+                            on_result (Error_types.Failure (Error_types.Network_error 
+                              (Error_types.Connection_failed err)))
+                          else
+                            on_result (Error_types.Partial_success { 
+                              result; 
+                              warnings = !accumulated_warnings @ [Error_types.Enrichment_skipped err]
+                            })))
+                    (fun err ->
+                      let result = { 
+                        Error_types.posted_ids = List.rev acc_ids;
+                        failed_at_index = Some (total_requested - List.length texts_remaining);
+                        total_requested;
+                      } in
+                      if acc_ids = [] then
+                        on_result (Error_types.Failure (Error_types.Network_error 
+                          (Error_types.Connection_failed err)))
+                      else
+                        on_result (Error_types.Partial_success { 
+                          result; 
+                          warnings = !accumulated_warnings @ [Error_types.Enrichment_skipped err]
+                        }))
+            in
+            
+            post_tweets_seq texts media_with_alt_per_post None [])
+          (fun err -> on_result (Error_types.Failure (Error_types.Auth_error 
+            (Error_types.Refresh_failed err))))
+  
+  (** Delete a tweet
+      
+      @param account_id The account identifier
+      @param tweet_id The ID of the tweet to delete
+      @param on_result Callback receiving the outcome
+  *)
+  let delete_tweet ~account_id ~tweet_id on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let url = Printf.sprintf "%s/tweets/%s" twitter_api_base tweet_id in
@@ -1045,15 +1324,21 @@ module Make (Config : CONFIG) = struct
                   |> Yojson.Basic.Util.member "deleted"
                   |> Yojson.Basic.Util.to_bool in
                 if deleted then
-                  on_success ()
+                  on_result (Error_types.Success ())
                 else
-                  on_error "Tweet was not deleted"
+                  on_result (Error_types.Failure (Error_types.Internal_error "Tweet was not deleted"))
               with e ->
-                on_error (Printf.sprintf "Failed to parse delete response: %s" (Printexc.to_string e))
+                on_result (Error_types.Failure (Error_types.Internal_error 
+                  (Printf.sprintf "Failed to parse delete response: %s" (Printexc.to_string e))))
+            else if response.status = 404 then
+              on_result (Error_types.Failure (Error_types.Resource_not_found tweet_id))
             else
-              on_error (Printf.sprintf "Failed to delete tweet (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error_types.Failure (parse_api_error 
+                ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+            (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error_types.Failure (Error_types.Auth_error 
+        (Error_types.Refresh_failed err))))
   
   (** Get a tweet by ID with optional expansions and fields *)
   let get_tweet ~account_id ~tweet_id ?(expansions=[]) ?(tweet_fields=[]) () on_success on_error =
@@ -1783,7 +2068,8 @@ module Make (Config : CONFIG) = struct
                         |> Option.value ~default:"image/jpeg"
                       in
                       upload_media ~access_token ~media_data:media_resp.body ~mime_type
-                        (fun media_id -> upload_media_seq rest (media_id :: acc) on_complete on_err)
+                        (fun (media_id, _alt_text_failed) -> 
+                          upload_media_seq rest (media_id :: acc) on_complete on_err)
                         on_err)
                     on_err
             in
@@ -1864,7 +2150,8 @@ module Make (Config : CONFIG) = struct
                         |> Option.value ~default:"image/jpeg"
                       in
                       upload_media ~access_token ~media_data:media_resp.body ~mime_type
-                        (fun media_id -> upload_media_seq rest (media_id :: acc) on_complete on_err)
+                        (fun (media_id, _alt_text_failed) -> 
+                          upload_media_seq rest (media_id :: acc) on_complete on_err)
                         on_err)
                     on_err
             in

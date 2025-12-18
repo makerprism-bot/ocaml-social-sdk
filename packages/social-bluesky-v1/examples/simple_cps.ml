@@ -89,11 +89,17 @@ let () =
   Printf.printf "\n2. Posting to Bluesky...\n";
   Bluesky.post_single
     ~account_id:"demo"
-    ~text:"Hello from OCaml CPS! 🐫"
+    ~text:"Hello from OCaml CPS!"
     ~media_urls:[]
-    (fun post_uri ->
-      Printf.printf "   ✓ Success: %s\n%!" post_uri)
-    (fun error ->
-      Printf.printf "   ✗ Failed: %s\n%!" error);
+    (function
+      | Error_types.Success post_uri ->
+          Printf.printf "   ✓ Success: %s\n%!" post_uri
+      | Error_types.Partial_success { result = post_uri; warnings } ->
+          Printf.printf "   ✓ Success with warnings: %s\n%!" post_uri;
+          List.iter (fun w -> 
+            Printf.printf "     Warning: %s\n%!" (Error_types.warning_to_string w)
+          ) warnings
+      | Error_types.Failure err ->
+          Printf.printf "   ✗ Failed: %s\n%!" (Error_types.error_to_string err));
   
   Printf.printf "\n=== Complete ===\n"

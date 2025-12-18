@@ -382,6 +382,114 @@ module Make (Config : CONFIG) = struct
           | Error _ -> true
         with _ -> true
   
+  (** {1 Platform Constants} *)
+  
+  (** Maximum post length (LinkedIn allows 3000 characters for posts) *)
+  let max_text_length = 3000
+  
+  (** Maximum number of images per post *)
+  let max_images = 9
+  
+  (** Maximum image size (8MB) *)
+  let max_image_size_bytes = 8 * 1024 * 1024
+  
+  (** Maximum video size (200MB for standard accounts) *)
+  let max_video_size_bytes = 200 * 1024 * 1024
+  
+  (** Maximum video duration in seconds (10 minutes) *)
+  let max_video_duration_seconds = 600
+  
+  (** {1 Validation} *)
+  
+  (** Validate a single post's content *)
+  let validate_post ~text ?(media_count=0) () =
+    let errors = ref [] in
+    let text_len = String.length text in
+    if text_len > max_text_length then
+      errors := Error_types.Text_too_long { length = text_len; max = max_text_length } :: !errors;
+    if media_count > max_images then
+      errors := Error_types.Too_many_media { count = media_count; max = max_images } :: !errors;
+    if !errors = [] then Ok ()
+    else Error (List.rev !errors)
+  
+  (** Validate a thread before posting (LinkedIn only posts first item) *)
+  let validate_thread ~texts ?(media_counts=[]) () =
+    if texts = [] then
+      Error [Error_types.Thread_empty]
+    else
+      (* LinkedIn only posts the first item, so only validate that *)
+      let first_text = List.hd texts in
+      let first_media_count = match media_counts with [] -> 0 | c :: _ -> c in
+      match validate_post ~text:first_text ~media_count:first_media_count () with
+      | Ok () -> Ok ()
+      | Error errs -> Error [Error_types.Thread_post_invalid { index = 0; errors = errs }]
+  
+  (** Validate media constraints *)
+  let validate_media ~(media : Platform_types.post_media) =
+    match media.Platform_types.media_type with
+    | Platform_types.Image ->
+        if media.file_size_bytes > max_image_size_bytes then
+          Error [Error_types.Media_too_large { 
+            size_bytes = media.file_size_bytes; 
+            max_bytes = max_image_size_bytes 
+          }]
+        else
+          Ok ()
+    | Platform_types.Video ->
+        let errors = ref [] in
+        if media.file_size_bytes > max_video_size_bytes then
+          errors := Error_types.Media_too_large { 
+            size_bytes = media.file_size_bytes; 
+            max_bytes = max_video_size_bytes 
+          } :: !errors;
+        (match media.duration_seconds with
+         | Some duration when duration > float_of_int max_video_duration_seconds ->
+             errors := Error_types.Video_too_long { 
+               duration_seconds = duration; 
+               max_seconds = max_video_duration_seconds 
+             } :: !errors
+         | _ -> ());
+        if !errors = [] then Ok ()
+        else Error (List.rev !errors)
+    | Platform_types.Gif ->
+        if media.file_size_bytes > max_image_size_bytes then
+          Error [Error_types.Media_too_large { 
+            size_bytes = media.file_size_bytes; 
+            max_bytes = max_image_size_bytes 
+          }]
+        else
+          Ok ()
+  
+  (** Suppress warning for validate_media - exported for public use *)
+  let _ = validate_media
+  
+  (** {1 Internal Helpers} *)
+  
+  (** Parse API error from response *)
+  let parse_api_error ~status_code ~body =
+    if status_code = 401 then
+      Error_types.Auth_error Error_types.Token_expired
+    else if status_code = 403 then
+      Error_types.Auth_error (Error_types.Insufficient_permissions ["w_member_social"])
+    else if status_code = 429 then
+      Error_types.make_rate_limited ()
+    else
+      Error_types.make_api_error
+        ~platform:Platform_types.LinkedIn
+        ~status_code
+        ~message:(try
+          let json = Yojson.Basic.from_string body in
+          let open Yojson.Basic.Util in
+          let msg = json |> member "message" |> to_string_option in
+          let service_code = json |> member "serviceErrorCode" |> to_int_option in
+          match msg, service_code with
+          | Some m, Some code -> Printf.sprintf "Error %d: %s" code m
+          | Some m, None -> m
+          | None, Some code -> Printf.sprintf "Service error code: %d" code
+          | None, None -> "API error"
+        with _ -> "API error")
+        ~raw_response:body ()
+  
   (** Refresh OAuth 2.0 access token (PARTNER PROGRAM ONLY)
       
       IMPORTANT: Programmatic token refresh is only available for LinkedIn Partner Program apps.
@@ -435,8 +543,6 @@ module Make (Config : CONFIG) = struct
                 with _ -> refresh_token in
               (* CRITICAL: Read actual expires_in from LinkedIn refresh response *)
               let expires_in = json |> member "expires_in" |> to_int in
-              Printf.printf "[LinkedIn] Token refreshed, new expiration in %d seconds (%d days)\n%!" 
-                expires_in (expires_in / 86400);
               let expires_at = 
                 let now = Ptime_clock.now () in
                 match Ptime.add_span now (Ptime.Span.of_int_s expires_in) with
@@ -468,54 +574,21 @@ module Make (Config : CONFIG) = struct
   let ensure_valid_token ~account_id on_success on_error =
     Config.get_credentials ~account_id
       (fun creds ->
-        (* Log token status for debugging *)
-        let expires_info = match creds.expires_at with
-          | Some exp_str -> 
-              (try
-                match Ptime.of_rfc3339 exp_str with
-                | Ok (exp_time, _, _) ->
-                    let now = Ptime_clock.now () in
-                    let diff = Ptime.diff exp_time now in
-                    let days = Ptime.Span.to_d_ps diff |> fst in
-                    Printf.sprintf "expires in %d days (%s)" days exp_str
-                | Error _ -> Printf.sprintf "invalid format: %s" exp_str
-              with _ -> Printf.sprintf "parse error: %s" exp_str)
-          | None -> "no expiration set"
-        in
-        
-        let has_refresh = match creds.refresh_token with
-          | Some _ -> "has refresh_token"
-          | None -> "NO refresh_token (LinkedIn standard app limitation)"
-        in
-        
-        Printf.printf "[LinkedIn] Token check for account %s: %s, %s\n%!" 
-          account_id expires_info has_refresh;
-        
         (* Check if token needs refresh (7 days buffer) *)
         if is_token_expired_buffer ~buffer_seconds:604800 creds.expires_at then (
-          Printf.printf "[LinkedIn] Token expiring soon for account %s (within 7 days), attempting refresh...\n%!" account_id;
-          
           (* Token expiring soon, refresh it *)
           match creds.refresh_token with
           | None ->
-              let error_msg = "LinkedIn token expired but no refresh_token available. " ^
-                              "LinkedIn standard apps (with 'Sign In with LinkedIn' and 'Share on LinkedIn' products) " ^
-                              "do not support programmatic token refresh. User must reconnect via OAuth flow. " ^
-                              "Tokens last 60 days from initial authorization." in
-              Printf.printf "[LinkedIn] ERROR for account %s: %s\n%!" account_id error_msg;
               Config.update_health_status ~account_id ~status:"token_expired" 
                 ~error_message:(Some "Token expired - please reconnect (LinkedIn tokens last 60 days)")
                 (fun () -> on_error "LinkedIn token expired - please reconnect your account")
                 on_error
           | Some refresh_token ->
-              Printf.printf "[LinkedIn] Attempting programmatic refresh for account %s...\n%!" account_id;
               let client_id = Config.get_env "LINKEDIN_CLIENT_ID" |> Option.value ~default:"" in
               let client_secret = Config.get_env "LINKEDIN_CLIENT_SECRET" |> Option.value ~default:"" in
               
               refresh_access_token ~client_id ~client_secret ~refresh_token
                 (fun (new_access, new_refresh, expires_at) ->
-                  Printf.printf "[LinkedIn] Successfully refreshed token for account %s, new expiry: %s\n%!" 
-                    account_id expires_at;
                   (* Update stored credentials *)
                   let updated_creds = {
                     access_token = new_access;
@@ -530,7 +603,6 @@ module Make (Config : CONFIG) = struct
                         on_error)
                     on_error)
                 (fun err ->
-                  Printf.printf "[LinkedIn] Token refresh FAILED for account %s: %s\n%!" account_id err;
                   let user_friendly_error = 
                     if String.length err > 100 && 
                        (Str.string_match (Str.regexp ".*[Pp]rogrammatic.*") err 0 ||
@@ -544,7 +616,6 @@ module Make (Config : CONFIG) = struct
                     (fun () -> on_error user_friendly_error)
                     on_error)
         ) else (
-          Printf.printf "[LinkedIn] Token valid for account %s (%s)\n%!" account_id expires_info;
           (* Token still valid *)
           Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
             (fun () -> on_success creds.access_token)
@@ -663,159 +734,202 @@ module Make (Config : CONFIG) = struct
       Some (Re.Group.get group 0)
     with Not_found -> None
   
-  (** Post to LinkedIn *)
-  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_success on_error =
-    ensure_valid_token ~account_id
-      (fun access_token ->
-        get_person_urn ~access_token
-          (fun person_urn ->
-            (* Upload all media items first *)
-            let rec upload_all_media urls_with_alt acc on_complete =
-              match urls_with_alt with
-              | [] -> on_complete (List.rev acc)
-              | (url, alt_text) :: rest ->
-                  (* Determine media type from URL or default to image *)
-                  let is_video_url url =
-                    let lower = String.lowercase_ascii url in
-                    Filename.check_suffix lower ".mp4" ||
-                    Filename.check_suffix lower ".mov" ||
-                    Filename.check_suffix lower ".mpeg" ||
-                    Filename.check_suffix lower ".avi"
-                  in
-                  let media_type = if is_video_url url then "video" else "image" in
-                  upload_media ~access_token ~person_urn 
-                    ~media_url:url 
-                    ~media_type
-                    ~alt_text
-                    (fun (asset_urn, alt_text) ->
-                      let uploaded = { 
-                        asset_urn; 
-                        media_type; 
-                        alt_text 
-                      } in
-                      upload_all_media rest (uploaded :: acc) on_complete)
-                    on_error
-            in
-            
-            (* Pair URLs with alt text *)
-            let urls_with_alt = List.mapi (fun i url ->
-              let alt_text = try List.nth alt_texts i with _ -> None in
-              (url, alt_text)
-            ) media_urls in
-            
-            upload_all_media urls_with_alt [] (fun uploaded_media ->
-                (* Extract URL from text for link preview *)
-                let text_url = extract_first_url text in
-                
-                (* Determine share media category and build specific content *)
-                let specific_content = 
-                  match uploaded_media, text_url with
-                  | [], Some url ->
-                      (* URL found, no uploaded media - use ARTICLE for rich link preview *)
-                      [
-                        ("shareCommentary", `Assoc [("text", `String text)]);
-                        ("shareMediaCategory", `String "ARTICLE");
-                        ("media", `List [
-                          `Assoc [
-                            ("status", `String "READY");
-                            ("originalUrl", `String url);
-                          ]
-                        ]);
-                      ]
-                  | [], None ->
-                      (* No media, no URL - text only *)
-                      [
-                        ("shareCommentary", `Assoc [("text", `String text)]);
-                        ("shareMediaCategory", `String "NONE");
-                      ]
-                  | uploaded_media, _ ->
-                      (* Has uploaded media - use existing media handling logic *)
-                      let category = match uploaded_media with
-                        | first :: _ -> if first.media_type = "video" then "VIDEO" else "IMAGE"
-                        | [] -> "NONE"
+  (** Post to LinkedIn
+      
+      @param account_id The account identifier
+      @param text The post text (max 3000 characters)
+      @param media_urls List of media URLs to attach (max 9)
+      @param alt_texts Optional alt text for each media item
+      @param on_result Callback receiving the outcome with post ID
+  *)
+  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_result =
+    (* Validate before making any API calls *)
+    let media_count = List.length media_urls in
+    match validate_post ~text ~media_count () with
+    | Error errs ->
+        on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        ensure_valid_token ~account_id
+          (fun access_token ->
+            get_person_urn ~access_token
+              (fun person_urn ->
+                (* Upload all media items first *)
+                let rec upload_all_media urls_with_alt acc on_complete on_err =
+                  match urls_with_alt with
+                  | [] -> on_complete (List.rev acc)
+                  | (url, alt_text) :: rest ->
+                      (* Determine media type from URL or default to image *)
+                      let is_video_url url =
+                        let lower = String.lowercase_ascii url in
+                        Filename.check_suffix lower ".mp4" ||
+                        Filename.check_suffix lower ".mov" ||
+                        Filename.check_suffix lower ".mpeg" ||
+                        Filename.check_suffix lower ".avi"
                       in
-                      let media_json = `List (List.map (fun media ->
-                        let base_fields = [
-                          ("status", `String "READY");
-                          ("media", `String media.asset_urn);
-                        ] in
-                        (* Add description (alt text) if available *)
-                        let with_description = match media.alt_text with
-                          | Some alt when String.length alt > 0 ->
-                              base_fields @ [("description", `Assoc [("text", `String alt)])]
-                          | _ -> base_fields
-                        in
-                        `Assoc with_description
-                      ) uploaded_media) in
-                      [
-                        ("shareCommentary", `Assoc [("text", `String text)]);
-                        ("shareMediaCategory", `String category);
-                        ("media", media_json);
-                      ]
+                      let media_type = if is_video_url url then "video" else "image" in
+                      upload_media ~access_token ~person_urn 
+                        ~media_url:url 
+                        ~media_type
+                        ~alt_text
+                        (fun (asset_urn, alt_text) ->
+                          let uploaded = { 
+                            asset_urn; 
+                            media_type; 
+                            alt_text 
+                          } in
+                          upload_all_media rest (uploaded :: acc) on_complete on_err)
+                        on_err
                 in
                 
-                let post_body = `Assoc [
-                  ("author", `String person_urn);
-                  ("lifecycleState", `String "PUBLISHED");
-                  ("specificContent", `Assoc [
-                    ("com.linkedin.ugc.ShareContent", `Assoc specific_content)
-                  ]);
-                  ("visibility", `Assoc [
-                    ("com.linkedin.ugc.MemberNetworkVisibility", `String "PUBLIC")
-                  ])
-                ] in
+                (* Pair URLs with alt text *)
+                let urls_with_alt = List.mapi (fun i url ->
+                  let alt_text = try List.nth alt_texts i with _ -> None in
+                  (url, alt_text)
+                ) media_urls in
                 
-                let url = Printf.sprintf "%s/ugcPosts" linkedin_api_base in
-                let body = Yojson.Basic.to_string post_body in
-                let headers = [
-                  ("Authorization", Printf.sprintf "Bearer %s" access_token);
-                  ("Content-Type", "application/json");
-                  ("X-Restli-Protocol-Version", "2.0.0");
-                ] in
-                
-                Config.Http.post ~headers ~body url
-                  (fun response ->
-                    if response.status >= 200 && response.status < 300 then
-                      (* LinkedIn returns post ID in X-RestLi-Id header *)
-                      let post_id = 
-                        try
-                          (* Parse from response headers if available *)
-                          let json = Yojson.Basic.from_string response.body in
-                          json |> Yojson.Basic.Util.member "id" |> Yojson.Basic.Util.to_string
-                        with _ -> "unknown"
-                      in
-                      on_success post_id
-                    else
-                      (* Parse error response *)
-                      let error_msg = 
-                        try
-                          let json = Yojson.Basic.from_string response.body in
-                          let open Yojson.Basic.Util in
-                          let error = json |> member "message" |> to_string_option in
-                          let service_error = json |> member "serviceErrorCode" |> to_int_option in
-                          match error, service_error with
-                          | Some msg, Some code -> Printf.sprintf "Error %d: %s" code msg
-                          | Some msg, None -> msg
-                          | None, Some code -> Printf.sprintf "Service error code: %d" code
-                          | None, None -> response.body
-                        with _ -> response.body
-                      in
-                      on_error (Printf.sprintf "LinkedIn API error (%d): %s" response.status error_msg))
-                  on_error))
-          on_error)
-      on_error
+                upload_all_media urls_with_alt [] 
+                  (fun uploaded_media ->
+                    (* Extract URL from text for link preview *)
+                    let text_url = extract_first_url text in
+                    
+                    (* Determine share media category and build specific content *)
+                    let specific_content = 
+                      match uploaded_media, text_url with
+                      | [], Some url ->
+                          (* URL found, no uploaded media - use ARTICLE for rich link preview *)
+                          [
+                            ("shareCommentary", `Assoc [("text", `String text)]);
+                            ("shareMediaCategory", `String "ARTICLE");
+                            ("media", `List [
+                              `Assoc [
+                                ("status", `String "READY");
+                                ("originalUrl", `String url);
+                              ]
+                            ]);
+                          ]
+                      | [], None ->
+                          (* No media, no URL - text only *)
+                          [
+                            ("shareCommentary", `Assoc [("text", `String text)]);
+                            ("shareMediaCategory", `String "NONE");
+                          ]
+                      | uploaded_media, _ ->
+                          (* Has uploaded media - use existing media handling logic *)
+                          let category = match uploaded_media with
+                            | first :: _ -> if first.media_type = "video" then "VIDEO" else "IMAGE"
+                            | [] -> "NONE"
+                          in
+                          let media_json = `List (List.map (fun media ->
+                            let base_fields = [
+                              ("status", `String "READY");
+                              ("media", `String media.asset_urn);
+                            ] in
+                            (* Add description (alt text) if available *)
+                            let with_description = match media.alt_text with
+                              | Some alt when String.length alt > 0 ->
+                                  base_fields @ [("description", `Assoc [("text", `String alt)])]
+                              | _ -> base_fields
+                            in
+                            `Assoc with_description
+                          ) uploaded_media) in
+                          [
+                            ("shareCommentary", `Assoc [("text", `String text)]);
+                            ("shareMediaCategory", `String category);
+                            ("media", media_json);
+                          ]
+                    in
+                    
+                    let post_body = `Assoc [
+                      ("author", `String person_urn);
+                      ("lifecycleState", `String "PUBLISHED");
+                      ("specificContent", `Assoc [
+                        ("com.linkedin.ugc.ShareContent", `Assoc specific_content)
+                      ]);
+                      ("visibility", `Assoc [
+                        ("com.linkedin.ugc.MemberNetworkVisibility", `String "PUBLIC")
+                      ])
+                    ] in
+                    
+                    let url = Printf.sprintf "%s/ugcPosts" linkedin_api_base in
+                    let body = Yojson.Basic.to_string post_body in
+                    let headers = [
+                      ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                      ("Content-Type", "application/json");
+                      ("X-Restli-Protocol-Version", "2.0.0");
+                    ] in
+                    
+                    Config.Http.post ~headers ~body url
+                      (fun response ->
+                        if response.status >= 200 && response.status < 300 then
+                          let post_id = 
+                            try
+                              let json = Yojson.Basic.from_string response.body in
+                              json |> Yojson.Basic.Util.member "id" |> Yojson.Basic.Util.to_string
+                            with _ -> "unknown"
+                          in
+                          on_result (Error_types.Success post_id)
+                        else
+                          on_result (Error_types.Failure (parse_api_error 
+                            ~status_code:response.status ~body:response.body)))
+                      (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                        (Error_types.Connection_failed err)))))
+                  (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                    (Error_types.Connection_failed err)))))
+              (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                (Error_types.Connection_failed err)))))
+          (fun err -> on_result (Error_types.Failure (Error_types.Auth_error 
+            (Error_types.Refresh_failed err))))
   
-  (** Post thread (LinkedIn doesn't support threads, posts only first item) *)
-  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_success on_error =
-    if List.length texts = 0 then
-      on_error "No content to post"
-    else
-      let first_text = List.hd texts in
-      let first_media = if List.length media_urls_per_post > 0 then List.hd media_urls_per_post else [] in
-      let first_alt_texts = if List.length alt_texts_per_post > 0 then List.hd alt_texts_per_post else [] in
-      post_single ~account_id ~text:first_text ~media_urls:first_media ~alt_texts:first_alt_texts
-        (fun post_id -> on_success [post_id])
-        on_error
+  (** Post thread (LinkedIn doesn't support threads, posts only first item)
+      
+      @param account_id The account identifier
+      @param texts List of post texts (only first is used)
+      @param media_urls_per_post Media URLs for each post
+      @param alt_texts_per_post Alt texts for each post's media
+      @param on_result Callback receiving the outcome with thread_result
+  *)
+  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_result =
+    let media_counts = List.map List.length media_urls_per_post in
+    match validate_thread ~texts ~media_counts () with
+    | Error errs ->
+        on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        let first_text = List.hd texts in
+        let first_media = if List.length media_urls_per_post > 0 then List.hd media_urls_per_post else [] in
+        let first_alt_texts = if List.length alt_texts_per_post > 0 then List.hd alt_texts_per_post else [] in
+        post_single ~account_id ~text:first_text ~media_urls:first_media ~alt_texts:first_alt_texts
+          (fun outcome ->
+            match outcome with
+            | Error_types.Success post_id ->
+                let result = { 
+                  Error_types.posted_ids = [post_id];
+                  failed_at_index = None;
+                  total_requested = List.length texts;
+                } in
+                (* If more than one text was provided, add a warning that only first was posted *)
+                if List.length texts > 1 then
+                  on_result (Error_types.Partial_success { 
+                    result; 
+                    warnings = [Error_types.Enrichment_skipped 
+                      "LinkedIn does not support threads - only first post was published"]
+                  })
+                else
+                  on_result (Error_types.Success result)
+            | Error_types.Partial_success { result = post_id; warnings } ->
+                let result = { 
+                  Error_types.posted_ids = [post_id];
+                  failed_at_index = None;
+                  total_requested = List.length texts;
+                } in
+                let extra_warning = 
+                  if List.length texts > 1 then
+                    [Error_types.Enrichment_skipped 
+                      "LinkedIn does not support threads - only first post was published"]
+                  else []
+                in
+                on_result (Error_types.Partial_success { result; warnings = warnings @ extra_warning })
+            | Error_types.Failure err ->
+                on_result (Error_types.Failure err))
   
   (** OAuth authorization URL *)
   let get_oauth_url ~redirect_uri ~state on_success on_error =
@@ -892,27 +1006,8 @@ module Make (Config : CONFIG) = struct
               
               match expires_in_result with
               | Error err ->
-                  let response_preview = if String.length response.body > 200 
-                    then String.sub response.body 0 200 ^ "..." 
-                    else response.body in
-                  Printf.printf "[LinkedIn] ERROR: %s. Response: %s\n%!" err response_preview;
                   on_error err
               | Ok expires_in ->
-              
-              (* Log refresh_token presence and actual expiration *)
-              (match refresh_token with
-              | Some rt -> 
-                  Printf.printf "[LinkedIn] OAuth exchange successful: access_token received, refresh_token PRESENT (length: %d)\n%!" 
-                    (String.length rt);
-                  Printf.printf "[LinkedIn] Token expires in %d seconds (%d days) according to LinkedIn response\n%!" 
-                    expires_in (expires_in / 86400)
-              | None -> 
-                  Printf.printf "[LinkedIn] OAuth exchange successful: access_token received, refresh_token ABSENT\n%!";
-                  Printf.printf "[LinkedIn] WARNING: LinkedIn standard apps (with 'Sign In' and 'Share' products) typically do NOT provide refresh_token.\n%!";
-                  Printf.printf "[LinkedIn] Token expires in %d seconds (%d days) according to LinkedIn response\n%!" 
-                    expires_in (expires_in / 86400);
-                  Printf.printf "[LinkedIn] User will need to reconnect via OAuth flow when token expires.\n%!";
-                  Printf.printf "[LinkedIn] To enable programmatic refresh, apply for LinkedIn Partner Program.\n%!");
               
               let expires_at = 
                 let now = Ptime_clock.now () in
@@ -920,7 +1015,6 @@ module Make (Config : CONFIG) = struct
                 | Some exp -> Ptime.to_rfc3339 exp
                 | None -> Ptime.to_rfc3339 now
               in
-              Printf.printf "[LinkedIn] Token expires at: %s\n%!" expires_at;
               
               let credentials = {
                 access_token;

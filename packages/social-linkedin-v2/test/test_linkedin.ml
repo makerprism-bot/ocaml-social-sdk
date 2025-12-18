@@ -10,6 +10,20 @@ let string_contains s substr =
     true
   with Not_found -> false
 
+(** Helper to handle outcome results in tests *)
+let handle_outcome on_success on_error outcome =
+  match outcome with
+  | Error_types.Success result -> on_success result
+  | Error_types.Partial_success { result; _ } -> on_success result
+  | Error_types.Failure err -> on_error (Error_types.error_to_string err)
+
+(** Helper for thread results *)
+let handle_thread_outcome on_success on_error outcome =
+  match outcome with
+  | Error_types.Success result -> on_success result.Error_types.posted_ids
+  | Error_types.Partial_success { result; _ } -> on_success result.Error_types.posted_ids
+  | Error_types.Failure err -> on_error (Error_types.error_to_string err)
+
 (** Mock HTTP client for testing with response queue *)
 module Mock_http = struct
   let requests = ref []
@@ -679,23 +693,24 @@ let test_post_with_url_preview () =
   let text = "Great article about OCaml! https://example.com/ocaml-article" in
   
   LinkedIn.post_single ~account_id:"test_account" ~text ~media_urls:[]
-    (fun post_id ->
-      assert (post_id = "urn:li:share:789");
-      
-      (* Check that the request included ARTICLE media category and originalUrl *)
-      let requests = List.rev !Mock_http.requests in
-      let post_request = List.find (fun (method_, url, _, _) ->
-        method_ = "POST" && string_contains url "ugcPosts"
-      ) requests in
-      
-      let (_, _, _, body) = post_request in
-      assert (string_contains body "shareMediaCategory");
-      assert (string_contains body "ARTICLE");
-      assert (string_contains body "originalUrl");
-      assert (string_contains body "https://example.com/ocaml-article");
-      
-      print_endline "✓ Post with URL preview (ARTICLE)")
-    (fun err -> failwith ("Post with URL failed: " ^ err))
+    (handle_outcome
+      (fun post_id ->
+        assert (post_id = "urn:li:share:789");
+        
+        (* Check that the request included ARTICLE media category and originalUrl *)
+        let requests = List.rev !Mock_http.requests in
+        let post_request = List.find (fun (method_, url, _, _) ->
+          method_ = "POST" && string_contains url "ugcPosts"
+        ) requests in
+        
+        let (_, _, _, body) = post_request in
+        assert (string_contains body "shareMediaCategory");
+        assert (string_contains body "ARTICLE");
+        assert (string_contains body "originalUrl");
+        assert (string_contains body "https://example.com/ocaml-article");
+        
+        print_endline "✓ Post with URL preview (ARTICLE)")
+      (fun err -> failwith ("Post with URL failed: " ^ err)))
 
 (** Test: OAuth URL contains all required parameters *)
 let test_oauth_url_parameters () =
@@ -943,9 +958,10 @@ let test_post_with_alt_text () =
     ~text:"Check out this image!"
     ~media_urls:["https://example.com/image.jpg"]
     ~alt_texts:[Some "A beautiful sunset over mountains"]
-    (fun _post_id ->
-      print_endline "✓ Post with single image and alt-text")
-    (fun err -> failwith ("Post with alt-text failed: " ^ err))
+    (handle_outcome
+      (fun _post_id ->
+        print_endline "✓ Post with single image and alt-text")
+      (fun err -> failwith ("Post with alt-text failed: " ^ err)))
 
 (** Test: Post with multiple images and alt-texts *)
 let test_post_with_multiple_alt_texts () =
@@ -974,9 +990,10 @@ let test_post_with_multiple_alt_texts () =
     ~text:"Multiple images with descriptions"
     ~media_urls:["https://example.com/img1.jpg"; "https://example.com/img2.jpg"]
     ~alt_texts:[Some "First image description"; Some "Second image description"]
-    (fun _post_id ->
-      print_endline "✓ Post with multiple images and alt-texts")
-    (fun err -> failwith ("Post with multiple alt-texts failed: " ^ err))
+    (handle_outcome
+      (fun _post_id ->
+        print_endline "✓ Post with multiple images and alt-texts")
+      (fun err -> failwith ("Post with multiple alt-texts failed: " ^ err)))
 
 (** Test: Post with image but no alt-text *)
 let test_post_without_alt_text () =
@@ -1005,9 +1022,10 @@ let test_post_without_alt_text () =
     ~text:"Image without description"
     ~media_urls:["https://example.com/image.jpg"]
     ~alt_texts:[]
-    (fun _post_id ->
-      print_endline "✓ Post without alt-text")
-    (fun err -> failwith ("Post without alt-text failed: " ^ err))
+    (handle_outcome
+      (fun _post_id ->
+        print_endline "✓ Post without alt-text")
+      (fun err -> failwith ("Post without alt-text failed: " ^ err)))
 
 (** Test: Partial alt-texts - fewer alt-texts than images *)
 let test_post_with_partial_alt_texts () =
@@ -1036,9 +1054,10 @@ let test_post_with_partial_alt_texts () =
     ~text:"Three images, two descriptions"
     ~media_urls:["https://example.com/img1.jpg"; "https://example.com/img2.jpg"; "https://example.com/img3.jpg"]
     ~alt_texts:[Some "First image"; Some "Second image"]
-    (fun _post_id ->
-      print_endline "✓ Post with partial alt-texts (3 images, 2 alt-texts)")
-    (fun err -> failwith ("Post with partial alt-texts failed: " ^ err))
+    (handle_outcome
+      (fun _post_id ->
+        print_endline "✓ Post with partial alt-texts (3 images, 2 alt-texts)")
+      (fun err -> failwith ("Post with partial alt-texts failed: " ^ err)))
 
 (** Test: Alt-text with special characters *)
 let test_alt_text_special_chars () =
@@ -1067,9 +1086,10 @@ let test_alt_text_special_chars () =
     ~text:"Testing special characters in alt-text"
     ~media_urls:["https://example.com/image.jpg"]
     ~alt_texts:[Some "A photo with \"quotes\", emojis 🌅, & special chars: <>&"]
-    (fun _post_id ->
-      print_endline "✓ Alt-text with special characters")
-    (fun err -> failwith ("Alt-text with special chars failed: " ^ err))
+    (handle_outcome
+      (fun _post_id ->
+        print_endline "✓ Alt-text with special characters")
+      (fun err -> failwith ("Alt-text with special chars failed: " ^ err)))
 
 (** Test: Thread with alt-texts per post *)
 let test_thread_with_alt_texts () =
@@ -1099,9 +1119,10 @@ let test_thread_with_alt_texts () =
     ~texts:["First post with image"; "Second post with image"]
     ~media_urls_per_post:[["https://example.com/img1.jpg"]; ["https://example.com/img2.jpg"]]
     ~alt_texts_per_post:[[Some "Description for first image"]; [Some "Description for second image"]]
-    (fun _post_ids ->
-      print_endline "✓ Thread with alt-texts per post")
-    (fun err -> failwith ("Thread with alt-texts failed: " ^ err))
+    (handle_thread_outcome
+      (fun _post_ids ->
+        print_endline "✓ Thread with alt-texts per post")
+      (fun err -> failwith ("Thread with alt-texts failed: " ^ err)))
 
 (** {1 REST.li Protocol Tests} *)
 (** 
@@ -1354,27 +1375,28 @@ let test_ugcpost_request_body_structure () =
   ];
   
   LinkedIn.post_single ~account_id:"test_account" ~text:"Test post content" ~media_urls:[]
-    (fun _post_id ->
-      (* Find the POST request to ugcPosts *)
-      let requests = List.rev !Mock_http.requests in
-      let ugc_post_request = List.find_opt (fun (method_, url, _, _) ->
-        method_ = "POST" && string_contains url "ugcPosts"
-      ) requests in
-      
-      match ugc_post_request with
-      | Some (_, _, _, body) ->
-          (* Verify required fields in request body *)
-          assert (string_contains body "author");
-          assert (string_contains body "lifecycleState");
-          assert (string_contains body "PUBLISHED");
-          assert (string_contains body "specificContent");
-          assert (string_contains body "com.linkedin.ugc.ShareContent");
-          assert (string_contains body "shareCommentary");
-          assert (string_contains body "visibility");
-          assert (string_contains body "com.linkedin.ugc.MemberNetworkVisibility");
-          print_endline "✓ UGC Post request body structure"
-      | None -> failwith "No ugcPosts POST request found")
-    (fun err -> failwith ("Post single failed: " ^ err))
+    (handle_outcome
+      (fun _post_id ->
+        (* Find the POST request to ugcPosts *)
+        let requests = List.rev !Mock_http.requests in
+        let ugc_post_request = List.find_opt (fun (method_, url, _, _) ->
+          method_ = "POST" && string_contains url "ugcPosts"
+        ) requests in
+        
+        match ugc_post_request with
+        | Some (_, _, _, body) ->
+            (* Verify required fields in request body *)
+            assert (string_contains body "author");
+            assert (string_contains body "lifecycleState");
+            assert (string_contains body "PUBLISHED");
+            assert (string_contains body "specificContent");
+            assert (string_contains body "com.linkedin.ugc.ShareContent");
+            assert (string_contains body "shareCommentary");
+            assert (string_contains body "visibility");
+            assert (string_contains body "com.linkedin.ugc.MemberNetworkVisibility");
+            print_endline "✓ UGC Post request body structure"
+        | None -> failwith "No ugcPosts POST request found")
+      (fun err -> failwith ("Post single failed: " ^ err)))
 
 (** Test: Comment request body structure *)
 let test_comment_request_body_structure () =

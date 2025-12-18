@@ -384,10 +384,11 @@ let test_post_single () =
     ~account_id:"test_account"
     ~text:"Test tweet"
     ~media_urls:[]
-    (fun tweet_id -> 
-      result := Some (Ok tweet_id))
-    (fun err -> 
-      result := Some (Error err));
+    (fun outcome -> 
+      match outcome with
+      | Error_types.Success tweet_id -> result := Some (Ok tweet_id)
+      | Error_types.Partial_success { result = tweet_id; _ } -> result := Some (Ok tweet_id)
+      | Error_types.Failure err -> result := Some (Error (Error_types.error_to_string err)));
   
   (* With our synchronous mock, the result should be set *)
   (match !result with
@@ -425,8 +426,11 @@ let test_delete_tweet () =
   Twitter.delete_tweet
     ~account_id:"test_account"
     ~tweet_id:"12345"
-    (fun () -> result := Some (Ok ()))
-    (fun err -> result := Some (Error err));
+    (fun outcome ->
+      match outcome with
+      | Error_types.Success () -> result := Some (Ok ())
+      | Error_types.Partial_success _ -> result := Some (Ok ())
+      | Error_types.Failure err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok ()) -> ()
@@ -593,10 +597,14 @@ let test_thread_posting () =
     ~account_id:"test_account"
     ~texts:["Tweet 1"; "Tweet 2"; "Tweet 3"]
     ~media_urls_per_post:[[]; []; []]
-    (fun tweet_ids -> 
-      result := Some (Ok tweet_ids))
-    (fun err -> 
-      result := Some (Error err));
+    (fun outcome ->
+      match outcome with
+      | Error_types.Success thread_result -> 
+          result := Some (Ok thread_result.Error_types.posted_ids)
+      | Error_types.Partial_success { result = thread_result; _ } -> 
+          result := Some (Ok thread_result.Error_types.posted_ids)
+      | Error_types.Failure err -> 
+          result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok ids) -> 
@@ -758,10 +766,11 @@ let test_post_with_alt_text () =
     ~text:"Image with accessibility description"
     ~media_urls:["https://example.com/image.jpg"]
     ~alt_texts:[Some "A scenic mountain landscape at sunrise"]
-    (fun tweet_id -> 
-      result := Some (Ok tweet_id))
-    (fun err -> 
-      result := Some (Error err));
+    (fun outcome ->
+      match outcome with
+      | Error_types.Success tweet_id -> result := Some (Ok tweet_id)
+      | Error_types.Partial_success { result = tweet_id; _ } -> result := Some (Ok tweet_id)
+      | Error_types.Failure err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _) -> ()
@@ -779,10 +788,11 @@ let test_post_with_multiple_alt_texts () =
     ~text:"Multiple images with descriptions"
     ~media_urls:["https://example.com/img1.jpg"; "https://example.com/img2.jpg"; "https://example.com/img3.jpg"]
     ~alt_texts:[Some "First image"; Some "Second image"; Some "Third image"]
-    (fun tweet_id -> 
-      result := Some (Ok tweet_id))
-    (fun err -> 
-      result := Some (Error err));
+    (fun outcome ->
+      match outcome with
+      | Error_types.Success tweet_id -> result := Some (Ok tweet_id)
+      | Error_types.Partial_success { result = tweet_id; _ } -> result := Some (Ok tweet_id)
+      | Error_types.Failure err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _) -> ()
@@ -800,10 +810,11 @@ let test_post_without_alt_text_twitter () =
     ~text:"Image without description"
     ~media_urls:["https://example.com/image.jpg"]
     ~alt_texts:[]
-    (fun tweet_id -> 
-      result := Some (Ok tweet_id))
-    (fun err -> 
-      result := Some (Error err));
+    (fun outcome ->
+      match outcome with
+      | Error_types.Success tweet_id -> result := Some (Ok tweet_id)
+      | Error_types.Partial_success { result = tweet_id; _ } -> result := Some (Ok tweet_id)
+      | Error_types.Failure err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _) -> ()
@@ -822,10 +833,11 @@ let test_alt_text_char_limit () =
     ~text:"Testing alt-text limit"
     ~media_urls:["https://example.com/image.jpg"]
     ~alt_texts:[Some max_alt_text]
-    (fun tweet_id -> 
-      result := Some (Ok tweet_id))
-    (fun err -> 
-      result := Some (Error err));
+    (fun outcome ->
+      match outcome with
+      | Error_types.Success tweet_id -> result := Some (Ok tweet_id)
+      | Error_types.Partial_success { result = tweet_id; _ } -> result := Some (Ok tweet_id)
+      | Error_types.Failure err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _) -> ()
@@ -843,10 +855,14 @@ let test_thread_with_alt_texts_twitter () =
     ~texts:["First tweet with image"; "Second tweet with image"]
     ~media_urls_per_post:[["https://example.com/img1.jpg"]; ["https://example.com/img2.jpg"]]
     ~alt_texts_per_post:[[Some "First image description"]; [Some "Second image description"]]
-    (fun tweet_ids -> 
-      result := Some (Ok tweet_ids))
-    (fun err -> 
-      result := Some (Error err));
+    (fun outcome ->
+      match outcome with
+      | Error_types.Success thread_result -> 
+          result := Some (Ok thread_result.Error_types.posted_ids)
+      | Error_types.Partial_success { result = thread_result; _ } -> 
+          result := Some (Ok thread_result.Error_types.posted_ids)
+      | Error_types.Failure err -> 
+          result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _) -> ()
@@ -864,10 +880,11 @@ let test_alt_text_unicode_twitter () =
     ~text:"Unicode in alt-text"
     ~media_urls:["https://example.com/image.jpg"]
     ~alt_texts:[Some "Photo of 🌅 sunset with Japanese text: こんにちは"]
-    (fun tweet_id -> 
-      result := Some (Ok tweet_id))
-    (fun err -> 
-      result := Some (Error err));
+    (fun outcome ->
+      match outcome with
+      | Error_types.Success tweet_id -> result := Some (Ok tweet_id)
+      | Error_types.Partial_success { result = tweet_id; _ } -> result := Some (Ok tweet_id)
+      | Error_types.Failure err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _) -> ()

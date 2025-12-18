@@ -6,27 +6,19 @@
     - In-memory credential storage (for demo purposes)
 *)
 
-open Lwt.Syntax
-
 (** Simple in-memory credential storage for demo *)
 let credentials_store = Hashtbl.create 10
 
-(** First create the base CPS config, then we'll adapt it to Lwt *)
-
-(** Direct CPS configuration - callbacks execute immediately in async context *)
+(** Direct CPS configuration *)
 module Cps_config = struct
-  (* We'll define CPS-style functions that work with Lwt under the hood *)
   
-  module type HTTP_CPS = Social_core.HTTP_CLIENT
-  
-  module Http : HTTP_CPS = struct
-    (* TODO: This needs proper implementation *)
-    (* For now, showing the concept *)
-    let get ?headers:_ _url _on_success _on_error = ()
-    let post ?headers:_ ?body:_ _url _on_success _on_error = ()
-    let post_multipart ?headers:_ ~parts:_ _url _on_success _on_error = ()
-    let put ?headers:_ ?body:_ _url _on_success _on_error = ()
-    let delete ?headers:_ _url _on_success _on_error = ()
+  module Http : Social_core.HTTP_CLIENT = struct
+    (* Mock HTTP - in real app, use cohttp or similar *)
+    let get ?headers:_ _url _on_success on_error = on_error "HTTP not implemented"
+    let post ?headers:_ ?body:_ _url _on_success on_error = on_error "HTTP not implemented"
+    let post_multipart ?headers:_ ~parts:_ _url _on_success on_error = on_error "HTTP not implemented"
+    let put ?headers:_ ?body:_ _url _on_success on_error = on_error "HTTP not implemented"
+    let delete ?headers:_ _url _on_success on_error = on_error "HTTP not implemented"
   end
   
   let get_env = Sys.getenv_opt
@@ -58,7 +50,7 @@ module Cps_config = struct
 end
 
 (** Create Bluesky provider instance *)
-module Bluesky = Social_bluesky_v1.Make(Demo_config)
+module Bluesky = Social_bluesky_v1.Make(Cps_config)
 
 (** Example: Post a simple message *)
 let example_post_simple () =
@@ -72,15 +64,20 @@ let example_post_simple () =
     token_type = "Bearer";
   };
   
-  (* Post using CPS style *)
+  (* Post using CPS style with outcome type *)
   Bluesky.post_single
     ~account_id:"demo_account"
-    ~text:"Hello from OCaml! 🐫"
+    ~text:"Hello from OCaml!"
     ~media_urls:[]
-    (fun post_uri ->
-      Printf.printf "✓ Posted successfully: %s\n%!" post_uri)
-    (fun error ->
-      Printf.printf "✗ Post failed: %s\n%!" error)
+    (function
+      | Error_types.Success post_uri ->
+          Printf.printf "Posted successfully: %s\n%!" post_uri
+      | Error_types.Partial_success { result = post_uri; warnings } ->
+          Printf.printf "Posted with warnings: %s\n%!" post_uri;
+          List.iter (fun w -> Printf.printf "  Warning: %s\n%!" 
+            (Error_types.warning_to_string w)) warnings
+      | Error_types.Failure err ->
+          Printf.printf "Post failed: %s\n%!" (Error_types.error_to_string err))
 
 (** Example: Validate content before posting *)
 let example_validate () =
@@ -89,13 +86,13 @@ let example_validate () =
   let short_text = "This is a short post" in
   let long_text = String.make 400 'a' in
   
-  match Bluesky.validate_content ~text:short_text with
-  | Ok () -> Printf.printf "✓ Short text is valid\n%!"
-  | Error e -> Printf.printf "✗ Short text invalid: %s\n%!" e;
+  (match Bluesky.validate_content ~text:short_text with
+  | Ok () -> Printf.printf "Short text is valid\n%!"
+  | Error e -> Printf.printf "Short text invalid: %s\n%!" e);
   
-  match Bluesky.validate_content ~text:long_text with
-  | Ok () -> Printf.printf "✓ Long text is valid\n%!"
-  | Error e -> Printf.printf "✗ Long text invalid: %s\n%!" e
+  (match Bluesky.validate_content ~text:long_text with
+  | Ok () -> Printf.printf "Long text is valid\n%!"
+  | Error e -> Printf.printf "Long text invalid: %s\n%!" e)
 
 (** Example: Validate media *)
 let example_validate_media () =
@@ -112,8 +109,29 @@ let example_validate_media () =
   } in
   
   match Bluesky.validate_media ~media:valid_image with
-  | Ok () -> Printf.printf "✓ Image is valid\n%!"
-  | Error e -> Printf.printf "✗ Image invalid: %s\n%!" e
+  | Ok () -> Printf.printf "Image is valid\n%!"
+  | Error _ -> Printf.printf "Image invalid\n%!"
+
+(** Example: Pre-validate a thread *)
+let example_validate_thread () =
+  Printf.printf "\nExample: Validating thread\n%!";
+  
+  let valid_thread = ["First post"; "Second post"; "Third post"] in
+  let invalid_thread = ["Short"; String.make 400 'x'; "OK"] in
+  
+  (match Bluesky.validate_thread ~texts:valid_thread () with
+  | Ok () -> Printf.printf "Thread is valid\n%!"
+  | Error errs -> 
+      Printf.printf "Thread invalid:\n%!";
+      List.iter (fun e -> Printf.printf "  - %s\n%!" 
+        (Error_types.validation_error_to_string e)) errs);
+  
+  (match Bluesky.validate_thread ~texts:invalid_thread () with
+  | Ok () -> Printf.printf "Thread is valid\n%!"
+  | Error errs -> 
+      Printf.printf "Thread invalid:\n%!";
+      List.iter (fun e -> Printf.printf "  - %s\n%!" 
+        (Error_types.validation_error_to_string e)) errs)
 
 (** Run all examples *)
 let () =
@@ -121,9 +139,7 @@ let () =
   
   example_validate ();
   example_validate_media ();
+  example_validate_thread ();
   example_post_simple ();
   
-  Printf.printf "\n=== Examples complete ===\n";
-  
-  (* Note: In a real Lwt application, you would use Lwt_main.run *)
-  (* For CPS style, the callbacks execute synchronously in this demo *)
+  Printf.printf "\n=== Examples complete ===\n"

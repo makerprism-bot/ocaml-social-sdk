@@ -6,7 +6,8 @@
   social_core
   platform_types
   content_validator
-  url_extractor)
+  url_extractor
+  error_types)
  (libraries
   yojson
   re))

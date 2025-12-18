@@ -323,6 +323,80 @@ module Make (Config : CONFIG) = struct
   let pinterest_auth_url = "https://www.pinterest.com/oauth"
   let pinterest_token_url = "https://api.pinterest.com/v5/oauth/token"
   
+  (** {1 Platform Constants} *)
+  
+  let max_description_length = 500
+  let max_title_length = 100
+  
+  (** {1 Validation Functions} *)
+  
+  (** Validate a single post's content *)
+  let validate_post ~text ?(media_count=0) () =
+    let errors = ref [] in
+    
+    (* Check description length *)
+    let text_len = String.length text in
+    if text_len > max_description_length then
+      errors := Error_types.Text_too_long { length = text_len; max = max_description_length } :: !errors;
+    
+    (* Pinterest requires at least one image *)
+    if media_count < 1 then
+      errors := Error_types.Text_empty :: !errors;  (* Reusing to mean "content incomplete" *)
+    
+    if !errors = [] then Ok ()
+    else Error (List.rev !errors)
+  
+  (** Validate thread content - Pinterest only posts first item *)
+  let validate_thread ~texts ~media_counts () =
+    if List.length texts = 0 then
+      Error [Error_types.Thread_empty]
+    else
+      (* Only validate first post since Pinterest doesn't support threads *)
+      let text = List.hd texts in
+      let media_count = try List.hd media_counts with _ -> 0 in
+      match validate_post ~text ~media_count () with
+      | Error errs -> Error [Error_types.Thread_post_invalid { index = 0; errors = errs }]
+      | Ok () -> Ok ()
+  
+  (** Parse API error response and return structured Error_types.error *)
+  let parse_api_error ~status_code ~response_body =
+    try
+      let json = Yojson.Basic.from_string response_body in
+      let open Yojson.Basic.Util in
+      let error_msg = 
+        try json |> member "message" |> to_string
+        with _ -> response_body
+      in
+      
+      (* Map common Pinterest errors *)
+      if status_code = 401 then
+        Error_types.Auth_error Error_types.Token_invalid
+      else if status_code = 403 then
+        Error_types.Auth_error (Error_types.Insufficient_permissions ["pins:write"])
+      else if status_code = 429 then
+        Error_types.Rate_limited { 
+          retry_after_seconds = Some 60;
+          limit = None;
+          remaining = Some 0;
+          reset_at = None;
+        }
+      else
+        Error_types.Api_error {
+          status_code;
+          message = error_msg;
+          platform = Platform_types.Pinterest;
+          raw_response = Some response_body;
+          request_id = None;
+        }
+    with _ ->
+      Error_types.Api_error {
+        status_code;
+        message = response_body;
+        platform = Platform_types.Pinterest;
+        raw_response = Some response_body;
+        request_id = None;
+      }
+  
   (** Ensure valid access token (Pinterest tokens are long-lived) *)
   let ensure_valid_token ~account_id on_success on_error =
     Config.get_credentials ~account_id
@@ -395,76 +469,107 @@ module Make (Config : CONFIG) = struct
       on_error
   
   (** Post to Pinterest *)
-  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_success on_error =
-    if List.length media_urls = 0 then
-      on_error "Pinterest requires at least one image to create a pin"
-    else
-      ensure_valid_token ~account_id
-        (fun access_token ->
-          get_default_board ~access_token
-            (fun board_id ->
-              let image_url = List.hd media_urls in
-              let alt_text = try List.nth alt_texts 0 with _ -> None in
-              
-              upload_image ~access_token ~image_url ~alt_text
-                (fun (media_id, alt_text_opt) ->
-                  (* Create pin with uploaded media *)
-                  let url = pinterest_api_base ^ "/pins" in
-                  
-                  let base_fields = [
-                    ("board_id", `String board_id);
-                    ("title", `String (String.sub text 0 (min (String.length text) 100)));
-                    ("description", `String text);
-                    ("media_source", `Assoc [
-                      ("source_type", `String "image_base64");
-                      ("media_id", `String media_id);
-                    ]);
-                  ] in
-                  
-                  (* Add alt text if provided *)
-                  let pin_fields = match alt_text_opt with
-                    | Some alt when String.length alt > 0 ->
-                        ("alt_text", `String alt) :: base_fields
-                    | _ -> base_fields
-                  in
-                  
-                  let pin_json = `Assoc pin_fields in
-                  
-                  let headers = [
-                    ("Authorization", "Bearer " ^ access_token);
-                    ("Content-Type", "application/json");
-                  ] in
-                  
-                  let body = Yojson.Basic.to_string pin_json in
-                  
-                  Config.Http.post ~headers ~body url
-                    (fun response ->
-                      if response.status >= 200 && response.status < 300 then
-                        try
-                          let open Yojson.Basic.Util in
-                          let json = Yojson.Basic.from_string response.body in
-                          let pin_id = json |> member "id" |> to_string in
-                          on_success pin_id
-                        with e ->
-                          on_error (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))
-                      else
-                        on_error (Printf.sprintf "Pin creation failed (%d): %s" response.status response.body))
-                    on_error)
-                on_error)
-            on_error)
-        on_error
+  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_result =
+    let media_count = List.length media_urls in
+    match validate_post ~text ~media_count () with
+    | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        (* Validation ensures media_urls is non-empty *)
+        let image_url = List.hd media_urls in
+        let alt_text = try List.nth alt_texts 0 with _ -> None in
+        ensure_valid_token ~account_id
+          (fun access_token ->
+            get_default_board ~access_token
+              (fun board_id ->
+                upload_image ~access_token ~image_url ~alt_text
+                  (fun (media_id, alt_text_opt) ->
+                    (* Create pin with uploaded media *)
+                    let url = pinterest_api_base ^ "/pins" in
+                    
+                    let base_fields = [
+                      ("board_id", `String board_id);
+                      ("title", `String (String.sub text 0 (min (String.length text) max_title_length)));
+                      ("description", `String text);
+                      ("media_source", `Assoc [
+                        ("source_type", `String "image_base64");
+                        ("media_id", `String media_id);
+                      ]);
+                    ] in
+                    
+                    (* Add alt text if provided *)
+                    let pin_fields = match alt_text_opt with
+                      | Some alt when String.length alt > 0 ->
+                          ("alt_text", `String alt) :: base_fields
+                      | _ -> base_fields
+                    in
+                    
+                    let pin_json = `Assoc pin_fields in
+                    
+                    let headers = [
+                      ("Authorization", "Bearer " ^ access_token);
+                      ("Content-Type", "application/json");
+                    ] in
+                    
+                    let body = Yojson.Basic.to_string pin_json in
+                    
+                    Config.Http.post ~headers ~body url
+                      (fun response ->
+                        if response.status >= 200 && response.status < 300 then
+                          try
+                            let open Yojson.Basic.Util in
+                            let json = Yojson.Basic.from_string response.body in
+                            let pin_id = json |> member "id" |> to_string in
+                            on_result (Error_types.Success pin_id)
+                          with e ->
+                            on_result (Error_types.Failure (Error_types.Internal_error (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))))
+                        else
+                          on_result (Error_types.Failure (parse_api_error ~status_code:response.status ~response_body:response.body)))
+                      (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+                  (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+              (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+          (fun err -> on_result (Error_types.Failure (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Post thread (Pinterest doesn't support threads, posts only first item) *)
-  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_success on_error =
-    if List.length texts = 0 then
-      on_error "No content to post"
-    else
-      let first_text = List.hd texts in
-      let first_media = if List.length media_urls_per_post > 0 then List.hd media_urls_per_post else [] in
-      let first_alt_texts = if List.length alt_texts_per_post > 0 then List.hd alt_texts_per_post else [] in
-      post_single ~account_id ~text:first_text ~media_urls:first_media ~alt_texts:first_alt_texts
-        (fun pin_id -> on_success [pin_id])
-        on_error
+  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_result =
+    let media_counts = List.map List.length media_urls_per_post in
+    match validate_thread ~texts ~media_counts () with
+    | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        (* Pinterest only supports single pins, so we post just the first *)
+        let first_text = List.hd texts in
+        let first_media = List.hd media_urls_per_post in
+        let first_alt_texts = try List.hd alt_texts_per_post with _ -> [] in
+        let total_requested = List.length texts in
+        post_single ~account_id ~text:first_text ~media_urls:first_media ~alt_texts:first_alt_texts
+          (fun outcome ->
+            match outcome with
+            | Error_types.Success pin_id ->
+                let thread_result = {
+                  Error_types.posted_ids = [pin_id];
+                  failed_at_index = None;
+                  total_requested;
+                } in
+                if total_requested > 1 then
+                  (* Partial success - only first item posted *)
+                  on_result (Error_types.Partial_success {
+                    result = thread_result;
+                    warnings = [Error_types.Generic_warning { 
+                      code = "pinterest_no_threads"; 
+                      message = Printf.sprintf "Pinterest does not support threads. Only first of %d items posted." total_requested;
+                      recoverable = false 
+                    }]
+                  })
+                else
+                  on_result (Error_types.Success thread_result)
+            | Error_types.Partial_success { result = pin_id; warnings } ->
+                let thread_result = {
+                  Error_types.posted_ids = [pin_id];
+                  failed_at_index = None;
+                  total_requested;
+                } in
+                on_result (Error_types.Partial_success { result = thread_result; warnings })
+            | Error_types.Failure err ->
+                on_result (Error_types.Failure err))
   
   (** OAuth authorization URL *)
   let get_oauth_url ~redirect_uri ~state on_success on_error =

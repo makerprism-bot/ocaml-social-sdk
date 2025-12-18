@@ -467,6 +467,86 @@ module Make (Config : CONFIG) = struct
   let video_init_url = api_base_url ^ "/post/publish/video/init/"
   let status_fetch_url = api_base_url ^ "/post/publish/status/fetch/"
   
+  (** {1 Validation Functions} *)
+  
+  (** Validate a single post's content *)
+  let validate_post ~text ?(media_count=0) () =
+    let errors = ref [] in
+    
+    (* Check caption length *)
+    let text_len = String.length text in
+    if text_len > max_caption_length then
+      errors := Error_types.Text_too_long { length = text_len; max = max_caption_length } :: !errors;
+    
+    (* TikTok requires exactly one video - text-only posts not allowed *)
+    if media_count < 1 then
+      errors := Error_types.Text_empty :: !errors;  (* Reusing Text_empty to mean "content incomplete" *)
+    
+    if !errors = [] then Ok ()
+    else Error (List.rev !errors)
+  
+  (** Validate thread content *)
+  let validate_thread ~texts ~media_counts () =
+    if List.length texts = 0 then
+      Error [Error_types.Thread_empty]
+    else
+      let errors = ref [] in
+      List.iteri (fun i text ->
+        let media_count = 
+          try List.nth media_counts i 
+          with _ -> 0 
+        in
+        match validate_post ~text ~media_count () with
+        | Error post_errors ->
+            errors := Error_types.Thread_post_invalid { index = i; errors = post_errors } :: !errors
+        | Ok () -> ()
+      ) texts;
+      if !errors = [] then Ok ()
+      else Error (List.rev !errors)
+  
+  (** Parse API error response and return structured Error_types.error *)
+  let parse_api_error ~status_code ~response_body =
+    try
+      let json = Yojson.Basic.from_string response_body in
+      let open Yojson.Basic.Util in
+      let error_msg = 
+        try 
+          let error = json |> member "error" in
+          let code = try error |> member "code" |> to_string with _ -> "" in
+          let msg = try error |> member "message" |> to_string with _ -> response_body in
+          if code <> "" then Printf.sprintf "%s: %s" code msg else msg
+        with _ -> response_body
+      in
+      
+      (* Map common TikTok errors *)
+      if status_code = 401 then
+        Error_types.Auth_error Error_types.Token_invalid
+      else if status_code = 403 then
+        Error_types.Auth_error (Error_types.Insufficient_permissions ["video.publish"])
+      else if status_code = 429 then
+        Error_types.Rate_limited { 
+          retry_after_seconds = Some 60;
+          limit = None;
+          remaining = Some 0;
+          reset_at = None;
+        }
+      else
+        Error_types.Api_error {
+          status_code;
+          message = error_msg;
+          platform = Platform_types.TikTok;
+          raw_response = Some response_body;
+          request_id = None;
+        }
+    with _ ->
+      Error_types.Api_error {
+        status_code;
+        message = response_body;
+        platform = Platform_types.TikTok;
+        raw_response = Some response_body;
+        request_id = None;
+      }
+  
   (** Check if token is expired or expiring soon *)
   let is_token_expired_buffer ~buffer_seconds expires_at_opt =
     match expires_at_opt with
@@ -721,29 +801,56 @@ module Make (Config : CONFIG) = struct
       on_error
   
   (** Post single video (matches other provider signatures) *)
-  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_success on_error =
+  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_result =
     let _ = alt_texts in (* TikTok doesn't support alt text *)
-    match media_urls with
-    | [] -> on_error "TikTok requires a video - no media provided"
-    | video_url :: _ ->
+    let media_count = List.length media_urls in
+    match validate_post ~text ~media_count () with
+    | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        (* Validation ensures media_urls is non-empty *)
+        let video_url = List.hd media_urls in
         post_video_from_url ~account_id ~caption:text ~video_url
-          on_success on_error
+          (fun publish_id -> on_result (Error_types.Success publish_id))
+          (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err)))
   
   (** Post thread (TikTok doesn't support threads, posts videos separately) *)
-  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_success on_error =
+  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_result =
     let _ = alt_texts_per_post in
-    let rec post_all acc texts media =
-      match texts, media with
-      | [], _ | _, [] -> on_success (List.rev acc)
-      | text :: rest_texts, urls :: rest_media ->
-          (match urls with
-           | [] -> on_error "Each TikTok post requires a video"
-           | video_url :: _ ->
-               post_video_from_url ~account_id ~caption:text ~video_url
-                 (fun post_id -> post_all (post_id :: acc) rest_texts rest_media)
-                 on_error)
-    in
-    post_all [] texts media_urls_per_post
+    let media_counts = List.map List.length media_urls_per_post in
+    match validate_thread ~texts ~media_counts () with
+    | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        let total_requested = List.length texts in
+        (* Validation ensures each post has at least one video URL *)
+        let rec post_all acc post_index texts media =
+          match texts, media with
+          | [], _ | _, [] -> 
+              let thread_result = {
+                Error_types.posted_ids = List.rev acc;
+                failed_at_index = None;
+                total_requested;
+              } in
+              on_result (Error_types.Success thread_result)
+          | text :: rest_texts, urls :: rest_media ->
+              (* Validation ensures urls is non-empty *)
+              let video_url = List.hd urls in
+              post_video_from_url ~account_id ~caption:text ~video_url
+                (fun post_id -> post_all (post_id :: acc) (post_index + 1) rest_texts rest_media)
+                (fun err ->
+                  let thread_result = {
+                    Error_types.posted_ids = List.rev acc;
+                    failed_at_index = Some post_index;
+                    total_requested;
+                  } in
+                  if List.length acc > 0 then
+                    on_result (Error_types.Partial_success { 
+                      result = thread_result;
+                      warnings = [Error_types.Generic_warning { code = "thread_incomplete"; message = err; recoverable = false }]
+                    })
+                  else
+                    on_result (Error_types.Failure (Error_types.Internal_error err)))
+        in
+        post_all [] 0 texts media_urls_per_post
   
   (** Exchange authorization code for access token *)
   let exchange_code ~code ~redirect_uri on_success on_error =

@@ -11,6 +11,7 @@ type platform =
   | YouTubeShorts
   | Pinterest
   | Threads
+  | TikTok
 
 (** Convert platform to string *)
 let platform_to_string = function
@@ -23,6 +24,7 @@ let platform_to_string = function
   | YouTubeShorts -> "youtube_shorts"
   | Pinterest -> "pinterest"
   | Threads -> "threads"
+  | TikTok -> "tiktok"
 
 (** Parse platform from string *)
 let platform_of_string = function
@@ -35,6 +37,7 @@ let platform_of_string = function
   | "youtube_shorts" -> Some YouTubeShorts
   | "pinterest" -> Some Pinterest
   | "threads" -> Some Threads
+  | "tiktok" -> Some TikTok
   | _ -> None
 
 (** Media type *)

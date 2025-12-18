@@ -10,6 +10,13 @@ let string_contains s substr =
     true
   with Not_found -> false
 
+(** Helper to handle outcome type for tests - unused but kept for consistency *)
+let _handle_outcome on_success on_error outcome =
+  match outcome with
+  | Error_types.Success result -> on_success result
+  | Error_types.Partial_success { result; _ } -> on_success result
+  | Error_types.Failure err -> on_error (Error_types.error_to_string err)
+
 (** Mock HTTP client for testing *)
 module Mock_http = struct
   let requests = ref []
@@ -275,10 +282,14 @@ let test_post_requires_video () =
     ~account_id:"test_account"
     ~text:"Test"
     ~media_urls:[]
-    (fun _ -> failwith "Should fail without video")
-    (fun err ->
-      assert (string_contains err "video");
-      print_endline "✓ Post requires video")
+    (fun outcome ->
+      match outcome with
+      | Error_types.Failure (Error_types.Validation_error _) ->
+          print_endline "✓ Post requires video (validation error)"
+      | Error_types.Success _ ->
+          failwith "Should fail without video"
+      | _ ->
+          failwith "Expected validation error")
 
 (** Run all tests *)
 let () =

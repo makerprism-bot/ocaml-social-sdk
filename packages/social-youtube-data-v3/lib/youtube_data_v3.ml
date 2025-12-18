@@ -336,6 +336,83 @@ module Make (Config : CONFIG) = struct
   let youtube_upload_base = "https://www.googleapis.com/upload/youtube/v3"
   let google_oauth_base = "https://oauth2.googleapis.com"
   
+  (** {1 Platform Constants} *)
+  
+  let max_title_length = 100
+  let max_description_length = 5000
+  
+  (** {1 Validation Functions} *)
+  
+  (** Validate a single post's content *)
+  let validate_post ~text ?(media_count=0) () =
+    let errors = ref [] in
+    
+    (* Check description length *)
+    let text_len = String.length text in
+    if text_len > max_description_length then
+      errors := Error_types.Text_too_long { length = text_len; max = max_description_length } :: !errors;
+    
+    (* YouTube Shorts requires a video *)
+    if media_count < 1 then
+      errors := Error_types.Text_empty :: !errors;  (* Reusing to mean "content incomplete" *)
+    
+    if !errors = [] then Ok ()
+    else Error (List.rev !errors)
+  
+  (** Validate thread content - YouTube only posts first item *)
+  let validate_thread ~texts ~media_counts () =
+    if List.length texts = 0 then
+      Error [Error_types.Thread_empty]
+    else
+      (* Only validate first post since YouTube doesn't support threads *)
+      let text = List.hd texts in
+      let media_count = try List.hd media_counts with _ -> 0 in
+      match validate_post ~text ~media_count () with
+      | Error errs -> Error [Error_types.Thread_post_invalid { index = 0; errors = errs }]
+      | Ok () -> Ok ()
+  
+  (** Parse API error response and return structured Error_types.error *)
+  let parse_api_error ~status_code ~response_body =
+    try
+      let json = Yojson.Basic.from_string response_body in
+      let open Yojson.Basic.Util in
+      let error_msg = 
+        try 
+          let error = json |> member "error" in
+          try error |> member "message" |> to_string
+          with _ -> response_body
+        with _ -> response_body
+      in
+      
+      (* Map common YouTube/Google errors *)
+      if status_code = 401 then
+        Error_types.Auth_error Error_types.Token_invalid
+      else if status_code = 403 then
+        Error_types.Auth_error (Error_types.Insufficient_permissions ["youtube.upload"])
+      else if status_code = 429 then
+        Error_types.Rate_limited { 
+          retry_after_seconds = Some 60;
+          limit = None;
+          remaining = Some 0;
+          reset_at = None;
+        }
+      else
+        Error_types.Api_error {
+          status_code;
+          message = error_msg;
+          platform = Platform_types.YouTubeShorts;
+          raw_response = Some response_body;
+          request_id = None;
+        }
+    with _ ->
+      Error_types.Api_error {
+        status_code;
+        message = response_body;
+        platform = Platform_types.YouTubeShorts;
+        raw_response = Some response_body;
+        request_id = None;
+      }
+  
   (** Check if token is expired or expiring soon *)
   let is_token_expired_buffer ~buffer_seconds expires_at_opt =
     match expires_at_opt with
@@ -438,96 +515,126 @@ module Make (Config : CONFIG) = struct
       on_error
   
   (** Upload video to YouTube Shorts *)
-  let post_single ~account_id ~text ~media_urls on_success on_error =
-    if List.length media_urls = 0 then
-      on_error "YouTube Shorts requires a vertical video"
-    else
-      ensure_valid_token ~account_id
-        (fun access_token ->
-          let video_url = List.hd media_urls in
-          
-          (* Download video *)
-          Config.Http.get ~headers:[] video_url
-            (fun video_response ->
-              if video_response.status >= 200 && video_response.status < 300 then
-                let video_data = video_response.body in
-                let content_type = 
-                  match List.assoc_opt "content-type" video_response.headers with
-                  | Some ct -> ct
-                  | None -> "video/mp4"
-                in
-                
-                (* Step 1: Initialize resumable upload with metadata *)
-                let video_metadata = `Assoc [
-                  ("snippet", `Assoc [
-                    ("title", `String (String.sub text 0 (min (String.length text) 100)));
-                    ("description", `String (text ^ " #Shorts"));
-                    ("tags", `List [`String "shorts"; `String "short"]);
-                    ("categoryId", `String "22"); (* People & Blogs *)
-                  ]);
-                  ("status", `Assoc [
-                    ("privacyStatus", `String "public");
-                    ("selfDeclaredMadeForKids", `Bool false);
-                  ]);
-                ] in
-                
-                let init_url = youtube_upload_base ^ "/videos?uploadType=resumable&part=snippet,status" in
-                let init_headers = [
-                  ("Authorization", "Bearer " ^ access_token);
-                  ("Content-Type", "application/json");
-                  ("X-Upload-Content-Length", string_of_int (String.length video_data));
-                  ("X-Upload-Content-Type", content_type);
-                ] in
-                
-                let metadata_str = Yojson.Basic.to_string video_metadata in
-                
-                Config.Http.post ~headers:init_headers ~body:metadata_str init_url
-                  (fun init_response ->
-                    if init_response.status >= 200 && init_response.status < 300 then
-                      (* Get upload URL from Location header *)
-                      match List.assoc_opt "location" init_response.headers with
-                      | Some upload_url ->
-                          (* Step 2: Upload video data to resumable URL *)
-                          let upload_headers = [
-                            ("Content-Type", content_type);
-                            ("Content-Length", string_of_int (String.length video_data));
-                          ] in
-                          
-                          Config.Http.put ~headers:upload_headers ~body:video_data upload_url
-                            (fun upload_response ->
-                              if upload_response.status >= 200 && upload_response.status < 300 then
-                                try
-                                  let open Yojson.Basic.Util in
-                                  let json = Yojson.Basic.from_string upload_response.body in
-                                  let video_id = json |> member "id" |> to_string in
-                                  on_success video_id
-                                with _e ->
-                                  on_error (Printf.sprintf "Failed to parse response: %s" upload_response.body)
-                              else
-                                on_error (Printf.sprintf "Video upload failed (%d): %s" 
-                                  upload_response.status upload_response.body))
-                            on_error
-                      | None ->
-                          on_error (Printf.sprintf "No upload URL in response: %s" init_response.body)
-                    else
-                      on_error (Printf.sprintf "Upload initialization failed (%d): %s" 
-                        init_response.status init_response.body))
-                  on_error
-              else
-                on_error (Printf.sprintf "Failed to download video (%d)" video_response.status))
-            on_error)
-        on_error
+  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_result =
+    let _ = alt_texts in (* YouTube doesn't support alt text for videos *)
+    let media_count = List.length media_urls in
+    match validate_post ~text ~media_count () with
+    | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        (* Validation ensures media_urls is non-empty *)
+        let video_url = List.hd media_urls in
+        ensure_valid_token ~account_id
+          (fun access_token ->
+            (* Download video *)
+            Config.Http.get ~headers:[] video_url
+              (fun video_response ->
+                if video_response.status >= 200 && video_response.status < 300 then
+                  let video_data = video_response.body in
+                  let content_type = 
+                    match List.assoc_opt "content-type" video_response.headers with
+                    | Some ct -> ct
+                    | None -> "video/mp4"
+                  in
+                  
+                  (* Step 1: Initialize resumable upload with metadata *)
+                  let video_metadata = `Assoc [
+                    ("snippet", `Assoc [
+                      ("title", `String (String.sub text 0 (min (String.length text) max_title_length)));
+                      ("description", `String (text ^ " #Shorts"));
+                      ("tags", `List [`String "shorts"; `String "short"]);
+                      ("categoryId", `String "22"); (* People & Blogs *)
+                    ]);
+                    ("status", `Assoc [
+                      ("privacyStatus", `String "public");
+                      ("selfDeclaredMadeForKids", `Bool false);
+                    ]);
+                  ] in
+                  
+                  let init_url = youtube_upload_base ^ "/videos?uploadType=resumable&part=snippet,status" in
+                  let init_headers = [
+                    ("Authorization", "Bearer " ^ access_token);
+                    ("Content-Type", "application/json");
+                    ("X-Upload-Content-Length", string_of_int (String.length video_data));
+                    ("X-Upload-Content-Type", content_type);
+                  ] in
+                  
+                  let metadata_str = Yojson.Basic.to_string video_metadata in
+                  
+                  Config.Http.post ~headers:init_headers ~body:metadata_str init_url
+                    (fun init_response ->
+                      if init_response.status >= 200 && init_response.status < 300 then
+                        (* Get upload URL from Location header *)
+                        match List.assoc_opt "location" init_response.headers with
+                        | Some upload_url ->
+                            (* Step 2: Upload video data to resumable URL *)
+                            let upload_headers = [
+                              ("Content-Type", content_type);
+                              ("Content-Length", string_of_int (String.length video_data));
+                            ] in
+                            
+                            Config.Http.put ~headers:upload_headers ~body:video_data upload_url
+                              (fun upload_response ->
+                                if upload_response.status >= 200 && upload_response.status < 300 then
+                                  try
+                                    let open Yojson.Basic.Util in
+                                    let json = Yojson.Basic.from_string upload_response.body in
+                                    let video_id = json |> member "id" |> to_string in
+                                    on_result (Error_types.Success video_id)
+                                  with _e ->
+                                    on_result (Error_types.Failure (Error_types.Internal_error (Printf.sprintf "Failed to parse response: %s" upload_response.body)))
+                                else
+                                  on_result (Error_types.Failure (parse_api_error ~status_code:upload_response.status ~response_body:upload_response.body)))
+                              (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err)))
+                        | None ->
+                            on_result (Error_types.Failure (Error_types.Internal_error (Printf.sprintf "No upload URL in response: %s" init_response.body)))
+                      else
+                        on_result (Error_types.Failure (parse_api_error ~status_code:init_response.status ~response_body:init_response.body)))
+                    (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err)))
+                else
+                  on_result (Error_types.Failure (Error_types.Internal_error (Printf.sprintf "Failed to download video (%d)" video_response.status))))
+              (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+          (fun err -> on_result (Error_types.Failure (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Post thread (YouTube doesn't support threads, posts only first item) *)
-  let post_thread ~account_id ~texts ~media_urls_per_post on_success on_error =
-    if List.length texts = 0 then
-      on_error "No content to post"
-    else
-      let first_text = List.hd texts in
-      let first_media = if List.length media_urls_per_post > 0 then List.hd media_urls_per_post else [] in
-      post_single ~account_id ~text:first_text ~media_urls:first_media
-        (fun video_id -> on_success [video_id])
-        on_error
+  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_result =
+    let _ = alt_texts_per_post in
+    let media_counts = List.map List.length media_urls_per_post in
+    match validate_thread ~texts ~media_counts () with
+    | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        (* YouTube only supports single videos, so we post just the first *)
+        let first_text = List.hd texts in
+        let first_media = List.hd media_urls_per_post in
+        let total_requested = List.length texts in
+        post_single ~account_id ~text:first_text ~media_urls:first_media
+          (fun outcome ->
+            match outcome with
+            | Error_types.Success video_id ->
+                let thread_result = {
+                  Error_types.posted_ids = [video_id];
+                  failed_at_index = None;
+                  total_requested;
+                } in
+                if total_requested > 1 then
+                  on_result (Error_types.Partial_success {
+                    result = thread_result;
+                    warnings = [Error_types.Generic_warning { 
+                      code = "youtube_no_threads"; 
+                      message = Printf.sprintf "YouTube does not support threads. Only first of %d items posted." total_requested;
+                      recoverable = false 
+                    }]
+                  })
+                else
+                  on_result (Error_types.Success thread_result)
+            | Error_types.Partial_success { result = video_id; warnings } ->
+                let thread_result = {
+                  Error_types.posted_ids = [video_id];
+                  failed_at_index = None;
+                  total_requested;
+                } in
+                on_result (Error_types.Partial_success { result = thread_result; warnings })
+            | Error_types.Failure err ->
+                on_result (Error_types.Failure err))
   
   (** OAuth authorization URL with PKCE *)
   let get_oauth_url ~redirect_uri ~state ~code_verifier on_success on_error =

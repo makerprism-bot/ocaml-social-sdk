@@ -1171,12 +1171,13 @@ module Make (Config : CONFIG) = struct
             in
             
             (* Pair media URLs with alt text for each post *)
+            let padded_alt_texts = alt_texts_per_post @ List.init (max 0 (List.length media_urls_per_post - List.length alt_texts_per_post)) (fun _ -> []) in
             let media_with_alt_per_post = List.map2 (fun media_urls alt_texts ->
               List.mapi (fun i url ->
                 let alt_text = try List.nth alt_texts i with _ -> None in
                 (url, alt_text)
               ) media_urls
-            ) media_urls_per_post (alt_texts_per_post @ List.init (List.length media_urls_per_post - List.length alt_texts_per_post) (fun _ -> [])) in
+            ) media_urls_per_post padded_alt_texts in
             
             (* Post tweets in sequence with reply references *)
             let rec post_tweets_seq texts_remaining media_remaining reply_to_id acc_ids =

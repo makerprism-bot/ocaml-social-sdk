@@ -81,10 +81,13 @@ let post_to_page account_id =
   let media_urls = ["https://example.com/image.jpg"] in
   
   Facebook.post_single ~account_id ~text ~media_urls
-    (fun post_id ->
-      Printf.printf "Posted successfully: %s\n" post_id;
-      ())
-    (fun err -> Printf.eprintf "Error: %s\n" err)
+    (function
+      | Social_core.Error_types.Success post_id ->
+          Printf.printf "Posted successfully: %s\n" post_id
+      | Social_core.Error_types.Partial_success { result = post_id; warnings } ->
+          Printf.printf "Posted: %s with %d warnings\n" post_id (List.length warnings)
+      | Social_core.Error_types.Failure err ->
+          Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ## OAuth Scopes

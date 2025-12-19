@@ -64,10 +64,13 @@ let post_image account_id =
   let media_urls = ["https://cdn.example.com/public/image.jpg"] in
   
   Instagram.post_single ~account_id ~text ~media_urls
-    (fun media_id ->
-      Printf.printf "Posted successfully: %s\n" media_id;
-      ())
-    (fun err -> Printf.eprintf "Error: %s\n" err)
+    (function
+      | Social_core.Error_types.Success media_id ->
+          Printf.printf "Posted successfully: %s\n" media_id
+      | Social_core.Error_types.Partial_success { result = media_id; warnings } ->
+          Printf.printf "Posted: %s with %d warnings\n" media_id (List.length warnings)
+      | Social_core.Error_types.Failure err ->
+          Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Carousel Example (2-10 Items)
@@ -83,10 +86,13 @@ let post_carousel account_id =
   ] in
   
   Instagram.post_single ~account_id ~text ~media_urls
-    (fun media_id ->
-      Printf.printf "Carousel posted: %s\n" media_id;
-      ())
-    (fun err -> Printf.eprintf "Error: %s\n" err)
+    (function
+      | Social_core.Error_types.Success media_id ->
+          Printf.printf "Carousel posted: %s\n" media_id
+      | Social_core.Error_types.Partial_success { result = media_id; warnings } ->
+          Printf.printf "Carousel posted: %s (with %d warnings)\n" media_id (List.length warnings)
+      | Social_core.Error_types.Failure err ->
+          Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Video Example
@@ -98,10 +104,13 @@ let post_video account_id =
   let media_urls = ["https://cdn.example.com/video.mp4"] in
   
   Instagram.post_single ~account_id ~text ~media_urls
-    (fun media_id ->
-      Printf.printf "Video posted: %s\n" media_id;
-      ())
-    (fun err -> Printf.eprintf "Error: %s\n" err)
+    (function
+      | Social_core.Error_types.Success media_id ->
+          Printf.printf "Video posted: %s\n" media_id
+      | Social_core.Error_types.Partial_success { result = media_id; warnings } ->
+          Printf.printf "Video posted: %s (with %d warnings)\n" media_id (List.length warnings)
+      | Social_core.Error_types.Failure err ->
+          Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Reel Example

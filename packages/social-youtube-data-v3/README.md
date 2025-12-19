@@ -42,10 +42,13 @@ let upload_short account_id =
   let media_urls = ["https://cdn.example.com/video.mp4"] in
   
   YouTube.post_single ~account_id ~text ~media_urls
-    (fun video_id ->
-      Printf.printf "Uploaded successfully: %s\n" video_id;
-      ())
-    (fun err -> Printf.eprintf "Error: %s\n" err)
+    (function
+      | Social_core.Error_types.Success video_id ->
+          Printf.printf "Uploaded successfully: %s\n" video_id
+      | Social_core.Error_types.Partial_success { result = video_id; warnings } ->
+          Printf.printf "Uploaded: %s with %d warnings\n" video_id (List.length warnings)
+      | Social_core.Error_types.Failure err ->
+          Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ## OAuth Configuration

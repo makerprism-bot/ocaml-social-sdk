@@ -150,23 +150,26 @@ let chunk_size, total_chunks = calculate_chunks ~video_size
 
 ## Error Handling
 
-All functions use continuation-passing style:
+Posting functions use structured error handling with the `outcome` type:
 
 ```ocaml
-init_video_upload_file
-  ~access_token
-  ~post_info
-  ~video_size
-  ~http_post
-  ~on_success:(fun response -> (* handle success *))
-  ~on_error:(fun err -> 
-    (* Common errors:
-       - "access_token_invalid" - Token expired
-       - "scope_not_authorized" - Missing video.publish scope
-       - "rate_limit_exceeded" - Too many requests
-       - "url_ownership_unverified" - Domain not verified
-    *)
-  )
+TikTok.post_single
+  ~account_id:"user123"
+  ~text:""
+  ~media_urls:["https://example.com/video.mp4"]
+  (function
+    | Social_core.Error_types.Success publish_id ->
+        Printf.printf "Published: %s\n" publish_id
+    | Social_core.Error_types.Partial_success { result = publish_id; warnings } ->
+        Printf.printf "Published: %s with %d warnings\n" publish_id (List.length warnings)
+    | Social_core.Error_types.Failure err ->
+        (* Common errors:
+           - Auth_error Token_expired - Token expired
+           - Auth_error (Insufficient_permissions _) - Missing video.publish scope
+           - Rate_limited _ - Too many requests
+           - Validation_error [Media_required] - Video is required
+        *)
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ## Important Notes

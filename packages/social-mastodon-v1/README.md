@@ -113,10 +113,13 @@ Mastodon.post_single
   ~account_id:"user_123"
   ~text:"Hello from OCaml! 👋"
   ~media_urls:[]
-  (fun status_id -> 
-    Printf.printf "Posted: %s\n" status_id)
-  (fun err -> 
-    Printf.eprintf "Error: %s\n" err)
+  (function
+    | Social_core.Error_types.Success status_id -> 
+        Printf.printf "Posted: %s\n" status_id
+    | Social_core.Error_types.Partial_success { result = status_id; warnings } ->
+        Printf.printf "Posted: %s with %d warnings\n" status_id (List.length warnings)
+    | Social_core.Error_types.Failure err ->
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Post with Options
@@ -130,8 +133,13 @@ Mastodon.post_single
   ~sensitive:true
   ~spoiler_text:(Some "Click to reveal")
   ~language:(Some "en")
-  (fun status_id -> ...)
-  on_error
+  (function
+    | Social_core.Error_types.Success status_id -> 
+        Printf.printf "Posted: %s\n" status_id
+    | Social_core.Error_types.Partial_success { result = status_id; _ } ->
+        Printf.printf "Posted with warnings: %s\n" status_id
+    | Social_core.Error_types.Failure err ->
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Post a Poll
@@ -153,8 +161,13 @@ Mastodon.post_single
   ~text:"What's your favorite?"
   ~media_urls:[]
   ~poll:(Some poll)
-  on_success
-  on_error
+  (function
+    | Social_core.Error_types.Success status_id -> 
+        Printf.printf "Poll posted: %s\n" status_id
+    | Social_core.Error_types.Partial_success { result = status_id; warnings } ->
+        Printf.printf "Poll posted: %s (with %d warnings)\n" status_id (List.length warnings)
+    | Social_core.Error_types.Failure err ->
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Post a Thread
@@ -173,9 +186,14 @@ Mastodon.post_thread
     ["https://example.com/image.jpg"];  (* Image in third post *)
   ]
   ~visibility:Public
-  (fun status_ids ->
-    Printf.printf "Posted thread with %d statuses\n" (List.length status_ids))
-  on_error
+  (function
+    | Social_core.Error_types.Success result ->
+        Printf.printf "Posted thread with %d statuses\n" (List.length result.posted_ids)
+    | Social_core.Error_types.Partial_success { result; _ } ->
+        Printf.printf "Posted %d/%d statuses\n" 
+          (List.length result.posted_ids) result.total_requested
+    | Social_core.Error_types.Failure err ->
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Edit a Status

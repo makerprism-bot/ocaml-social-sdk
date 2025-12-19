@@ -87,8 +87,13 @@ Twitter.post_single
   ~account_id:"my_account"
   ~text:"Hello from OCaml! 🐫"
   ~media_urls:[]
-  (fun tweet_id -> Printf.printf "Posted: %s\n" tweet_id)
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Social_core.Error_types.Success tweet_id -> 
+        Printf.printf "Posted: %s\n" tweet_id
+    | Social_core.Error_types.Partial_success { result = tweet_id; warnings } ->
+        Printf.printf "Posted: %s with %d warnings\n" tweet_id (List.length warnings)
+    | Social_core.Error_types.Failure err ->
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Tweet Operations
@@ -98,8 +103,11 @@ Twitter.post_single
 Twitter.delete_tweet
   ~account_id:"my_account"
   ~tweet_id:"123456789"
-  (fun () -> print_endline "Deleted!")
-  on_error
+  (function
+    | Social_core.Error_types.Success () -> print_endline "Deleted!"
+    | Social_core.Error_types.Partial_success _ -> print_endline "Deleted!"
+    | Social_core.Error_types.Failure err ->
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Get a tweet with expansions *)
 Twitter.get_tweet
@@ -132,8 +140,14 @@ Twitter.post_thread
   ~account_id:"my_account"
   ~texts:["First tweet"; "Second tweet"; "Third tweet"]
   ~media_urls_per_post:[["url1.jpg"]; []; ["url3.jpg"]]
-  (fun tweet_ids -> Printf.printf "Posted %d tweets\n" (List.length tweet_ids))
-  on_error
+  (function
+    | Social_core.Error_types.Success result -> 
+        Printf.printf "Posted %d tweets\n" (List.length result.posted_ids)
+    | Social_core.Error_types.Partial_success { result; warnings } ->
+        Printf.printf "Posted %d/%d tweets with warnings\n" 
+          (List.length result.posted_ids) result.total_requested
+    | Social_core.Error_types.Failure err ->
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Get mentions timeline *)
 Twitter.get_mentions_timeline
@@ -271,8 +285,13 @@ Twitter.post_single
   ~account_id:"my_account"
   ~text:"Check out this image!"
   ~media_urls:["https://example.com/image.jpg"]
-  on_success
-  on_error
+  (function
+    | Social_core.Error_types.Success tweet_id -> 
+        Printf.printf "Posted: %s\n" tweet_id
+    | Social_core.Error_types.Partial_success { result = tweet_id; warnings } ->
+        Printf.printf "Posted: %s (with %d warnings)\n" tweet_id (List.length warnings)
+    | Social_core.Error_types.Failure err ->
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Chunked upload for large videos with alt text *)
 Twitter.upload_media_chunked
@@ -508,7 +527,7 @@ This implementation supports the following Twitter API v2 endpoints:
 - **Rate limiting**: Built-in tracking + header parsing
 - **Pagination**: Support for cursor-based pagination
 - **Expansions**: Full support for v2 expansions and field selection
-- **Error handling**: Comprehensive error messages and status tracking
+- **Structured error handling**: Uses `outcome` type with `Success`, `Partial_success`, and `Failure` variants for posting operations
 
 ## Comparison with Popular Libraries
 

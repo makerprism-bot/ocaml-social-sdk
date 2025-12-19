@@ -115,8 +115,13 @@ Bluesky.post_single
   ~account_id:"my_account"
   ~text:"Hello from OCaml! 🐫"
   ~media_urls:[]
-  (fun post_uri -> Printf.printf "Posted: %s\n" post_uri)
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Social_core.Error_types.Success post_uri -> 
+        Printf.printf "Posted: %s\n" post_uri
+    | Social_core.Error_types.Partial_success { result = post_uri; warnings } ->
+        Printf.printf "Posted: %s with %d warnings\n" post_uri (List.length warnings)
+    | Social_core.Error_types.Failure err ->
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### With Validation
@@ -137,9 +142,15 @@ match Bluesky.validate_content ~text:"My post text" with
 Bluesky.post_single
   ~account_id:"my_account"
   ~text:"Check out this image!"
-  ~media_urls:[("https://example.com/image.png", Some "A beautiful sunset")]
-  (fun post_uri_cid -> Printf.printf "Posted with media: %s\n" post_uri_cid)
-  (fun error -> Printf.printf "Error: %s\n" error)
+  ~media_urls:["https://example.com/image.png"]
+  ~alt_texts:["A beautiful sunset"]
+  (function
+    | Social_core.Error_types.Success post_uri_cid -> 
+        Printf.printf "Posted with media: %s\n" post_uri_cid
+    | Social_core.Error_types.Partial_success { result = post_uri_cid; warnings } ->
+        Printf.printf "Posted: %s with %d warnings\n" post_uri_cid (List.length warnings)
+    | Social_core.Error_types.Failure err ->
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Posting a Thread
@@ -154,10 +165,14 @@ Bluesky.post_thread
     [];  (* No media on second post *)
     []   (* No media on third post *)
   ]
-  (fun post_uri_cids -> 
-    (* Each element is "uri|cid" format *)
-    Printf.printf "Posted thread with %d posts\n" (List.length post_uri_cids))
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Social_core.Error_types.Success result -> 
+        Printf.printf "Posted thread with %d posts\n" (List.length result.posted_ids)
+    | Social_core.Error_types.Partial_success { result; warnings } ->
+        Printf.printf "Posted %d/%d posts with warnings\n" 
+          (List.length result.posted_ids) result.total_requested
+    | Social_core.Error_types.Failure err ->
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Deleting a Post
@@ -166,8 +181,13 @@ Bluesky.post_thread
 Bluesky.delete_post
   ~account_id:"my_account"
   ~post_uri:"at://did:plc:xyz/app.bsky.feed.post/abc123"
-  (fun () -> Printf.printf "Post deleted\n")
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Social_core.Error_types.Success () -> 
+        Printf.printf "Post deleted\n"
+    | Social_core.Error_types.Partial_success _ ->
+        Printf.printf "Post deleted\n"  (* Partial success unlikely for delete *)
+    | Social_core.Error_types.Failure err ->
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Rich Text with Mentions and Hashtags
@@ -178,8 +198,13 @@ Bluesky.post_single
   ~account_id:"my_account"
   ~text:"Hey @alice.bsky.social check out #ocaml! https://ocaml.org"
   ~media_urls:[]
-  (fun post_uri -> Printf.printf "Posted: %s\n" post_uri)
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Social_core.Error_types.Success post_uri -> 
+        Printf.printf "Posted: %s\n" post_uri
+    | Social_core.Error_types.Partial_success { result = post_uri; warnings } ->
+        Printf.printf "Posted: %s (with %d warnings)\n" post_uri (List.length warnings)
+    | Social_core.Error_types.Failure err ->
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Like and Repost
@@ -297,8 +322,13 @@ Bluesky.quote_post
   ~post_cid:"bafyreiabc123"
   ~text:"Great point! 👍"
   ~media_urls:[]
-  (fun post_uri -> Printf.printf "Quoted: %s\n" post_uri)
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Social_core.Error_types.Success post_uri -> 
+        Printf.printf "Quoted: %s\n" post_uri
+    | Social_core.Error_types.Partial_success { result = post_uri; warnings } ->
+        Printf.printf "Quoted: %s (with %d warnings)\n" post_uri (List.length warnings)
+    | Social_core.Error_types.Failure err ->
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Quote with media *)
 Bluesky.quote_post
@@ -307,8 +337,13 @@ Bluesky.quote_post
   ~post_cid:"bafyreiabc123"
   ~text:"Check this out!"
   ~media_urls:["https://example.com/image.png"]
-  (fun post_uri -> Printf.printf "Quoted with media: %s\n" post_uri)
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Social_core.Error_types.Success post_uri -> 
+        Printf.printf "Quoted with media: %s\n" post_uri
+    | Social_core.Error_types.Partial_success { result = post_uri; warnings } ->
+        Printf.printf "Quoted: %s (with %d warnings)\n" post_uri (List.length warnings)
+    | Social_core.Error_types.Failure err ->
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Notifications

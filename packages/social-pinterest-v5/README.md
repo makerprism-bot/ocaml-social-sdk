@@ -28,20 +28,25 @@ dune install
 
 ## Quick Start
 
-### Basic Pin Creation (Backward Compatible)
+### Basic Pin Creation
 
 ```ocaml
 open Social_pinterest_v5
 
 module Pinterest = Pinterest_v5.Make(YourConfig)
 
-(* Simple pin creation - works like before *)
+(* Simple pin creation with structured error handling *)
 Pinterest.post_single 
   ~account_id:"user123"
   ~text:"Check out this pin!"
   ~media_urls:["https://example.com/image.jpg"]
-  (fun pin_id -> Printf.printf "Created: %s\n" pin_id)
-  (fun err -> Printf.eprintf "Error: %s\n" err)
+  (function
+    | Social_core.Error_types.Success pin_id -> 
+        Printf.printf "Created: %s\n" pin_id
+    | Social_core.Error_types.Partial_success { result = pin_id; warnings } ->
+        Printf.printf "Created: %s with %d warnings\n" pin_id (List.length warnings)
+    | Social_core.Error_types.Failure err ->
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Advanced Features

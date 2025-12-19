@@ -147,26 +147,27 @@ let post_to_linkedin account_id =
   let text = "Hello LinkedIn from OCaml! 🚀" in
   let media = [] in  (* No media for this example *)
   
-  LinkedIn.post ~account_id ~text ~media_items:media
-    (fun post_id ->
-      Printf.printf "Posted successfully: %s\n" post_id;
-      ())
-    (fun err -> Printf.eprintf "Error: %s\n" err)
+  LinkedIn.post_single ~account_id ~text ~media_urls:[]
+    (function
+      | Social_core.Error_types.Success post_id ->
+          Printf.printf "Posted successfully: %s\n" post_id
+      | Social_core.Error_types.Partial_success { result = post_id; warnings } ->
+          Printf.printf "Posted: %s with %d warnings\n" post_id (List.length warnings)
+      | Social_core.Error_types.Failure err ->
+          Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Post with image *)
 let post_with_image account_id =
   let text = "Check out this image!" in
-  let media = [{
-    storage_key = "path/to/image.jpg";
-    media_type = "image";
-    alt_text = Some "A beautiful sunset";
-  }] in
   
-  LinkedIn.post ~account_id ~text ~media_items:media
-    (fun post_id ->
-      Printf.printf "Posted with image: %s\n" post_id;
-      ())
-    (fun err -> Printf.eprintf "Error: %s\n" err)
+  LinkedIn.post_single ~account_id ~text ~media_urls:["path/to/image.jpg"]
+    (function
+      | Social_core.Error_types.Success post_id ->
+          Printf.printf "Posted with image: %s\n" post_id
+      | Social_core.Error_types.Partial_success { result = post_id; warnings } ->
+          Printf.printf "Posted: %s (with %d warnings)\n" post_id (List.length warnings)
+      | Social_core.Error_types.Failure err ->
+          Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Get User Profile
@@ -487,17 +488,30 @@ val exchange_code :
   'a
 ```
 
-#### `post`
-Post to LinkedIn with optional media.
+#### `post_single`
+Post to LinkedIn with optional media. Uses structured error handling with the `outcome` type.
 
 ```ocaml
-val post : 
+val post_single : 
   account_id:string -> 
   text:string -> 
-  media_items:media_item list -> 
-  (string -> 'a) ->  (* on_success: returns post_id *)
-  (string -> 'a) ->  (* on_error *)
-  'a
+  media_urls:string list ->
+  ?alt_texts:string list ->
+  (string Social_core.Error_types.outcome -> unit) ->  (* on_result *)
+  unit
+```
+
+#### `post_thread`
+Post multiple items (LinkedIn only supports single posts, so this posts just the first item).
+
+```ocaml
+val post_thread : 
+  account_id:string -> 
+  texts:string list -> 
+  media_urls_per_post:string list list ->
+  ?alt_texts_per_post:string list list ->
+  (Social_core.Error_types.thread_result Social_core.Error_types.outcome -> unit) ->  (* on_result *)
+  unit
 ```
 
 #### `validate_content`
@@ -746,16 +760,20 @@ LinkedIn does not support thread/chain posting. Only single posts are allowed.
 
 ## Error Handling
 
-The library uses continuation-passing style (CPS) for error handling:
+Posting operations use structured error handling with the `outcome` type:
 
 ```ocaml
-LinkedIn.post ~account_id ~text ~media_items
-  (fun post_id -> 
-    (* Success case *)
-    handle_success post_id)
-  (fun error -> 
-    (* Error case *)
-    handle_error error)
+LinkedIn.post_single ~account_id ~text ~media_urls:[]
+  (function
+    | Social_core.Error_types.Success post_id -> 
+        (* Success case *)
+        handle_success post_id
+    | Social_core.Error_types.Partial_success { result = post_id; warnings } ->
+        (* Posted but with warnings (e.g., link card failed) *)
+        handle_partial_success post_id warnings
+    | Social_core.Error_types.Failure err ->
+        (* Error case *)
+        handle_error (Social_core.Error_types.error_to_string err))
 ```
 
 Common error messages:

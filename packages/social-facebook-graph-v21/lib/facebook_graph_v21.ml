@@ -632,14 +632,14 @@ module Make (Config : CONFIG) = struct
           (* Token expiring soon - Facebook requires re-authentication *)
           Config.update_health_status ~account_id ~status:"token_expired" 
             ~error_message:(Some "Access token expired - please reconnect")
-            (fun () -> on_error "Facebook Page token expired - please reconnect")
-            on_error
+            (fun () -> on_error (Error_types.Auth_error Error_types.Token_expired))
+            (fun _ -> on_error (Error_types.Auth_error Error_types.Token_expired))
         else
           (* Token still valid *)
           Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
             (fun () -> on_success creds.access_token)
-            on_error)
-      on_error
+            (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
+      (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
   
   (** Upload photo to Facebook Page with optional alt text *)
   let upload_photo ~page_id ~page_access_token ~image_url ~alt_text on_result =
@@ -836,8 +836,7 @@ module Make (Config : CONFIG) = struct
                   (fun video_id -> on_result (Error_types.Success video_id))
                   (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
               (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
-          (fun err -> on_result (Error_types.Failure 
-            (Error_types.Auth_error (Error_types.Refresh_failed err))))
+          (fun err -> on_result (Error_types.Failure err))
   
   (** {1 Facebook Page Stories} *)
   
@@ -1044,8 +1043,7 @@ module Make (Config : CONFIG) = struct
                 | Ok story_id -> on_result (Error_types.Success story_id)
                 | Error e -> on_result (Error_types.Failure e)))
           (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
-      (fun err -> on_result (Error_types.Failure 
-        (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Post video story to Facebook Page (high-level)
       
@@ -1063,8 +1061,7 @@ module Make (Config : CONFIG) = struct
                 | Ok story_id -> on_result (Error_types.Success story_id)
                 | Error e -> on_result (Error_types.Failure e)))
           (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
-      (fun err -> on_result (Error_types.Failure 
-        (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Detect media type from URL extension *)
   let detect_media_type url =
@@ -1192,8 +1189,7 @@ module Make (Config : CONFIG) = struct
                                 (parse_api_error ~status_code:response.status ~response_body:response.body)))
                           (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err)))))
                   (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
-              (fun err -> on_result (Error_types.Failure 
-                (Error_types.Auth_error (Error_types.Refresh_failed err))))
+              (fun err -> on_result (Error_types.Failure err))
   
   (** Post thread (Facebook doesn't support threads, posts only first item with warning) *)
   let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_result =

@@ -320,7 +320,7 @@ let test_ensure_valid_token_fresh () =
       match Mock_config.get_health_status "test_account" with
       | Some (_, "healthy", None) -> print_endline "✓ Ensure valid token (fresh)"
       | _ -> failwith "Health status not updated correctly")
-    (fun err -> failwith ("Ensure valid token failed: " ^ err))
+    (fun err -> failwith ("Ensure valid token failed: " ^ Error_types.error_to_string err))
 
 (** Test: Get profile *)
 let test_get_profile () =
@@ -867,7 +867,7 @@ let test_expired_token_detection () =
       print_endline "✓ Expired token detection and refresh")
     (fun err ->
       (* Or fail gracefully if refresh not enabled *)
-      assert (String.length err > 0);
+      assert (String.length (Error_types.error_to_string err) > 0);
       print_endline "✓ Expired token detection and refresh")
 
 (** Test: OAuth state CSRF protection *)

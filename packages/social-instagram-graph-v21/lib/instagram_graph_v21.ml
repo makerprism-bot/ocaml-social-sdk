@@ -721,22 +721,22 @@ module Make (Config : CONFIG) = struct
                 (fun () ->
                   Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
                     (fun () -> on_success refreshed_creds.access_token)
-                    on_error)
+                    (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
                 (fun err ->
                   (* Failed to update credentials in DB *)
-                  on_error (Printf.sprintf "Failed to save refreshed token: %s" err)))
+                  on_error (Error_types.Network_error (Error_types.Connection_failed (Printf.sprintf "Failed to save refreshed token: %s" err)))))
             (fun refresh_err ->
               (* Token refresh failed - mark as expired and ask user to reconnect *)
               Config.update_health_status ~account_id ~status:"token_expired" 
                 ~error_message:(Some "Access token expired - please reconnect")
-                (fun () -> on_error (Printf.sprintf "Token refresh failed: %s. Please reconnect your Instagram account." refresh_err))
-                on_error)
+                (fun () -> on_error (Error_types.Auth_error (Error_types.Refresh_failed refresh_err)))
+                (fun _ -> on_error (Error_types.Auth_error (Error_types.Refresh_failed refresh_err))))
         else
           (* Token is still valid *)
           Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
             (fun () -> on_success creds.access_token)
-            on_error)
-      on_error
+            (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
+      (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
   
   (** Media type detection from URL *)
   let detect_media_type url =
@@ -1075,8 +1075,7 @@ module Make (Config : CONFIG) = struct
                           (Error_types.Internal_error err))))
                     (fun err -> on_result (Error_types.Failure 
                       (Error_types.Internal_error err))))
-                (fun err -> on_result (Error_types.Failure 
-                  (Error_types.Auth_error (Error_types.Refresh_failed err))))
+                (fun err -> on_result (Error_types.Failure err))
             else
               (* Single image or video post *)
               ensure_valid_token ~account_id
@@ -1115,8 +1114,7 @@ module Make (Config : CONFIG) = struct
                               | Error e -> on_result (Error_types.Failure e))))
                     (fun err -> on_result (Error_types.Failure 
                       (Error_types.Internal_error err))))
-                (fun err -> on_result (Error_types.Failure 
-                  (Error_types.Auth_error (Error_types.Refresh_failed err))))
+                (fun err -> on_result (Error_types.Failure err))
   
   (** Post Reel (short-form video) *)
   let post_reel ~account_id ~text ~video_url ?(alt_text=None) on_result =
@@ -1142,8 +1140,7 @@ module Make (Config : CONFIG) = struct
                     | Error e -> on_result (Error_types.Failure e)))
               (fun err -> on_result (Error_types.Failure 
                 (Error_types.Internal_error err))))
-          (fun err -> on_result (Error_types.Failure 
-            (Error_types.Auth_error (Error_types.Refresh_failed err))))
+          (fun err -> on_result (Error_types.Failure err))
   
   (** {1 Instagram Stories} *)
   
@@ -1271,8 +1268,7 @@ module Make (Config : CONFIG) = struct
                 | Error e -> on_result (Error_types.Failure e)))
           (fun err -> on_result (Error_types.Failure 
             (Error_types.Internal_error err))))
-      (fun err -> on_result (Error_types.Failure 
-        (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Post video story to Instagram
       
@@ -1309,8 +1305,7 @@ module Make (Config : CONFIG) = struct
                 | Error e -> on_result (Error_types.Failure e)))
           (fun err -> on_result (Error_types.Failure 
             (Error_types.Internal_error err))))
-      (fun err -> on_result (Error_types.Failure 
-        (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Post story to Instagram (auto-detect media type)
       

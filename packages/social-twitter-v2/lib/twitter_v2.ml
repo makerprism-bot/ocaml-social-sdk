@@ -566,8 +566,8 @@ module Make (Config : CONFIG) = struct
           | None ->
               Config.update_health_status ~account_id ~status:"token_expired" 
                 ~error_message:(Some "No refresh token available")
-                (fun () -> on_error "No refresh token available - please reconnect")
-                on_error
+                (fun () -> on_error (Error_types.Auth_error Error_types.Missing_credentials))
+                (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
           | Some refresh_token ->
               let client_id = Config.get_env "TWITTER_CLIENT_ID" |> Option.value ~default:"" in
               let client_secret = Config.get_env "TWITTER_CLIENT_SECRET" |> Option.value ~default:"" in
@@ -585,19 +585,19 @@ module Make (Config : CONFIG) = struct
                     (fun () ->
                       Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
                         (fun () -> on_success new_access)
-                        on_error)
-                    on_error)
+                        (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
+                    (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
                 (fun err ->
                   Config.update_health_status ~account_id ~status:"refresh_failed" 
                     ~error_message:(Some err)
-                    (fun () -> on_error err)
-                    on_error)
+                    (fun () -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err)))
+                    (fun err2 -> on_error (Error_types.Network_error (Error_types.Connection_failed err2))))
         else
           (* Token still valid *)
           Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
             (fun () -> on_success creds.access_token)
-            on_error)
-      on_error
+            (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
+      (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
   
   (** Update media metadata with alt text using X API v2 
       
@@ -923,12 +923,11 @@ module Make (Config : CONFIG) = struct
                             ~status_code:response.status ~body:response.body)))
                       (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
                         (Error_types.Connection_failed err)))))
-                  (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                   (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
                     (Error_types.Connection_failed err)))))
-              (fun err -> on_result (Error_types.Failure (Error_types.Auth_error 
-                (Error_types.Refresh_failed err))))
+              (fun err -> on_result (Error_types.Failure err))
   
-  (** Post single tweet with pre-uploaded media IDs 
+  (** Post single tweet with pre-uploaded media IDs
       
       This function is for when media has already been uploaded to Twitter
       and you have the media_ids. Use this when the backend handles media
@@ -987,12 +986,11 @@ module Make (Config : CONFIG) = struct
                     else
                       on_result (Error_types.Failure (parse_api_error 
                         ~status_code:response.status ~body:response.body)))
-                  (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                   (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
                     (Error_types.Connection_failed err)))))
-              (fun err -> on_result (Error_types.Failure (Error_types.Auth_error 
-                (Error_types.Refresh_failed err))))
+              (fun err -> on_result (Error_types.Failure err))
   
-  (** Post thread with pre-uploaded media IDs 
+  (** Post thread with pre-uploaded media IDs
       
       Each text gets paired with its corresponding media_ids list.
       The first tweet in the thread can have media, subsequent tweets
@@ -1110,8 +1108,7 @@ module Make (Config : CONFIG) = struct
             in
             
             post_tweets_seq texts media_ids_per_post None [])
-          (fun err -> on_result (Error_types.Failure (Error_types.Auth_error 
-            (Error_types.Refresh_failed err))))
+          (fun err -> on_result (Error_types.Failure err))
   
   (** Post thread with media URLs
       
@@ -1298,8 +1295,7 @@ module Make (Config : CONFIG) = struct
             in
             
             post_tweets_seq texts media_with_alt_per_post None [])
-          (fun err -> on_result (Error_types.Failure (Error_types.Auth_error 
-            (Error_types.Refresh_failed err))))
+          (fun err -> on_result (Error_types.Failure err))
   
   (** Delete a tweet
       
@@ -1338,8 +1334,7 @@ module Make (Config : CONFIG) = struct
                 ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure (Error_types.Auth_error 
-        (Error_types.Refresh_failed err))))
+              (fun err -> on_result (Error_types.Failure err))
   
   (** Get a tweet by ID with optional expansions and fields *)
   let get_tweet ~account_id ~tweet_id ?(expansions=[]) ?(tweet_fields=[]) () on_result =
@@ -1373,7 +1368,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Search recent tweets *)
   let search_tweets ~account_id ~query ?(max_results=10) ?(next_token=None) ?(expansions=[]) ?(tweet_fields=[]) () on_result =
@@ -1410,7 +1405,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Get user timeline (tweets by user ID) *)
   let get_user_timeline ~account_id ~user_id ?(max_results=10) ?(pagination_token=None) ?(expansions=[]) ?(tweet_fields=[]) () on_result =
@@ -1446,7 +1441,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Get authenticated user's info *)
   let get_me ~account_id ?(user_fields=[]) () on_result =
@@ -1476,7 +1471,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Get mentions timeline for authenticated user *)
   let get_mentions_timeline ~account_id ?(max_results=10) ?(pagination_token=None) ?(expansions=[]) ?(tweet_fields=[]) () on_result =
@@ -1522,7 +1517,7 @@ module Make (Config : CONFIG) = struct
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Get home timeline (reverse chronological timeline of tweets from followed users) 
       Note: This endpoint requires OAuth 2.0 with user context *)
@@ -1569,7 +1564,7 @@ module Make (Config : CONFIG) = struct
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Get user by ID *)
   let get_user_by_id ~account_id ~user_id ?(user_fields=[]) () on_result =
@@ -1599,7 +1594,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Get user by username *)
   let get_user_by_username ~account_id ~username ?(user_fields=[]) () on_result =
@@ -1629,7 +1624,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Follow a user *)
   let follow_user ~account_id ~target_user_id on_result =
@@ -1663,7 +1658,7 @@ module Make (Config : CONFIG) = struct
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Unfollow a user *)
   let unfollow_user ~account_id ~target_user_id on_result =
@@ -1693,7 +1688,7 @@ module Make (Config : CONFIG) = struct
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Block a user *)
   let block_user ~account_id ~target_user_id on_result =
@@ -1726,7 +1721,7 @@ module Make (Config : CONFIG) = struct
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Unblock a user *)
   let unblock_user ~account_id ~target_user_id on_result =
@@ -1756,7 +1751,7 @@ module Make (Config : CONFIG) = struct
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Mute a user *)
   let mute_user ~account_id ~target_user_id on_result =
@@ -1789,7 +1784,7 @@ module Make (Config : CONFIG) = struct
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Unmute a user *)
   let unmute_user ~account_id ~target_user_id on_result =
@@ -1819,7 +1814,7 @@ module Make (Config : CONFIG) = struct
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Get followers of a user *)
   let get_followers ~account_id ~user_id ?(max_results=100) ?(pagination_token=None) ?(user_fields=[]) () on_result =
@@ -1852,7 +1847,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Get users that a user is following *)
   let get_following ~account_id ~user_id ?(max_results=100) ?(pagination_token=None) ?(user_fields=[]) () on_result =
@@ -1885,7 +1880,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Search for users by keyword *)
   let search_users ~account_id ~query ?(max_results=100) ?(pagination_token=None) ?(user_fields=[]) () on_result =
@@ -1919,7 +1914,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Like a tweet *)
   let like_tweet ~account_id ~tweet_id on_result =
@@ -1952,7 +1947,7 @@ module Make (Config : CONFIG) = struct
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Unlike a tweet *)
   let unlike_tweet ~account_id ~tweet_id on_result =
@@ -1982,7 +1977,7 @@ module Make (Config : CONFIG) = struct
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Retweet a tweet *)
   let retweet ~account_id ~tweet_id on_result =
@@ -2015,7 +2010,7 @@ module Make (Config : CONFIG) = struct
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Unretweet (delete retweet) *)
   let unretweet ~account_id ~tweet_id on_result =
@@ -2045,7 +2040,7 @@ module Make (Config : CONFIG) = struct
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Quote tweet (tweet with quoted tweet reference) *)
   let quote_tweet ~account_id ~text ~quoted_tweet_id ~media_urls on_success on_error =
@@ -2128,7 +2123,7 @@ module Make (Config : CONFIG) = struct
                       on_error (Printf.sprintf "Failed to quote tweet (%d): %s" response.status response.body))
                   on_error)
               on_error)
-          on_error
+          (fun err -> on_error (Error_types.error_to_string err))
   
   (** Reply to a tweet *)
   let reply_to_tweet ~account_id ~text ~reply_to_tweet_id ~media_urls on_success on_error =
@@ -2210,7 +2205,7 @@ module Make (Config : CONFIG) = struct
                       on_error (Printf.sprintf "Failed to reply to tweet (%d): %s" response.status response.body))
                   on_error)
               on_error)
-          on_error
+          (fun err -> on_error (Error_types.error_to_string err))
   
   (** Bookmark a tweet *)
   let bookmark_tweet ~account_id ~tweet_id on_result =
@@ -2243,7 +2238,7 @@ module Make (Config : CONFIG) = struct
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Remove bookmark from a tweet *)
   let remove_bookmark ~account_id ~tweet_id on_result =
@@ -2273,7 +2268,7 @@ module Make (Config : CONFIG) = struct
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Create a list *)
   let create_list ~account_id ~name ?(description=None) ?(private_list=false) () on_result =
@@ -2308,7 +2303,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Update a list *)
   let update_list ~account_id ~list_id ?(name=None) ?(description=None) ?(private_list=None) () on_result =
@@ -2352,7 +2347,7 @@ module Make (Config : CONFIG) = struct
               else
                 on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
             (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Delete a list *)
   let delete_list ~account_id ~list_id on_result =
@@ -2381,7 +2376,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Get a list by ID *)
   let get_list ~account_id ~list_id ?(list_fields=[]) () on_result =
@@ -2411,7 +2406,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Add a member to a list *)
   let add_list_member ~account_id ~list_id ~user_id on_result =
@@ -2433,7 +2428,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Remove a member from a list *)
   let remove_list_member ~account_id ~list_id ~user_id on_result =
@@ -2451,7 +2446,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Get list members *)
   let get_list_members ~account_id ~list_id ?(max_results=100) ?(pagination_token=None) ?(user_fields=[]) () on_result =
@@ -2484,7 +2479,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Follow a list *)
   let follow_list ~account_id ~list_id on_success on_error =
@@ -2518,7 +2513,7 @@ module Make (Config : CONFIG) = struct
                   on_error
               with e ->
                 on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))
-      on_error
+      (fun err -> on_error (Error_types.error_to_string err))
   
   (** Unfollow a list *)
   let unfollow_list ~account_id ~list_id on_success on_error =
@@ -2548,7 +2543,7 @@ module Make (Config : CONFIG) = struct
                   on_error
               with e ->
                 on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))
-      on_error
+      (fun err -> on_error (Error_types.error_to_string err))
   
   (** Get tweets from a list *)
   let get_list_tweets ~account_id ~list_id ?(max_results=100) ?(pagination_token=None) ?(expansions=[]) ?(tweet_fields=[]) () on_result =
@@ -2584,7 +2579,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Pin a list for authenticated user *)
   let pin_list ~account_id ~list_id on_success on_error =
@@ -2618,7 +2613,7 @@ module Make (Config : CONFIG) = struct
                   on_error
               with e ->
                 on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))
-      on_error
+      (fun err -> on_error (Error_types.error_to_string err))
   
   (** Unpin a list for authenticated user *)
   let unpin_list ~account_id ~list_id on_success on_error =
@@ -2648,7 +2643,7 @@ module Make (Config : CONFIG) = struct
                   on_error
               with e ->
                 on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))
-      on_error
+      (fun err -> on_error (Error_types.error_to_string err))
   
   (** Validate content for Twitter *)
   let validate_content ~text =

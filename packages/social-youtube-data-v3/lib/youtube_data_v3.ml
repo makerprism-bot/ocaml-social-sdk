@@ -491,8 +491,8 @@ module Make (Config : CONFIG) = struct
           | None ->
               Config.update_health_status ~account_id ~status:"token_expired" 
                 ~error_message:(Some "No refresh token available")
-                (fun () -> on_error "No refresh token available - please reconnect")
-                on_error
+                (fun () -> on_error (Error_types.Auth_error Error_types.Missing_credentials))
+                (fun _ -> on_error (Error_types.Auth_error Error_types.Missing_credentials))
           | Some refresh_token ->
               let client_id = Config.get_env "YOUTUBE_CLIENT_ID" |> Option.value ~default:"" in
               let client_secret = Config.get_env "YOUTUBE_CLIENT_SECRET" |> Option.value ~default:"" in
@@ -510,19 +510,19 @@ module Make (Config : CONFIG) = struct
                     (fun () ->
                       Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
                         (fun () -> on_success new_access)
-                        on_error)
-                    on_error)
+                        (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
+                    (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
                 (fun err ->
                   Config.update_health_status ~account_id ~status:"refresh_failed" 
                     ~error_message:(Some err)
-                    (fun () -> on_error err)
-                    on_error)
+                    (fun () -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err)))
+                    (fun _ -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err))))
         else
           (* Token still valid *)
           Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
             (fun () -> on_success creds.access_token)
-            on_error)
-      on_error
+            (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
+      (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
   
   (** Upload video to YouTube Shorts *)
   let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_result =
@@ -603,7 +603,7 @@ module Make (Config : CONFIG) = struct
                 else
                   on_result (Error_types.Failure (Error_types.Internal_error (Printf.sprintf "Failed to download video (%d)" video_response.status))))
               (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
-          (fun err -> on_result (Error_types.Failure (Error_types.Auth_error (Error_types.Refresh_failed err))))
+          (fun err -> on_result (Error_types.Failure err))
   
   (** Post thread (YouTube doesn't support threads, posts only first item) *)
   let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_result =

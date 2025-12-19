@@ -583,14 +583,14 @@ module Make (Config : CONFIG) = struct
               (fun () ->
                 Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
                   (fun () -> on_success mastodon_creds)
-                  on_error)
+                  (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
               (fun err ->
                 Config.update_health_status ~account_id ~status:"invalid_token" 
                   ~error_message:(Some err)
-                  (fun () -> on_error err)
-                  on_error))
-          on_error)
-      on_error
+                  (fun () -> on_error (Error_types.Auth_error Error_types.Token_invalid))
+                  (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))))
+          (fun err -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
   
   (** Post single status with full options *)
   let post_single 
@@ -745,7 +745,7 @@ module Make (Config : CONFIG) = struct
                   on_result (Error_types.Failure (parse_api_error ~status_code:response.status ~response_body:response.body)))
               on_media_error)
           on_media_error)
-      (fun err -> on_result (Error_types.Failure (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Post thread with full options *)
   let post_thread 
@@ -914,7 +914,7 @@ module Make (Config : CONFIG) = struct
           in
           
           post_statuses_seq posts_with_media_and_alt 0 None [])
-      (fun err -> on_result (Error_types.Failure (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error_types.Failure err))
   
   (** Validate content for Mastodon 
       Note: The actual character limit may vary by instance. 
@@ -980,9 +980,9 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               on_success ()
             else
-              on_error (Printf.sprintf "Delete failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_error (parse_api_error ~status_code:response.status ~response_body:response.body))
+          (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
+      (fun err -> on_error err)
   
   (** Edit a status *)
   let edit_status
@@ -1057,11 +1057,11 @@ module Make (Config : CONFIG) = struct
                 let edited_id = json |> Yojson.Basic.Util.member "id" |> Yojson.Basic.Util.to_string in
                 on_success edited_id
               with e ->
-                on_error (Printf.sprintf "Failed to parse edit response: %s" (Printexc.to_string e))
+                on_error (Error_types.Internal_error (Printf.sprintf "Failed to parse edit response: %s" (Printexc.to_string e)))
             else
-              on_error (Printf.sprintf "Edit failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_error (parse_api_error ~status_code:response.status ~response_body:response.body))
+          (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
+      (fun err -> on_error err)
   
   (** Favorite a status *)
   let favorite_status ~account_id ~status_id on_result =
@@ -1079,7 +1079,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
           (fun err -> on_result (Error (Error_types.Internal_error err))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Unfavorite a status *)
   let unfavorite_status ~account_id ~status_id on_result =
@@ -1097,7 +1097,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
           (fun err -> on_result (Error (Error_types.Internal_error err))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Boost (reblog) a status *)
   let boost_status ~account_id ~status_id ?(visibility=None) on_result =
@@ -1123,7 +1123,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
           (fun err -> on_result (Error (Error_types.Internal_error err))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Unboost (unreblog) a status *)
   let unboost_status ~account_id ~status_id on_result =
@@ -1141,7 +1141,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
           (fun err -> on_result (Error (Error_types.Internal_error err))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Bookmark a status *)
   let bookmark_status ~account_id ~status_id on_result =
@@ -1159,7 +1159,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
           (fun err -> on_result (Error (Error_types.Internal_error err))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Unbookmark a status *)
   let unbookmark_status ~account_id ~status_id on_result =
@@ -1177,7 +1177,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
           (fun err -> on_result (Error (Error_types.Internal_error err))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Register an application with a Mastodon instance *)
   let register_app ~instance_url ~client_name ~redirect_uris ~scopes ~website on_result =
@@ -1323,6 +1323,6 @@ module Make (Config : CONFIG) = struct
                 (* Network errors should also not fail the disconnect flow *)
                 on_result (Ok ())  (* Continue with disconnect even if revocation failed *)
               ))
-          (fun err -> on_result (Error (Error_types.Internal_error err))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+          (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err)))))
+      (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
 end

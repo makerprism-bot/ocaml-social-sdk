@@ -642,7 +642,7 @@ module Make (Config : CONFIG) = struct
       on_error
   
   (** Query creator info to get available privacy options *)
-  let get_creator_info ~account_id on_success on_error =
+  let get_creator_info ~account_id on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let headers = [
@@ -654,15 +654,15 @@ module Make (Config : CONFIG) = struct
           (fun response ->
             if response.status >= 200 && response.status < 300 then
               match parse_creator_info (Yojson.Basic.from_string response.body) with
-              | Ok info -> on_success info
-              | Error e -> on_error e
+              | Ok info -> on_result (Ok info)
+              | Error e -> on_result (Error (Error_types.Internal_error e))
             else
-              on_error (Printf.sprintf "Creator info query failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** Initialize video upload and get upload URL *)
-  let init_video_upload ~account_id ~post_info ~video_size on_success on_error =
+  let init_video_upload ~account_id ~post_info ~video_size on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let headers = [
@@ -688,16 +688,16 @@ module Make (Config : CONFIG) = struct
                 let data = json |> member "data" in
                 let publish_id = data |> member "publish_id" |> to_string in
                 let upload_url = data |> member "upload_url" |> to_string in
-                on_success (publish_id, upload_url)
+                on_result (Ok (publish_id, upload_url))
               with e ->
-                on_error (Printf.sprintf "Failed to parse init response: %s" (Printexc.to_string e))
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse init response: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Video init failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** Upload video content to the upload URL *)
-  let upload_video_chunk ~upload_url ~video_content on_success on_error =
+  let upload_video_chunk ~upload_url ~video_content on_result =
     let video_size = String.length video_content in
     let headers = [
       ("Content-Type", "video/mp4");
@@ -708,13 +708,13 @@ module Make (Config : CONFIG) = struct
     Config.Http.put ~headers ~body:video_content upload_url
       (fun response ->
         if response.status >= 200 && response.status < 300 then
-          on_success ()
+          on_result (Ok ())
         else
-          on_error (Printf.sprintf "Video upload failed (%d): %s" response.status response.body))
-      on_error
+          on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+      (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** Check publish status *)
-  let check_publish_status ~account_id ~publish_id on_success on_error =
+  let check_publish_status ~account_id ~publish_id on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let headers = [
@@ -729,11 +729,11 @@ module Make (Config : CONFIG) = struct
           (fun response ->
             if response.status >= 200 && response.status < 300 then
               let status = parse_publish_status (Yojson.Basic.from_string response.body) in
-              on_success status
+              on_result (Ok status)
             else
-              on_error (Printf.sprintf "Status check failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** Post a video to TikTok (high-level function)
       
@@ -751,10 +751,10 @@ module Make (Config : CONFIG) = struct
       ?(disable_comment=false) 
       ?(disable_stitch=false)
       ?video_cover_timestamp_ms
-      on_success on_error =
+      on_result =
     (* Validate caption *)
     match validate_caption caption with
-    | Error e -> on_error e
+    | Error e -> on_result (Error (Error_types.Internal_error e))
     | Ok () ->
         let post_info = make_post_info 
           ~title:caption 
@@ -768,11 +768,13 @@ module Make (Config : CONFIG) = struct
         let video_size = String.length video_content in
         
         init_video_upload ~account_id ~post_info ~video_size
-          (fun (publish_id, upload_url) ->
-            upload_video_chunk ~upload_url ~video_content
-              (fun () -> on_success publish_id)
-              on_error)
-          on_error
+          (function
+            | Ok (publish_id, upload_url) ->
+                upload_video_chunk ~upload_url ~video_content
+                  (function
+                    | Ok () -> on_result (Ok publish_id)
+                    | Error e -> on_result (Error e))
+            | Error e -> on_result (Error e))
   
   (** Post a video from URL (downloads and uploads)
       
@@ -787,7 +789,7 @@ module Make (Config : CONFIG) = struct
       ?(disable_comment=false) 
       ?(disable_stitch=false)
       ?video_cover_timestamp_ms
-      on_success on_error =
+      on_result =
     (* Download video *)
     Config.Http.get video_url
       (fun response ->
@@ -795,10 +797,10 @@ module Make (Config : CONFIG) = struct
           post_video ~account_id ~caption ~video_content:response.body
             ~privacy_level ~disable_duet ~disable_comment ~disable_stitch
             ?video_cover_timestamp_ms
-            on_success on_error
+            on_result
         else
-          on_error (Printf.sprintf "Failed to download video (%d)" response.status))
-      on_error
+          on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to download video (%d)" response.status))))
+      (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** Post single video (matches other provider signatures) *)
   let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_result =
@@ -810,8 +812,9 @@ module Make (Config : CONFIG) = struct
         (* Validation ensures media_urls is non-empty *)
         let video_url = List.hd media_urls in
         post_video_from_url ~account_id ~caption:text ~video_url
-          (fun publish_id -> on_result (Error_types.Success publish_id))
-          (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err)))
+          (function
+            | Ok publish_id -> on_result (Error_types.Success publish_id)
+            | Error err -> on_result (Error_types.Failure err))
   
   (** Post thread (TikTok doesn't support threads, posts videos separately) *)
   let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_result =
@@ -835,30 +838,31 @@ module Make (Config : CONFIG) = struct
               (* Validation ensures urls is non-empty *)
               let video_url = List.hd urls in
               post_video_from_url ~account_id ~caption:text ~video_url
-                (fun post_id -> post_all (post_id :: acc) (post_index + 1) rest_texts rest_media)
-                (fun err ->
-                  let thread_result = {
-                    Error_types.posted_ids = List.rev acc;
-                    failed_at_index = Some post_index;
-                    total_requested;
-                  } in
-                  if List.length acc > 0 then
-                    on_result (Error_types.Partial_success { 
-                      result = thread_result;
-                      warnings = [Error_types.Generic_warning { code = "thread_incomplete"; message = err; recoverable = false }]
-                    })
-                  else
-                    on_result (Error_types.Failure (Error_types.Internal_error err)))
+                (function
+                  | Ok post_id -> post_all (post_id :: acc) (post_index + 1) rest_texts rest_media
+                  | Error err ->
+                      let thread_result = {
+                        Error_types.posted_ids = List.rev acc;
+                        failed_at_index = Some post_index;
+                        total_requested;
+                      } in
+                      if List.length acc > 0 then
+                        on_result (Error_types.Partial_success { 
+                          result = thread_result;
+                          warnings = [Error_types.Generic_warning { code = "thread_incomplete"; message = Error_types.error_to_string err; recoverable = false }]
+                        })
+                      else
+                        on_result (Error_types.Failure err))
         in
         post_all [] 0 texts media_urls_per_post
   
   (** Exchange authorization code for access token *)
-  let exchange_code ~code ~redirect_uri on_success on_error =
+  let exchange_code ~code ~redirect_uri on_result =
     let client_key = Config.get_env "TIKTOK_CLIENT_KEY" |> Option.value ~default:"" in
     let client_secret = Config.get_env "TIKTOK_CLIENT_SECRET" |> Option.value ~default:"" in
     
     if client_key = "" || client_secret = "" then
-      on_error "TikTok OAuth credentials not configured"
+      on_result (Error (Error_types.Internal_error "TikTok OAuth credentials not configured"))
     else
       let headers = [
         ("Content-Type", "application/x-www-form-urlencoded");
@@ -892,15 +896,15 @@ module Make (Config : CONFIG) = struct
                 expires_at = Some expires_at;
                 token_type = "Bearer";
               } in
-              on_success credentials
+              on_result (Ok credentials)
             with e ->
-              on_error (Printf.sprintf "Failed to parse token response: %s" (Printexc.to_string e))
+              on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse token response: %s" (Printexc.to_string e))))
           else
-            on_error (Printf.sprintf "Token exchange failed (%d): %s" response.status response.body))
-        on_error
+            on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+        (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** Get OAuth URL *)
-  let get_oauth_url ~redirect_uri ~state ~code_verifier:_ on_success _on_error =
+  let get_oauth_url ~redirect_uri ~state ~code_verifier:_ on_result =
     let client_key = Config.get_env "TIKTOK_CLIENT_KEY" |> Option.value ~default:"" in
     let url = get_authorization_url
       ~client_id:client_key
@@ -908,7 +912,7 @@ module Make (Config : CONFIG) = struct
       ~scope:"user.info.basic,video.publish"
       ~state
     in
-    on_success url
+    on_result (Ok url)
   
   (** Validate content *)
   let validate_content ~text =

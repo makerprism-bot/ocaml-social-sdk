@@ -1342,7 +1342,7 @@ module Make (Config : CONFIG) = struct
         (Error_types.Refresh_failed err))))
   
   (** Get a tweet by ID with optional expansions and fields *)
-  let get_tweet ~account_id ~tweet_id ?(expansions=[]) ?(tweet_fields=[]) () on_success on_error =
+  let get_tweet ~account_id ~tweet_id ?(expansions=[]) ?(tweet_fields=[]) () on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let params = [] in
@@ -1367,16 +1367,16 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Ok json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse tweet response: %s" (Printexc.to_string e))
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse tweet response: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Failed to get tweet (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Search recent tweets *)
-  let search_tweets ~account_id ~query ?(max_results=10) ?(next_token=None) ?(expansions=[]) ?(tweet_fields=[]) () on_success on_error =
+  let search_tweets ~account_id ~query ?(max_results=10) ?(next_token=None) ?(expansions=[]) ?(tweet_fields=[]) () on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let params = [
@@ -1404,16 +1404,16 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Ok json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse search response: %s" (Printexc.to_string e))
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse search response: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Failed to search tweets (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Get user timeline (tweets by user ID) *)
-  let get_user_timeline ~account_id ~user_id ?(max_results=10) ?(pagination_token=None) ?(expansions=[]) ?(tweet_fields=[]) () on_success on_error =
+  let get_user_timeline ~account_id ~user_id ?(max_results=10) ?(pagination_token=None) ?(expansions=[]) ?(tweet_fields=[]) () on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let params = [
@@ -1440,16 +1440,16 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Ok json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse timeline response: %s" (Printexc.to_string e))
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse timeline response: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Failed to get timeline (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Get authenticated user's info *)
-  let get_me ~account_id ?(user_fields=[]) () on_success on_error =
+  let get_me ~account_id ?(user_fields=[]) () on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let params = if List.length user_fields > 0 then
@@ -1470,107 +1470,109 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Ok json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse user response: %s" (Printexc.to_string e))
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user response: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Failed to get user info (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Get mentions timeline for authenticated user *)
-  let get_mentions_timeline ~account_id ?(max_results=10) ?(pagination_token=None) ?(expansions=[]) ?(tweet_fields=[]) () on_success on_error =
+  let get_mentions_timeline ~account_id ?(max_results=10) ?(pagination_token=None) ?(expansions=[]) ?(tweet_fields=[]) () on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         get_me ~account_id ()
-          (fun me_json ->
-            try
-              let open Yojson.Basic.Util in
-              let user_id = me_json |> member "data" |> member "id" |> to_string in
-              
-              let params = [
-                ("max_results", string_of_int max_results);
-              ] in
-              let params = match pagination_token with
-                | Some token -> ("pagination_token", token) :: params
-                | None -> params in
-              let params = if List.length expansions > 0 then
-                ("expansions", String.concat "," expansions) :: params
-              else params in
-              let params = if List.length tweet_fields > 0 then
-                ("tweet.fields", String.concat "," tweet_fields) :: params
-              else params in
-              
-              let query = Uri.encoded_of_query (List.map (fun (k, v) -> (k, [v])) params) in
-              let url = Printf.sprintf "%s/users/%s/mentions?%s" twitter_api_base user_id query in
-              let headers = [
-                ("Authorization", Printf.sprintf "Bearer %s" access_token);
-              ] in
-              
-              Config.Http.get ~headers url
-                (fun response ->
-                  if response.status >= 200 && response.status < 300 then
-                    try
-                      let json = Yojson.Basic.from_string response.body in
-                      on_success json
-                    with e ->
-                      on_error (Printf.sprintf "Failed to parse mentions: %s" (Printexc.to_string e))
-                  else
-                    on_error (Printf.sprintf "Failed to get mentions (%d): %s" response.status response.body))
-                on_error
-            with e ->
-              on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e)))
-          on_error)
-      on_error
+          (function
+            | Error e -> on_result (Error e)
+            | Ok me_json ->
+              try
+                let open Yojson.Basic.Util in
+                let user_id = me_json |> member "data" |> member "id" |> to_string in
+                
+                let params = [
+                  ("max_results", string_of_int max_results);
+                ] in
+                let params = match pagination_token with
+                  | Some token -> ("pagination_token", token) :: params
+                  | None -> params in
+                let params = if List.length expansions > 0 then
+                  ("expansions", String.concat "," expansions) :: params
+                else params in
+                let params = if List.length tweet_fields > 0 then
+                  ("tweet.fields", String.concat "," tweet_fields) :: params
+                else params in
+                
+                let query = Uri.encoded_of_query (List.map (fun (k, v) -> (k, [v])) params) in
+                let url = Printf.sprintf "%s/users/%s/mentions?%s" twitter_api_base user_id query in
+                let headers = [
+                  ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                ] in
+                
+                Config.Http.get ~headers url
+                  (fun response ->
+                    if response.status >= 200 && response.status < 300 then
+                      try
+                        let json = Yojson.Basic.from_string response.body in
+                        on_result (Ok json)
+                      with e ->
+                        on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse mentions: %s" (Printexc.to_string e))))
+                    else
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                  (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Get home timeline (reverse chronological timeline of tweets from followed users) 
       Note: This endpoint requires OAuth 2.0 with user context *)
-  let get_home_timeline ~account_id ?(max_results=10) ?(pagination_token=None) ?(expansions=[]) ?(tweet_fields=[]) () on_success on_error =
+  let get_home_timeline ~account_id ?(max_results=10) ?(pagination_token=None) ?(expansions=[]) ?(tweet_fields=[]) () on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         get_me ~account_id ()
-          (fun me_json ->
-            try
-              let open Yojson.Basic.Util in
-              let user_id = me_json |> member "data" |> member "id" |> to_string in
-              
-              let params = [
-                ("max_results", string_of_int max_results);
-              ] in
-              let params = match pagination_token with
-                | Some token -> ("pagination_token", token) :: params
-                | None -> params in
-              let params = if List.length expansions > 0 then
-                ("expansions", String.concat "," expansions) :: params
-              else params in
-              let params = if List.length tweet_fields > 0 then
-                ("tweet.fields", String.concat "," tweet_fields) :: params
-              else params in
-              
-              let query = Uri.encoded_of_query (List.map (fun (k, v) -> (k, [v])) params) in
-              let url = Printf.sprintf "%s/users/%s/timelines/reverse_chronological?%s" twitter_api_base user_id query in
-              let headers = [
-                ("Authorization", Printf.sprintf "Bearer %s" access_token);
-              ] in
-              
-              Config.Http.get ~headers url
-                (fun response ->
-                  if response.status >= 200 && response.status < 300 then
-                    try
-                      let json = Yojson.Basic.from_string response.body in
-                      on_success json
-                    with e ->
-                      on_error (Printf.sprintf "Failed to parse home timeline: %s" (Printexc.to_string e))
-                  else
-                    on_error (Printf.sprintf "Failed to get home timeline (%d): %s" response.status response.body))
-                on_error
-            with e ->
-              on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e)))
-          on_error)
-      on_error
+          (function
+            | Error e -> on_result (Error e)
+            | Ok me_json ->
+              try
+                let open Yojson.Basic.Util in
+                let user_id = me_json |> member "data" |> member "id" |> to_string in
+                
+                let params = [
+                  ("max_results", string_of_int max_results);
+                ] in
+                let params = match pagination_token with
+                  | Some token -> ("pagination_token", token) :: params
+                  | None -> params in
+                let params = if List.length expansions > 0 then
+                  ("expansions", String.concat "," expansions) :: params
+                else params in
+                let params = if List.length tweet_fields > 0 then
+                  ("tweet.fields", String.concat "," tweet_fields) :: params
+                else params in
+                
+                let query = Uri.encoded_of_query (List.map (fun (k, v) -> (k, [v])) params) in
+                let url = Printf.sprintf "%s/users/%s/timelines/reverse_chronological?%s" twitter_api_base user_id query in
+                let headers = [
+                  ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                ] in
+                
+                Config.Http.get ~headers url
+                  (fun response ->
+                    if response.status >= 200 && response.status < 300 then
+                      try
+                        let json = Yojson.Basic.from_string response.body in
+                        on_result (Ok json)
+                      with e ->
+                        on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse home timeline: %s" (Printexc.to_string e))))
+                    else
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                  (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Get user by ID *)
-  let get_user_by_id ~account_id ~user_id ?(user_fields=[]) () on_success on_error =
+  let get_user_by_id ~account_id ~user_id ?(user_fields=[]) () on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let params = if List.length user_fields > 0 then
@@ -1591,16 +1593,16 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Ok json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse user response: %s" (Printexc.to_string e))
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user response: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Failed to get user (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Get user by username *)
-  let get_user_by_username ~account_id ~username ?(user_fields=[]) () on_success on_error =
+  let get_user_by_username ~account_id ~username ?(user_fields=[]) () on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let params = if List.length user_fields > 0 then
@@ -1621,200 +1623,206 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Ok json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse user response: %s" (Printexc.to_string e))
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user response: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Failed to get user (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Follow a user *)
-  let follow_user ~account_id ~target_user_id on_success on_error =
+  let follow_user ~account_id ~target_user_id on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         (* First get authenticated user's ID *)
         get_me ~account_id ()
-          (fun me_json ->
-            try
-              let source_user_id = me_json
-                |> Yojson.Basic.Util.member "data"
-                |> Yojson.Basic.Util.member "id"
-                |> Yojson.Basic.Util.to_string in
-              
-              let url = Printf.sprintf "%s/users/%s/following" twitter_api_base source_user_id in
-              let body_json = `Assoc [("target_user_id", `String target_user_id)] in
-              let body = Yojson.Basic.to_string body_json in
-              let headers = [
-                ("Authorization", Printf.sprintf "Bearer %s" access_token);
-                ("Content-Type", "application/json");
-              ] in
-              
-              Config.Http.post ~headers ~body url
-                (fun response ->
-                  if response.status >= 200 && response.status < 300 then
-                    on_success ()
-                  else
-                    on_error (Printf.sprintf "Failed to follow user (%d): %s" response.status response.body))
-                on_error
-            with e ->
-              on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e)))
-          on_error)
-      on_error
+          (function
+            | Error e -> on_result (Error e)
+            | Ok me_json ->
+              try
+                let source_user_id = me_json
+                  |> Yojson.Basic.Util.member "data"
+                  |> Yojson.Basic.Util.member "id"
+                  |> Yojson.Basic.Util.to_string in
+                
+                let url = Printf.sprintf "%s/users/%s/following" twitter_api_base source_user_id in
+                let body_json = `Assoc [("target_user_id", `String target_user_id)] in
+                let body = Yojson.Basic.to_string body_json in
+                let headers = [
+                  ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                  ("Content-Type", "application/json");
+                ] in
+                
+                Config.Http.post ~headers ~body url
+                  (fun response ->
+                    if response.status >= 200 && response.status < 300 then
+                      on_result (Ok ())
+                    else
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                  (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Unfollow a user *)
-  let unfollow_user ~account_id ~target_user_id on_success on_error =
+  let unfollow_user ~account_id ~target_user_id on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         get_me ~account_id ()
-          (fun me_json ->
-            try
-              let source_user_id = me_json
-                |> Yojson.Basic.Util.member "data"
-                |> Yojson.Basic.Util.member "id"
-                |> Yojson.Basic.Util.to_string in
-              
-              let url = Printf.sprintf "%s/users/%s/following/%s" twitter_api_base source_user_id target_user_id in
-              let headers = [
-                ("Authorization", Printf.sprintf "Bearer %s" access_token);
-              ] in
-              
-              Config.Http.delete ~headers url
-                (fun response ->
-                  if response.status >= 200 && response.status < 300 then
-                    on_success ()
-                  else
-                    on_error (Printf.sprintf "Failed to unfollow user (%d): %s" response.status response.body))
-                on_error
-            with e ->
-              on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e)))
-          on_error)
-      on_error
+          (function
+            | Error e -> on_result (Error e)
+            | Ok me_json ->
+              try
+                let source_user_id = me_json
+                  |> Yojson.Basic.Util.member "data"
+                  |> Yojson.Basic.Util.member "id"
+                  |> Yojson.Basic.Util.to_string in
+                
+                let url = Printf.sprintf "%s/users/%s/following/%s" twitter_api_base source_user_id target_user_id in
+                let headers = [
+                  ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                ] in
+                
+                Config.Http.delete ~headers url
+                  (fun response ->
+                    if response.status >= 200 && response.status < 300 then
+                      on_result (Ok ())
+                    else
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                  (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Block a user *)
-  let block_user ~account_id ~target_user_id on_success on_error =
+  let block_user ~account_id ~target_user_id on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         get_me ~account_id ()
-          (fun me_json ->
-            try
-              let source_user_id = me_json
-                |> Yojson.Basic.Util.member "data"
-                |> Yojson.Basic.Util.member "id"
-                |> Yojson.Basic.Util.to_string in
-              
-              let url = Printf.sprintf "%s/users/%s/blocking" twitter_api_base source_user_id in
-              let body_json = `Assoc [("target_user_id", `String target_user_id)] in
-              let body = Yojson.Basic.to_string body_json in
-              let headers = [
-                ("Authorization", Printf.sprintf "Bearer %s" access_token);
-                ("Content-Type", "application/json");
-              ] in
-              
-              Config.Http.post ~headers ~body url
-                (fun response ->
-                  if response.status >= 200 && response.status < 300 then
-                    on_success ()
-                  else
-                    on_error (Printf.sprintf "Failed to block user (%d): %s" response.status response.body))
-                on_error
-            with e ->
-              on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e)))
-          on_error)
-      on_error
+          (function
+            | Error e -> on_result (Error e)
+            | Ok me_json ->
+              try
+                let source_user_id = me_json
+                  |> Yojson.Basic.Util.member "data"
+                  |> Yojson.Basic.Util.member "id"
+                  |> Yojson.Basic.Util.to_string in
+                
+                let url = Printf.sprintf "%s/users/%s/blocking" twitter_api_base source_user_id in
+                let body_json = `Assoc [("target_user_id", `String target_user_id)] in
+                let body = Yojson.Basic.to_string body_json in
+                let headers = [
+                  ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                  ("Content-Type", "application/json");
+                ] in
+                
+                Config.Http.post ~headers ~body url
+                  (fun response ->
+                    if response.status >= 200 && response.status < 300 then
+                      on_result (Ok ())
+                    else
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                  (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Unblock a user *)
-  let unblock_user ~account_id ~target_user_id on_success on_error =
+  let unblock_user ~account_id ~target_user_id on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         get_me ~account_id ()
-          (fun me_json ->
-            try
-              let source_user_id = me_json
-                |> Yojson.Basic.Util.member "data"
-                |> Yojson.Basic.Util.member "id"
-                |> Yojson.Basic.Util.to_string in
-              
-              let url = Printf.sprintf "%s/users/%s/blocking/%s" twitter_api_base source_user_id target_user_id in
-              let headers = [
-                ("Authorization", Printf.sprintf "Bearer %s" access_token);
-              ] in
-              
-              Config.Http.delete ~headers url
-                (fun response ->
-                  if response.status >= 200 && response.status < 300 then
-                    on_success ()
-                  else
-                    on_error (Printf.sprintf "Failed to unblock user (%d): %s" response.status response.body))
-                on_error
-            with e ->
-              on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e)))
-          on_error)
-      on_error
+          (function
+            | Error e -> on_result (Error e)
+            | Ok me_json ->
+              try
+                let source_user_id = me_json
+                  |> Yojson.Basic.Util.member "data"
+                  |> Yojson.Basic.Util.member "id"
+                  |> Yojson.Basic.Util.to_string in
+                
+                let url = Printf.sprintf "%s/users/%s/blocking/%s" twitter_api_base source_user_id target_user_id in
+                let headers = [
+                  ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                ] in
+                
+                Config.Http.delete ~headers url
+                  (fun response ->
+                    if response.status >= 200 && response.status < 300 then
+                      on_result (Ok ())
+                    else
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                  (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Mute a user *)
-  let mute_user ~account_id ~target_user_id on_success on_error =
+  let mute_user ~account_id ~target_user_id on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         get_me ~account_id ()
-          (fun me_json ->
-            try
-              let source_user_id = me_json
-                |> Yojson.Basic.Util.member "data"
-                |> Yojson.Basic.Util.member "id"
-                |> Yojson.Basic.Util.to_string in
-              
-              let url = Printf.sprintf "%s/users/%s/muting" twitter_api_base source_user_id in
-              let body_json = `Assoc [("target_user_id", `String target_user_id)] in
-              let body = Yojson.Basic.to_string body_json in
-              let headers = [
-                ("Authorization", Printf.sprintf "Bearer %s" access_token);
-                ("Content-Type", "application/json");
-              ] in
-              
-              Config.Http.post ~headers ~body url
-                (fun response ->
-                  if response.status >= 200 && response.status < 300 then
-                    on_success ()
-                  else
-                    on_error (Printf.sprintf "Failed to mute user (%d): %s" response.status response.body))
-                on_error
-            with e ->
-              on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e)))
-          on_error)
-      on_error
+          (function
+            | Error e -> on_result (Error e)
+            | Ok me_json ->
+              try
+                let source_user_id = me_json
+                  |> Yojson.Basic.Util.member "data"
+                  |> Yojson.Basic.Util.member "id"
+                  |> Yojson.Basic.Util.to_string in
+                
+                let url = Printf.sprintf "%s/users/%s/muting" twitter_api_base source_user_id in
+                let body_json = `Assoc [("target_user_id", `String target_user_id)] in
+                let body = Yojson.Basic.to_string body_json in
+                let headers = [
+                  ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                  ("Content-Type", "application/json");
+                ] in
+                
+                Config.Http.post ~headers ~body url
+                  (fun response ->
+                    if response.status >= 200 && response.status < 300 then
+                      on_result (Ok ())
+                    else
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                  (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Unmute a user *)
-  let unmute_user ~account_id ~target_user_id on_success on_error =
+  let unmute_user ~account_id ~target_user_id on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         get_me ~account_id ()
-          (fun me_json ->
-            try
-              let source_user_id = me_json
-                |> Yojson.Basic.Util.member "data"
-                |> Yojson.Basic.Util.member "id"
-                |> Yojson.Basic.Util.to_string in
-              
-              let url = Printf.sprintf "%s/users/%s/muting/%s" twitter_api_base source_user_id target_user_id in
-              let headers = [
-                ("Authorization", Printf.sprintf "Bearer %s" access_token);
-              ] in
-              
-              Config.Http.delete ~headers url
-                (fun response ->
-                  if response.status >= 200 && response.status < 300 then
-                    on_success ()
-                  else
-                    on_error (Printf.sprintf "Failed to unmute user (%d): %s" response.status response.body))
-                on_error
-            with e ->
-              on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e)))
-          on_error)
-      on_error
+          (function
+            | Error e -> on_result (Error e)
+            | Ok me_json ->
+              try
+                let source_user_id = me_json
+                  |> Yojson.Basic.Util.member "data"
+                  |> Yojson.Basic.Util.member "id"
+                  |> Yojson.Basic.Util.to_string in
+                
+                let url = Printf.sprintf "%s/users/%s/muting/%s" twitter_api_base source_user_id target_user_id in
+                let headers = [
+                  ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                ] in
+                
+                Config.Http.delete ~headers url
+                  (fun response ->
+                    if response.status >= 200 && response.status < 300 then
+                      on_result (Ok ())
+                    else
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                  (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Get followers of a user *)
-  let get_followers ~account_id ~user_id ?(max_results=100) ?(pagination_token=None) ?(user_fields=[]) () on_success on_error =
+  let get_followers ~account_id ~user_id ?(max_results=100) ?(pagination_token=None) ?(user_fields=[]) () on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let params = [
@@ -1838,16 +1846,16 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Ok json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse followers: %s" (Printexc.to_string e))
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse followers: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Failed to get followers (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Get users that a user is following *)
-  let get_following ~account_id ~user_id ?(max_results=100) ?(pagination_token=None) ?(user_fields=[]) () on_success on_error =
+  let get_following ~account_id ~user_id ?(max_results=100) ?(pagination_token=None) ?(user_fields=[]) () on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let params = [
@@ -1871,16 +1879,16 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Ok json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse following: %s" (Printexc.to_string e))
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse following: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Failed to get following (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Search for users by keyword *)
-  let search_users ~account_id ~query ?(max_results=100) ?(pagination_token=None) ?(user_fields=[]) () on_success on_error =
+  let search_users ~account_id ~query ?(max_results=100) ?(pagination_token=None) ?(user_fields=[]) () on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let params = [
@@ -1905,135 +1913,139 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Ok json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse user search: %s" (Printexc.to_string e))
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user search: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Failed to search users (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Like a tweet *)
-  let like_tweet ~account_id ~tweet_id on_success on_error =
+  let like_tweet ~account_id ~tweet_id on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         get_me ~account_id ()
-          (fun me_json ->
-            try
-              let user_id = me_json
-                |> Yojson.Basic.Util.member "data"
-                |> Yojson.Basic.Util.member "id"
-                |> Yojson.Basic.Util.to_string in
-              
-              let url = Printf.sprintf "%s/users/%s/likes" twitter_api_base user_id in
-              let body_json = `Assoc [("tweet_id", `String tweet_id)] in
-              let body = Yojson.Basic.to_string body_json in
-              let headers = [
-                ("Authorization", Printf.sprintf "Bearer %s" access_token);
-                ("Content-Type", "application/json");
-              ] in
-              
-              Config.Http.post ~headers ~body url
-                (fun response ->
-                  if response.status >= 200 && response.status < 300 then
-                    on_success ()
-                  else
-                    on_error (Printf.sprintf "Failed to like tweet (%d): %s" response.status response.body))
-                on_error
-            with e ->
-              on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e)))
-          on_error)
-      on_error
+          (function
+            | Error e -> on_result (Error e)
+            | Ok me_json ->
+              try
+                let user_id = me_json
+                  |> Yojson.Basic.Util.member "data"
+                  |> Yojson.Basic.Util.member "id"
+                  |> Yojson.Basic.Util.to_string in
+                
+                let url = Printf.sprintf "%s/users/%s/likes" twitter_api_base user_id in
+                let body_json = `Assoc [("tweet_id", `String tweet_id)] in
+                let body = Yojson.Basic.to_string body_json in
+                let headers = [
+                  ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                  ("Content-Type", "application/json");
+                ] in
+                
+                Config.Http.post ~headers ~body url
+                  (fun response ->
+                    if response.status >= 200 && response.status < 300 then
+                      on_result (Ok ())
+                    else
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                  (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Unlike a tweet *)
-  let unlike_tweet ~account_id ~tweet_id on_success on_error =
+  let unlike_tweet ~account_id ~tweet_id on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         get_me ~account_id ()
-          (fun me_json ->
-            try
-              let user_id = me_json
-                |> Yojson.Basic.Util.member "data"
-                |> Yojson.Basic.Util.member "id"
-                |> Yojson.Basic.Util.to_string in
-              
-              let url = Printf.sprintf "%s/users/%s/likes/%s" twitter_api_base user_id tweet_id in
-              let headers = [
-                ("Authorization", Printf.sprintf "Bearer %s" access_token);
-              ] in
-              
-              Config.Http.delete ~headers url
-                (fun response ->
-                  if response.status >= 200 && response.status < 300 then
-                    on_success ()
-                  else
-                    on_error (Printf.sprintf "Failed to unlike tweet (%d): %s" response.status response.body))
-                on_error
-            with e ->
-              on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e)))
-          on_error)
-      on_error
+          (function
+            | Error e -> on_result (Error e)
+            | Ok me_json ->
+              try
+                let user_id = me_json
+                  |> Yojson.Basic.Util.member "data"
+                  |> Yojson.Basic.Util.member "id"
+                  |> Yojson.Basic.Util.to_string in
+                
+                let url = Printf.sprintf "%s/users/%s/likes/%s" twitter_api_base user_id tweet_id in
+                let headers = [
+                  ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                ] in
+                
+                Config.Http.delete ~headers url
+                  (fun response ->
+                    if response.status >= 200 && response.status < 300 then
+                      on_result (Ok ())
+                    else
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                  (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Retweet a tweet *)
-  let retweet ~account_id ~tweet_id on_success on_error =
+  let retweet ~account_id ~tweet_id on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         get_me ~account_id ()
-          (fun me_json ->
-            try
-              let user_id = me_json
-                |> Yojson.Basic.Util.member "data"
-                |> Yojson.Basic.Util.member "id"
-                |> Yojson.Basic.Util.to_string in
-              
-              let url = Printf.sprintf "%s/users/%s/retweets" twitter_api_base user_id in
-              let body_json = `Assoc [("tweet_id", `String tweet_id)] in
-              let body = Yojson.Basic.to_string body_json in
-              let headers = [
-                ("Authorization", Printf.sprintf "Bearer %s" access_token);
-                ("Content-Type", "application/json");
-              ] in
-              
-              Config.Http.post ~headers ~body url
-                (fun response ->
-                  if response.status >= 200 && response.status < 300 then
-                    on_success ()
-                  else
-                    on_error (Printf.sprintf "Failed to retweet (%d): %s" response.status response.body))
-                on_error
-            with e ->
-              on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e)))
-          on_error)
-      on_error
+          (function
+            | Error e -> on_result (Error e)
+            | Ok me_json ->
+              try
+                let user_id = me_json
+                  |> Yojson.Basic.Util.member "data"
+                  |> Yojson.Basic.Util.member "id"
+                  |> Yojson.Basic.Util.to_string in
+                
+                let url = Printf.sprintf "%s/users/%s/retweets" twitter_api_base user_id in
+                let body_json = `Assoc [("tweet_id", `String tweet_id)] in
+                let body = Yojson.Basic.to_string body_json in
+                let headers = [
+                  ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                  ("Content-Type", "application/json");
+                ] in
+                
+                Config.Http.post ~headers ~body url
+                  (fun response ->
+                    if response.status >= 200 && response.status < 300 then
+                      on_result (Ok ())
+                    else
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                  (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Unretweet (delete retweet) *)
-  let unretweet ~account_id ~tweet_id on_success on_error =
+  let unretweet ~account_id ~tweet_id on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         get_me ~account_id ()
-          (fun me_json ->
-            try
-              let user_id = me_json
-                |> Yojson.Basic.Util.member "data"
-                |> Yojson.Basic.Util.member "id"
-                |> Yojson.Basic.Util.to_string in
-              
-              let url = Printf.sprintf "%s/users/%s/retweets/%s" twitter_api_base user_id tweet_id in
-              let headers = [
-                ("Authorization", Printf.sprintf "Bearer %s" access_token);
-              ] in
-              
-              Config.Http.delete ~headers url
-                (fun response ->
-                  if response.status >= 200 && response.status < 300 then
-                    on_success ()
-                  else
-                    on_error (Printf.sprintf "Failed to unretweet (%d): %s" response.status response.body))
-                on_error
-            with e ->
-              on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e)))
-          on_error)
-      on_error
+          (function
+            | Error e -> on_result (Error e)
+            | Ok me_json ->
+              try
+                let user_id = me_json
+                  |> Yojson.Basic.Util.member "data"
+                  |> Yojson.Basic.Util.member "id"
+                  |> Yojson.Basic.Util.to_string in
+                
+                let url = Printf.sprintf "%s/users/%s/retweets/%s" twitter_api_base user_id tweet_id in
+                let headers = [
+                  ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                ] in
+                
+                Config.Http.delete ~headers url
+                  (fun response ->
+                    if response.status >= 200 && response.status < 300 then
+                      on_result (Ok ())
+                    else
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                  (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Quote tweet (tweet with quoted tweet reference) *)
   let quote_tweet ~account_id ~text ~quoted_tweet_id ~media_urls on_success on_error =
@@ -2201,68 +2213,70 @@ module Make (Config : CONFIG) = struct
           on_error
   
   (** Bookmark a tweet *)
-  let bookmark_tweet ~account_id ~tweet_id on_success on_error =
+  let bookmark_tweet ~account_id ~tweet_id on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         get_me ~account_id ()
-          (fun me_json ->
-            try
-              let user_id = me_json
-                |> Yojson.Basic.Util.member "data"
-                |> Yojson.Basic.Util.member "id"
-                |> Yojson.Basic.Util.to_string in
-              
-              let url = Printf.sprintf "%s/users/%s/bookmarks" twitter_api_base user_id in
-              let body_json = `Assoc [("tweet_id", `String tweet_id)] in
-              let body = Yojson.Basic.to_string body_json in
-              let headers = [
-                ("Authorization", Printf.sprintf "Bearer %s" access_token);
-                ("Content-Type", "application/json");
-              ] in
-              
-              Config.Http.post ~headers ~body url
-                (fun response ->
-                  if response.status >= 200 && response.status < 300 then
-                    on_success ()
-                  else
-                    on_error (Printf.sprintf "Failed to bookmark tweet (%d): %s" response.status response.body))
-                on_error
-            with e ->
-              on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e)))
-          on_error)
-      on_error
+          (function
+            | Error e -> on_result (Error e)
+            | Ok me_json ->
+              try
+                let user_id = me_json
+                  |> Yojson.Basic.Util.member "data"
+                  |> Yojson.Basic.Util.member "id"
+                  |> Yojson.Basic.Util.to_string in
+                
+                let url = Printf.sprintf "%s/users/%s/bookmarks" twitter_api_base user_id in
+                let body_json = `Assoc [("tweet_id", `String tweet_id)] in
+                let body = Yojson.Basic.to_string body_json in
+                let headers = [
+                  ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                  ("Content-Type", "application/json");
+                ] in
+                
+                Config.Http.post ~headers ~body url
+                  (fun response ->
+                    if response.status >= 200 && response.status < 300 then
+                      on_result (Ok ())
+                    else
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                  (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Remove bookmark from a tweet *)
-  let remove_bookmark ~account_id ~tweet_id on_success on_error =
+  let remove_bookmark ~account_id ~tweet_id on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         get_me ~account_id ()
-          (fun me_json ->
-            try
-              let user_id = me_json
-                |> Yojson.Basic.Util.member "data"
-                |> Yojson.Basic.Util.member "id"
-                |> Yojson.Basic.Util.to_string in
-              
-              let url = Printf.sprintf "%s/users/%s/bookmarks/%s" twitter_api_base user_id tweet_id in
-              let headers = [
-                ("Authorization", Printf.sprintf "Bearer %s" access_token);
-              ] in
-              
-              Config.Http.delete ~headers url
-                (fun response ->
-                  if response.status >= 200 && response.status < 300 then
-                    on_success ()
-                  else
-                    on_error (Printf.sprintf "Failed to remove bookmark (%d): %s" response.status response.body))
-                on_error
-            with e ->
-              on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e)))
-          on_error)
-      on_error
+          (function
+            | Error e -> on_result (Error e)
+            | Ok me_json ->
+              try
+                let user_id = me_json
+                  |> Yojson.Basic.Util.member "data"
+                  |> Yojson.Basic.Util.member "id"
+                  |> Yojson.Basic.Util.to_string in
+                
+                let url = Printf.sprintf "%s/users/%s/bookmarks/%s" twitter_api_base user_id tweet_id in
+                let headers = [
+                  ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                ] in
+                
+                Config.Http.delete ~headers url
+                  (fun response ->
+                    if response.status >= 200 && response.status < 300 then
+                      on_result (Ok ())
+                    else
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                  (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Create a list *)
-  let create_list ~account_id ~name ?(description=None) ?(private_list=false) () on_success on_error =
+  let create_list ~account_id ~name ?(description=None) ?(private_list=false) () on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let url = Printf.sprintf "%s/lists" twitter_api_base in
@@ -2288,16 +2302,16 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Ok json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse list response: %s" (Printexc.to_string e))
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse list response: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Failed to create list (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Update a list *)
-  let update_list ~account_id ~list_id ?(name=None) ?(description=None) ?(private_list=None) () on_success on_error =
+  let update_list ~account_id ~list_id ?(name=None) ?(description=None) ?(private_list=None) () on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let url = Printf.sprintf "%s/lists/%s" twitter_api_base list_id in
@@ -2317,7 +2331,7 @@ module Make (Config : CONFIG) = struct
         in
         
         if List.length fields = 0 then
-          on_error "No fields to update"
+          on_result (Error (Error_types.Internal_error "No fields to update"))
         else
           let body_json = `Assoc fields in
           let body = Yojson.Basic.to_string body_json in
@@ -2332,16 +2346,16 @@ module Make (Config : CONFIG) = struct
               if response.status >= 200 && response.status < 300 then
                 try
                   let json = Yojson.Basic.from_string response.body in
-                  on_success json
+                  on_result (Ok json)
                 with e ->
-                  on_error (Printf.sprintf "Failed to parse list response: %s" (Printexc.to_string e))
+                  on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse list response: %s" (Printexc.to_string e))))
               else
-                on_error (Printf.sprintf "Failed to update list (%d): %s" response.status response.body))
-            on_error)
-      on_error
+                on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+            (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Delete a list *)
-  let delete_list ~account_id ~list_id on_success on_error =
+  let delete_list ~account_id ~list_id on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let url = Printf.sprintf "%s/lists/%s" twitter_api_base list_id in
@@ -2359,18 +2373,18 @@ module Make (Config : CONFIG) = struct
                   |> Yojson.Basic.Util.member "deleted"
                   |> Yojson.Basic.Util.to_bool in
                 if deleted then
-                  on_success ()
+                  on_result (Ok ())
                 else
-                  on_error "List was not deleted"
+                  on_result (Error (Error_types.Internal_error "List was not deleted"))
               with e ->
-                on_error (Printf.sprintf "Failed to parse delete response: %s" (Printexc.to_string e))
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse delete response: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Failed to delete list (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Get a list by ID *)
-  let get_list ~account_id ~list_id ?(list_fields=[]) () on_success on_error =
+  let get_list ~account_id ~list_id ?(list_fields=[]) () on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let params = if List.length list_fields > 0 then
@@ -2391,16 +2405,16 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Ok json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse list response: %s" (Printexc.to_string e))
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse list response: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Failed to get list (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Add a member to a list *)
-  let add_list_member ~account_id ~list_id ~user_id on_success on_error =
+  let add_list_member ~account_id ~list_id ~user_id on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let url = Printf.sprintf "%s/lists/%s/members" twitter_api_base list_id in
@@ -2415,14 +2429,14 @@ module Make (Config : CONFIG) = struct
         Config.Http.post ~headers ~body url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              on_success ()
+              on_result (Ok ())
             else
-              on_error (Printf.sprintf "Failed to add member (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Remove a member from a list *)
-  let remove_list_member ~account_id ~list_id ~user_id on_success on_error =
+  let remove_list_member ~account_id ~list_id ~user_id on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let url = Printf.sprintf "%s/lists/%s/members/%s" twitter_api_base list_id user_id in
@@ -2433,14 +2447,14 @@ module Make (Config : CONFIG) = struct
         Config.Http.delete ~headers url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              on_success ()
+              on_result (Ok ())
             else
-              on_error (Printf.sprintf "Failed to remove member (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Get list members *)
-  let get_list_members ~account_id ~list_id ?(max_results=100) ?(pagination_token=None) ?(user_fields=[]) () on_success on_error =
+  let get_list_members ~account_id ~list_id ?(max_results=100) ?(pagination_token=None) ?(user_fields=[]) () on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let params = [
@@ -2464,45 +2478,46 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Ok json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse members: %s" (Printexc.to_string e))
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse members: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Failed to get members (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Follow a list *)
   let follow_list ~account_id ~list_id on_success on_error =
     ensure_valid_token ~account_id
       (fun access_token ->
         get_me ~account_id ()
-          (fun me_json ->
-            try
-              let user_id = me_json
-                |> Yojson.Basic.Util.member "data"
-                |> Yojson.Basic.Util.member "id"
-                |> Yojson.Basic.Util.to_string in
-              
-              let url = Printf.sprintf "%s/users/%s/followed_lists" twitter_api_base user_id in
-              let body_json = `Assoc [("list_id", `String list_id)] in
-              let body = Yojson.Basic.to_string body_json in
-              
-              let headers = [
-                ("Authorization", Printf.sprintf "Bearer %s" access_token);
-                ("Content-Type", "application/json");
-              ] in
-              
-              Config.Http.post ~headers ~body url
-                (fun response ->
-                  if response.status >= 200 && response.status < 300 then
-                    on_success ()
-                  else
-                    on_error (Printf.sprintf "Failed to follow list (%d): %s" response.status response.body))
-                on_error
-            with e ->
-              on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e)))
-          on_error)
+          (function
+            | Error _ -> on_error "Failed to get authenticated user"
+            | Ok me_json ->
+              try
+                let user_id = me_json
+                  |> Yojson.Basic.Util.member "data"
+                  |> Yojson.Basic.Util.member "id"
+                  |> Yojson.Basic.Util.to_string in
+                
+                let url = Printf.sprintf "%s/users/%s/followed_lists" twitter_api_base user_id in
+                let body_json = `Assoc [("list_id", `String list_id)] in
+                let body = Yojson.Basic.to_string body_json in
+                
+                let headers = [
+                  ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                  ("Content-Type", "application/json");
+                ] in
+                
+                Config.Http.post ~headers ~body url
+                  (fun response ->
+                    if response.status >= 200 && response.status < 300 then
+                      on_success ()
+                    else
+                      on_error (Printf.sprintf "Failed to follow list (%d): %s" response.status response.body))
+                  on_error
+              with e ->
+                on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))
       on_error
   
   (** Unfollow a list *)
@@ -2510,32 +2525,33 @@ module Make (Config : CONFIG) = struct
     ensure_valid_token ~account_id
       (fun access_token ->
         get_me ~account_id ()
-          (fun me_json ->
-            try
-              let user_id = me_json
-                |> Yojson.Basic.Util.member "data"
-                |> Yojson.Basic.Util.member "id"
-                |> Yojson.Basic.Util.to_string in
-              
-              let url = Printf.sprintf "%s/users/%s/followed_lists/%s" twitter_api_base user_id list_id in
-              let headers = [
-                ("Authorization", Printf.sprintf "Bearer %s" access_token);
-              ] in
-              
-              Config.Http.delete ~headers url
-                (fun response ->
-                  if response.status >= 200 && response.status < 300 then
-                    on_success ()
-                  else
-                    on_error (Printf.sprintf "Failed to unfollow list (%d): %s" response.status response.body))
-                on_error
-            with e ->
-              on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e)))
-          on_error)
+          (function
+            | Error _ -> on_error "Failed to get authenticated user"
+            | Ok me_json ->
+              try
+                let user_id = me_json
+                  |> Yojson.Basic.Util.member "data"
+                  |> Yojson.Basic.Util.member "id"
+                  |> Yojson.Basic.Util.to_string in
+                
+                let url = Printf.sprintf "%s/users/%s/followed_lists/%s" twitter_api_base user_id list_id in
+                let headers = [
+                  ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                ] in
+                
+                Config.Http.delete ~headers url
+                  (fun response ->
+                    if response.status >= 200 && response.status < 300 then
+                      on_success ()
+                    else
+                      on_error (Printf.sprintf "Failed to unfollow list (%d): %s" response.status response.body))
+                  on_error
+              with e ->
+                on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))
       on_error
   
   (** Get tweets from a list *)
-  let get_list_tweets ~account_id ~list_id ?(max_results=100) ?(pagination_token=None) ?(expansions=[]) ?(tweet_fields=[]) () on_success on_error =
+  let get_list_tweets ~account_id ~list_id ?(max_results=100) ?(pagination_token=None) ?(expansions=[]) ?(tweet_fields=[]) () on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let params = [
@@ -2562,45 +2578,46 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_success json
+                on_result (Ok json)
               with e ->
-                on_error (Printf.sprintf "Failed to parse list tweets: %s" (Printexc.to_string e))
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse list tweets: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Failed to get list tweets (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Pin a list for authenticated user *)
   let pin_list ~account_id ~list_id on_success on_error =
     ensure_valid_token ~account_id
       (fun access_token ->
         get_me ~account_id ()
-          (fun me_json ->
-            try
-              let user_id = me_json
-                |> Yojson.Basic.Util.member "data"
-                |> Yojson.Basic.Util.member "id"
-                |> Yojson.Basic.Util.to_string in
-              
-              let url = Printf.sprintf "%s/users/%s/pinned_lists" twitter_api_base user_id in
-              let body_json = `Assoc [("list_id", `String list_id)] in
-              let body = Yojson.Basic.to_string body_json in
-              
-              let headers = [
-                ("Authorization", Printf.sprintf "Bearer %s" access_token);
-                ("Content-Type", "application/json");
-              ] in
-              
-              Config.Http.post ~headers ~body url
-                (fun response ->
-                  if response.status >= 200 && response.status < 300 then
-                    on_success ()
-                  else
-                    on_error (Printf.sprintf "Failed to pin list (%d): %s" response.status response.body))
-                on_error
-            with e ->
-              on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e)))
-          on_error)
+          (function
+            | Error _ -> on_error "Failed to get authenticated user"
+            | Ok me_json ->
+              try
+                let user_id = me_json
+                  |> Yojson.Basic.Util.member "data"
+                  |> Yojson.Basic.Util.member "id"
+                  |> Yojson.Basic.Util.to_string in
+                
+                let url = Printf.sprintf "%s/users/%s/pinned_lists" twitter_api_base user_id in
+                let body_json = `Assoc [("list_id", `String list_id)] in
+                let body = Yojson.Basic.to_string body_json in
+                
+                let headers = [
+                  ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                  ("Content-Type", "application/json");
+                ] in
+                
+                Config.Http.post ~headers ~body url
+                  (fun response ->
+                    if response.status >= 200 && response.status < 300 then
+                      on_success ()
+                    else
+                      on_error (Printf.sprintf "Failed to pin list (%d): %s" response.status response.body))
+                  on_error
+              with e ->
+                on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))
       on_error
   
   (** Unpin a list for authenticated user *)
@@ -2608,28 +2625,29 @@ module Make (Config : CONFIG) = struct
     ensure_valid_token ~account_id
       (fun access_token ->
         get_me ~account_id ()
-          (fun me_json ->
-            try
-              let user_id = me_json
-                |> Yojson.Basic.Util.member "data"
-                |> Yojson.Basic.Util.member "id"
-                |> Yojson.Basic.Util.to_string in
-              
-              let url = Printf.sprintf "%s/users/%s/pinned_lists/%s" twitter_api_base user_id list_id in
-              let headers = [
-                ("Authorization", Printf.sprintf "Bearer %s" access_token);
-              ] in
-              
-              Config.Http.delete ~headers url
-                (fun response ->
-                  if response.status >= 200 && response.status < 300 then
-                    on_success ()
-                  else
-                    on_error (Printf.sprintf "Failed to unpin list (%d): %s" response.status response.body))
-                on_error
-            with e ->
-              on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e)))
-          on_error)
+          (function
+            | Error _ -> on_error "Failed to get authenticated user"
+            | Ok me_json ->
+              try
+                let user_id = me_json
+                  |> Yojson.Basic.Util.member "data"
+                  |> Yojson.Basic.Util.member "id"
+                  |> Yojson.Basic.Util.to_string in
+                
+                let url = Printf.sprintf "%s/users/%s/pinned_lists/%s" twitter_api_base user_id list_id in
+                let headers = [
+                  ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                ] in
+                
+                Config.Http.delete ~headers url
+                  (fun response ->
+                    if response.status >= 200 && response.status < 300 then
+                      on_success ()
+                    else
+                      on_error (Printf.sprintf "Failed to unpin list (%d): %s" response.status response.body))
+                  on_error
+              with e ->
+                on_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))
       on_error
   
   (** Validate content for Twitter *)

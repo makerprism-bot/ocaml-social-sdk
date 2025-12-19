@@ -23,6 +23,12 @@ let handle_thread_outcome on_success on_error outcome =
   | Error_types.Partial_success { result; _ } -> on_success result.Error_types.posted_ids
   | Error_types.Failure err -> on_error (Error_types.error_to_string err)
 
+(** Helper to handle api_result type for tests - converts to legacy on_success/on_error *)
+let handle_api_result on_success on_error result =
+  match result with
+  | Ok value -> on_success value
+  | Error err -> on_error (Error_types.error_to_string err)
+
 (** Mock HTTP client for testing *)
 module Mock_http : Social_core.HTTP_CLIENT = struct
   let get ?headers:_ _url on_success _on_error =
@@ -222,12 +228,13 @@ let test_favorite_status () =
   Mastodon.favorite_status
     ~account_id:"test_account"
     ~status_id:"54321"
-    (fun () ->
-      success_called := true;
-      Printf.printf "✓\n")
-    (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
-      assert false);
+    (handle_api_result
+      (fun () ->
+        success_called := true;
+        Printf.printf "✓\n")
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
   assert !success_called
 
 (** Test: Bookmark a status *)
@@ -237,12 +244,13 @@ let test_bookmark_status () =
   Mastodon.bookmark_status
     ~account_id:"test_account"
     ~status_id:"54321"
-    (fun () ->
-      success_called := true;
-      Printf.printf "✓\n")
-    (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
-      assert false);
+    (handle_api_result
+      (fun () ->
+        success_called := true;
+        Printf.printf "✓\n")
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
   assert !success_called
 
 (** Test: Validate content *)
@@ -284,12 +292,13 @@ let test_register_app () =
     ~redirect_uris:"urn:ietf:wg:oauth:2.0:oob"
     ~scopes:"read write follow"
     ~website:"https://example.com"
-    (fun (client_id, _client_secret) ->
-      success_called := true;
-      Printf.printf "✓ (client_id: %s)\n" client_id)
-    (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
-      assert false);
+    (handle_api_result
+      (fun (client_id, _client_secret) ->
+        success_called := true;
+        Printf.printf "✓ (client_id: %s)\n" client_id)
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
   assert !success_called
 
 (** Test: Get OAuth URL *)
@@ -318,12 +327,13 @@ let test_exchange_code () =
     ~client_secret:"test_client_secret"
     ~redirect_uri:"urn:ietf:wg:oauth:2.0:oob"
     ~code:"test_code"
-    (fun credentials ->
-      success_called := true;
-      Printf.printf "✓ (access_token: %s)\n" credentials.Social_core.access_token)
-    (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
-      assert false);
+    (handle_api_result
+      (fun credentials ->
+        success_called := true;
+        Printf.printf "✓ (access_token: %s)\n" credentials.Social_core.access_token)
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
   assert !success_called
 
 (** Test: Reject content exceeding character limit *)
@@ -641,12 +651,13 @@ let test_boost_status () =
   Mastodon.boost_status
     ~account_id:"test_account"
     ~status_id:"54321"
-    (fun () ->
-      success_called := true;
-      Printf.printf "✓\n")
-    (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
-      assert false);
+    (handle_api_result
+      (fun () ->
+        success_called := true;
+        Printf.printf "✓\n")
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
   assert !success_called
 
 (** Test: Boost with visibility *)
@@ -657,12 +668,13 @@ let test_boost_with_visibility () =
     ~account_id:"test_account"
     ~status_id:"54321"
     ~visibility:(Some Social_mastodon_v1.Unlisted)
-    (fun () ->
-      success_called := true;
-      Printf.printf "✓\n")
-    (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
-      assert false);
+    (handle_api_result
+      (fun () ->
+        success_called := true;
+        Printf.printf "✓\n")
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
   assert !success_called
 
 (** Test: Accept valid content lengths *)
@@ -699,12 +711,13 @@ let test_exchange_code_with_pkce () =
     ~redirect_uri:"urn:ietf:wg:oauth:2.0:oob"
     ~code:"test_code"
     ~code_verifier:(Some "test_verifier_12345")
-    (fun _credentials ->
-      success_called := true;
-      Printf.printf "✓ (with PKCE)\n")
-    (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
-      assert false);
+    (handle_api_result
+      (fun _credentials ->
+        success_called := true;
+        Printf.printf "✓ (with PKCE)\n")
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
   assert !success_called
 
 (** Test: OAuth URL with PKCE challenge *)
@@ -773,12 +786,13 @@ let test_revoke_token () =
   let success_called = ref false in
   Mastodon.revoke_token
     ~account_id:"test_account"
-    (fun () ->
-      success_called := true;
-      Printf.printf "✓\n")
-    (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
-      assert false);
+    (handle_api_result
+      (fun () ->
+        success_called := true;
+        Printf.printf "✓\n")
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
   assert !success_called
 
 (** Test: OAuth URL with state parameter *)

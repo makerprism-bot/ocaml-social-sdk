@@ -1059,7 +1059,7 @@ module Make (Config : CONFIG) = struct
       This uses the /userinfo endpoint which requires the 'openid' and 'profile' scopes.
       Returns basic profile information including user ID, name, email, and profile picture.
   *)
-  let get_profile ~account_id on_success on_error =
+  let get_profile ~account_id on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let url = Printf.sprintf "%s/userinfo" linkedin_api_base in
@@ -1083,13 +1083,13 @@ module Make (Config : CONFIG) = struct
                   email_verified = json |> member "email_verified" |> to_bool_option;
                   locale = json |> member "locale" |> to_string_option;
                 } in
-                on_success profile
+                on_result (Ok profile)
               with e ->
-                on_error (Printf.sprintf "Failed to parse profile: %s" (Printexc.to_string e))
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse profile: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Failed to get profile (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** {1 Posts API} *)
   
@@ -1098,7 +1098,7 @@ module Make (Config : CONFIG) = struct
       Fetches a single post/share using its URN. Requires appropriate permissions.
       @param post_urn The URN of the post (e.g., "urn:li:share:123456")
   *)
-  let get_post ~account_id ~post_urn on_success on_error =
+  let get_post ~account_id ~post_urn on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let url = Printf.sprintf "%s/ugcPosts/%s" linkedin_api_base (Uri.pct_encode post_urn) in
@@ -1133,13 +1133,13 @@ module Make (Config : CONFIG) = struct
                   with _ -> None);
                   lifecycle_state = json |> member "lifecycleState" |> to_string_option;
                 } in
-                on_success post
+                on_result (Ok post)
               with e ->
-                on_error (Printf.sprintf "Failed to parse post: %s" (Printexc.to_string e))
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse post: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Failed to get post (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Get user's posts with pagination
       
@@ -1147,7 +1147,7 @@ module Make (Config : CONFIG) = struct
       @param start Starting index (default: 0)
       @param count Number of posts to fetch (default: 10, max: 50)
   *)
-  let get_posts ~account_id ?(start=0) ?(count=10) on_success on_error =
+  let get_posts ~account_id ?(start=0) ?(count=10) on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         get_person_urn ~access_token
@@ -1215,14 +1215,14 @@ module Make (Config : CONFIG) = struct
                       paging = paging;
                       metadata = None;
                     } in
-                    on_success collection
+                    on_result (Ok collection)
                   with e ->
-                    on_error (Printf.sprintf "Failed to parse posts: %s" (Printexc.to_string e))
+                    on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse posts: %s" (Printexc.to_string e))))
                 else
-                  on_error (Printf.sprintf "Failed to get posts (%d): %s" response.status response.body))
-              on_error)
-          on_error)
-      on_error
+                  on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** {1 Scroller Pattern for Pagination} *)
   
@@ -1231,11 +1231,11 @@ module Make (Config : CONFIG) = struct
       Provides a convenient interface for navigating through pages of posts.
       Usage:
         let scroller = create_posts_scroller ~account_id ~page_size:10 ()
-        scroller.scroll_next (fun page -> ...) (fun err -> ...)
+        scroller.scroll_next (fun result -> ...)
   *)
   type 'a scroller = {
-    scroll_next: (('a collection_response -> unit) -> (string -> unit) -> unit);
-    scroll_back: (('a collection_response -> unit) -> (string -> unit) -> unit);
+    scroll_next: (('a collection_response, Error_types.error) result -> unit) -> unit;
+    scroll_back: (('a collection_response, Error_types.error) result -> unit) -> unit;
     current_position: unit -> int;
     has_more: unit -> bool;
   }
@@ -1245,30 +1245,34 @@ module Make (Config : CONFIG) = struct
     let current_start = ref 0 in
     let last_total = ref None in
     
-    let scroll_next on_success on_error =
+    let scroll_next on_result =
       get_posts ~account_id ~start:!current_start ~count:page_size
-        (fun collection ->
-          (* Update state *)
-          (match collection.paging with
-          | Some p -> 
-              current_start := p.start + p.count;
-              last_total := p.total
-          | None -> 
-              current_start := !current_start + (List.length collection.elements));
-          on_success collection)
-        on_error
+        (fun result ->
+          (match result with
+          | Ok collection ->
+              (* Update state *)
+              (match collection.paging with
+              | Some p -> 
+                  current_start := p.start + p.count;
+                  last_total := p.total
+              | None -> 
+                  current_start := !current_start + (List.length collection.elements))
+          | Error _ -> ());
+          on_result result)
     in
     
-    let scroll_back on_success on_error =
+    let scroll_back on_result =
       let new_start = max 0 (!current_start - page_size - page_size) in
       current_start := new_start;
       get_posts ~account_id ~start:new_start ~count:page_size
-        (fun collection ->
-          (match collection.paging with
-          | Some p -> current_start := p.start + p.count
-          | None -> current_start := new_start + (List.length collection.elements));
-          on_success collection)
-        on_error
+        (fun result ->
+          (match result with
+          | Ok collection ->
+              (match collection.paging with
+              | Some p -> current_start := p.start + p.count
+              | None -> current_start := new_start + (List.length collection.elements))
+          | Error _ -> ());
+          on_result result)
     in
     
     let current_position () = !current_start in
@@ -1288,11 +1292,11 @@ module Make (Config : CONFIG) = struct
       Efficiently fetch multiple posts in a single API call.
       @param post_urns List of post URNs to fetch
   *)
-  let batch_get_posts ~account_id ~post_urns on_success on_error =
+  let batch_get_posts ~account_id ~post_urns on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         if List.length post_urns = 0 then
-          on_success []
+          on_result (Ok [])
         else
           let encoded_ids = List.map Uri.pct_encode post_urns in
           let ids_param = String.concat "," encoded_ids in
@@ -1339,14 +1343,14 @@ module Make (Config : CONFIG) = struct
                       with _ -> None
                     ) results)
                   with e ->
-                    Error (Printf.sprintf "Failed to parse batch results: %s" (Printexc.to_string e))
+                    Error (Error_types.Internal_error (Printf.sprintf "Failed to parse batch results: %s" (Printexc.to_string e)))
                 with
-                | Ok posts -> on_success posts
-                | Error msg -> on_error msg
+                | Ok posts -> on_result (Ok posts)
+                | Error err -> on_result (Error err)
               else
-                on_error (Printf.sprintf "Batch get failed (%d): %s" response.status response.body))
-            on_error)
-      on_error
+                on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+            (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** {1 Search API (FINDER Pattern)} *)
   
@@ -1360,7 +1364,7 @@ module Make (Config : CONFIG) = struct
       @param start Starting index
       @param count Results per page
   *)
-  let search_posts ~account_id ?keywords ?author ?(start=0) ?(count=10) on_success on_error =
+  let search_posts ~account_id ?keywords ?author ?(start=0) ?(count=10) on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         (* Build query parameters for FINDER *)
@@ -1435,42 +1439,46 @@ module Make (Config : CONFIG) = struct
                   paging = paging;
                   metadata = None;
                 } in
-                on_success collection
+                on_result (Ok collection)
               with e ->
-                on_error (Printf.sprintf "Failed to parse search results: %s" (Printexc.to_string e))
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse search results: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Search failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Create a scroller for post search *)
   let create_search_scroller ~account_id ?keywords ?author ?(page_size=10) () =
     let current_start = ref 0 in
     let last_total = ref None in
     
-    let scroll_next on_success on_error =
+    let scroll_next on_result =
       search_posts ~account_id ?keywords ?author ~start:!current_start ~count:page_size
-        (fun collection ->
-          (match collection.paging with
-          | Some p -> 
-              current_start := p.start + p.count;
-              last_total := p.total
-          | None -> 
-              current_start := !current_start + (List.length collection.elements));
-          on_success collection)
-        on_error
+        (fun result ->
+          (match result with
+          | Ok collection ->
+              (match collection.paging with
+              | Some p -> 
+                  current_start := p.start + p.count;
+                  last_total := p.total
+              | None -> 
+                  current_start := !current_start + (List.length collection.elements))
+          | Error _ -> ());
+          on_result result)
     in
     
-    let scroll_back on_success on_error =
+    let scroll_back on_result =
       let new_start = max 0 (!current_start - page_size - page_size) in
       current_start := new_start;
       search_posts ~account_id ?keywords ?author ~start:new_start ~count:page_size
-        (fun collection ->
-          (match collection.paging with
-          | Some p -> current_start := p.start + p.count
-          | None -> current_start := new_start + (List.length collection.elements));
-          on_success collection)
-        on_error
+        (fun result ->
+          (match result with
+          | Ok collection ->
+              (match collection.paging with
+              | Some p -> current_start := p.start + p.count
+              | None -> current_start := new_start + (List.length collection.elements))
+          | Error _ -> ());
+          on_result result)
     in
     
     let current_position () = !current_start in
@@ -1489,7 +1497,7 @@ module Make (Config : CONFIG) = struct
       Adds a like/reaction to the specified post.
       @param post_urn The URN of the post to like
   *)
-  let like_post ~account_id ~post_urn on_success on_error =
+  let like_post ~account_id ~post_urn on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         get_person_urn ~access_token
@@ -1511,20 +1519,19 @@ module Make (Config : CONFIG) = struct
             Config.Http.post ~headers ~body url
               (fun response ->
                 if response.status >= 200 && response.status < 300 then
-                  on_success ()
+                  on_result (Ok ())
                 else
-                  on_error (Printf.sprintf "Failed to like post (%d): %s" 
-                    response.status response.body))
-              on_error)
-          on_error)
-      on_error
+                  on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Unlike a post
       
       Removes a like/reaction from the specified post.
       @param post_urn The URN of the post to unlike
   *)
-  let unlike_post ~account_id ~post_urn on_success on_error =
+  let unlike_post ~account_id ~post_urn on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         get_person_urn ~access_token
@@ -1543,13 +1550,12 @@ module Make (Config : CONFIG) = struct
             Config.Http.delete ~headers url
               (fun response ->
                 if response.status >= 200 && response.status < 300 then
-                  on_success ()
+                  on_result (Ok ())
                 else
-                  on_error (Printf.sprintf "Failed to unlike post (%d): %s" 
-                    response.status response.body))
-              on_error)
-          on_error)
-      on_error
+                  on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Comment on a post
       
@@ -1557,7 +1563,7 @@ module Make (Config : CONFIG) = struct
       @param post_urn The URN of the post
       @param text The comment text
   *)
-  let comment_on_post ~account_id ~post_urn ~text on_success on_error =
+  let comment_on_post ~account_id ~post_urn ~text on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         get_person_urn ~access_token
@@ -1587,16 +1593,15 @@ module Make (Config : CONFIG) = struct
                     let comment_id = json 
                       |> Yojson.Basic.Util.member "id" 
                       |> Yojson.Basic.Util.to_string in
-                    on_success comment_id
+                    on_result (Ok comment_id)
                   with _ ->
                     (* If we can't parse the ID, just return success *)
-                    on_success "unknown"
+                    on_result (Ok "unknown")
                 else
-                  on_error (Printf.sprintf "Failed to comment (%d): %s" 
-                    response.status response.body))
-              on_error)
-          on_error)
-      on_error
+                  on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Get comments on a post
       
@@ -1605,7 +1610,7 @@ module Make (Config : CONFIG) = struct
       @param start Starting index
       @param count Number of comments to fetch
   *)
-  let get_post_comments ~account_id ~post_urn ?(start=0) ?(count=10) on_success on_error =
+  let get_post_comments ~account_id ~post_urn ?(start=0) ?(count=10) on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let query_params = [
@@ -1653,14 +1658,13 @@ module Make (Config : CONFIG) = struct
                   paging = paging;
                   metadata = None;
                 } in
-                on_success collection
+                on_result (Ok collection)
               with e ->
-                on_error (Printf.sprintf "Failed to parse comments: %s" (Printexc.to_string e))
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse comments: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Failed to get comments (%d): %s" 
-                response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Get engagement statistics for a post
       
@@ -1668,7 +1672,7 @@ module Make (Config : CONFIG) = struct
       Note: This may require additional API permissions.
       @param post_urn The URN of the post
   *)
-  let get_post_engagement ~account_id ~post_urn on_success on_error =
+  let get_post_engagement ~account_id ~post_urn on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         let url = Printf.sprintf "%s/socialMetadata/%s" 
@@ -1691,12 +1695,11 @@ module Make (Config : CONFIG) = struct
                   share_count = json |> member "totalShares" |> to_int_option;
                   impression_count = json |> member "totalImpressions" |> to_int_option;
                 } in
-                on_success engagement
+                on_result (Ok engagement)
               with e ->
-                on_error (Printf.sprintf "Failed to parse engagement: %s" (Printexc.to_string e))
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse engagement: %s" (Printexc.to_string e))))
             else
-              on_error (Printf.sprintf "Failed to get engagement (%d): %s" 
-                response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
 end

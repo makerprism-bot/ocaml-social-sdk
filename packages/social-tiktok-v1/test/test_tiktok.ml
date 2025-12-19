@@ -13,14 +13,23 @@ module Mock_http : Social_core.HTTP_CLIENT = struct
     }
   
   let post ?headers:_ ?body:_ url on_success _on_error =
-    if String.length url > 0 && (
-      String.sub url (String.length url - min 5 (String.length url)) (min 5 (String.length url)) = "init/" ||
-      String.ends_with ~suffix:"video/init/" url
-    ) then
+    if String.ends_with ~suffix:"video/init/" url then
       on_success {
         Social_core.status = 200;
         headers = [("content-type", "application/json")];
         body = {|{"data":{"publish_id":"pub_123","upload_url":"https://upload.tiktok.com/video"}}|};
+      }
+    else if String.ends_with ~suffix:"creator_info/query/" url then
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"creator_avatar_url":"https://example.com/avatar.jpg","creator_username":"testuser","creator_nickname":"Test User","privacy_level_options":["PUBLIC_TO_EVERYONE","SELF_ONLY"],"comment_disabled":false,"duet_disabled":false,"stitch_disabled":false,"max_video_post_duration_sec":600}}|};
+      }
+    else if String.ends_with ~suffix:"status/fetch/" url then
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"status":"PUBLISH_COMPLETE","publicaly_available_post_id":[{"id":"video_123"}]}}|};
       }
     else
       on_success {
@@ -223,6 +232,80 @@ let test_post_thread_empty () =
           failwith "Expected validation error");
   assert !error_received
 
+(** Helper to handle api_result for tests *)
+let handle_api_result on_success on_error result =
+  match result with
+  | Ok value -> on_success value
+  | Error err -> on_error (Error_types.error_to_string err)
+
+let test_get_creator_info () =
+  print_string "Test: get_creator_info success... ";
+  let success_called = ref false in
+  TikTok.get_creator_info
+    ~account_id:"test_account"
+    (handle_api_result
+      (fun info ->
+        assert (info.Social_tiktok_v1.creator_username = "testuser");
+        assert (info.creator_nickname = "Test User");
+        assert (info.max_video_post_duration_sec = 600);
+        success_called := true;
+        print_endline "PASSED")
+      (fun err ->
+        failwith ("Unexpected error: " ^ err)));
+  assert !success_called
+
+let test_check_publish_status () =
+  print_string "Test: check_publish_status success... ";
+  let success_called = ref false in
+  TikTok.check_publish_status
+    ~account_id:"test_account"
+    ~publish_id:"pub_123"
+    (handle_api_result
+      (fun status ->
+        (match status with
+        | Social_tiktok_v1.Published video_id ->
+            assert (video_id = "video_123");
+            success_called := true;
+            print_endline "PASSED"
+        | _ ->
+            failwith "Expected Published status"))
+      (fun err ->
+        failwith ("Unexpected error: " ^ err)));
+  assert !success_called
+
+let test_exchange_code () =
+  print_string "Test: exchange_code success... ";
+  let success_called = ref false in
+  TikTok.exchange_code
+    ~code:"auth_code_123"
+    ~redirect_uri:"https://example.com/callback"
+    (handle_api_result
+      (fun creds ->
+        assert (creds.Social_core.access_token = "test_token");
+        assert (creds.refresh_token = Some "test_refresh");
+        success_called := true;
+        print_endline "PASSED")
+      (fun err ->
+        failwith ("Unexpected error: " ^ err)));
+  assert !success_called
+
+let test_get_oauth_url () =
+  print_string "Test: get_oauth_url success... ";
+  let success_called = ref false in
+  TikTok.get_oauth_url
+    ~redirect_uri:"https://example.com/callback"
+    ~state:"random_state"
+    ~code_verifier:""
+    (handle_api_result
+      (fun url ->
+        assert (String.length url > 0);
+        assert (String.sub url 0 5 = "https");
+        success_called := true;
+        print_endline "PASSED")
+      (fun err ->
+        failwith ("Unexpected error: " ^ err)));
+  assert !success_called
+
 let () =
   print_endline "\n=== TikTok Provider Tests ===\n";
   
@@ -240,4 +323,10 @@ let () =
   test_post_thread_success ();
   test_post_thread_empty ();
   
-  print_endline "\n=== All 10 tests passed! ==="
+  print_endline "\n--- API Operations (on_result pattern) ---";
+  test_get_creator_info ();
+  test_check_publish_status ();
+  test_exchange_code ();
+  test_get_oauth_url ();
+  
+  print_endline "\n=== All 14 tests passed! ==="

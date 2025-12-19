@@ -447,8 +447,9 @@ let test_get_tweet () =
     ~account_id:"test_account"
     ~tweet_id:"12345"
     ()
-    (fun json -> result := Some (Ok json))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok json -> result := Some (Ok json)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _json) -> ()
@@ -466,8 +467,9 @@ let test_search_tweets () =
     ~query:"OCaml"
     ~max_results:10
     ()
-    (fun json -> result := Some (Ok json))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok json -> result := Some (Ok json)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok json) ->
@@ -520,8 +522,9 @@ let test_user_operations () =
     ~account_id:"test_account"
     ~user_id:"12345"
     ()
-    (fun json -> result := Some (Ok json))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok json -> result := Some (Ok json)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _) -> ()
@@ -538,8 +541,9 @@ let test_engagement () =
   Twitter.like_tweet
     ~account_id:"test_account"
     ~tweet_id:"12345"
-    (fun () -> result := Some (Ok ()))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok () -> result := Some (Ok ())
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok ()) -> ()
@@ -559,8 +563,9 @@ let test_lists () =
     ~description:(Some "A test list")
     ~private_list:false
     ()
-    (fun json -> result := Some (Ok json))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok json -> result := Some (Ok json)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _json) -> ()
@@ -579,8 +584,9 @@ let test_timelines () =
     ~user_id:"12345"
     ~max_results:10
     ()
-    (fun json -> result := Some (Ok json))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok json -> result := Some (Ok json)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _json) -> ()
@@ -660,8 +666,9 @@ let test_bookmarks () =
   Twitter.bookmark_tweet
     ~account_id:"test_account"
     ~tweet_id:"12345"
-    (fun () -> result := Some (Ok ()))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok () -> result := Some (Ok ())
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok ()) -> ()
@@ -677,8 +684,9 @@ let test_follow_operations () =
   Twitter.follow_user
     ~account_id:"test_account"
     ~target_user_id:"12345"
-    (fun () -> result := Some (Ok ()))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok () -> result := Some (Ok ())
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok ()) -> ()
@@ -694,8 +702,9 @@ let test_block_operations () =
   Twitter.block_user
     ~account_id:"test_account"
     ~target_user_id:"12345"
-    (fun () -> result := Some (Ok ()))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok () -> result := Some (Ok ())
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok ()) -> ()
@@ -711,8 +720,9 @@ let test_mute_operations () =
   Twitter.mute_user
     ~account_id:"test_account"
     ~target_user_id:"12345"
-    (fun () -> result := Some (Ok ()))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok () -> result := Some (Ok ())
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok ()) -> ()
@@ -730,8 +740,9 @@ let test_relationships () =
     ~user_id:"12345"
     ~max_results:100
     ()
-    (fun json -> result := Some (Ok json))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok json -> result := Some (Ok json)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _) -> ()
@@ -747,8 +758,9 @@ let test_retweet_operations () =
   Twitter.retweet
     ~account_id:"test_account"
     ~tweet_id:"12345"
-    (fun () -> result := Some (Ok ()))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok () -> result := Some (Ok ())
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok ()) -> ()
@@ -905,8 +917,9 @@ let test_get_user_by_username () =
     ~account_id:"test_account"
     ~username:"testuser"
     ()
-    (fun json -> result := Some (Ok json))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok json -> result := Some (Ok json)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _) -> ()
@@ -922,12 +935,13 @@ let test_get_me () =
   Twitter.get_me
     ~account_id:"test_account"
     ()
-    (fun json -> 
-      let open Yojson.Basic.Util in
-      let data = json |> member "data" in
-      let _id = data |> member "id" |> to_string in
-      result := Some (Ok json))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok json -> 
+        let open Yojson.Basic.Util in
+        let data = json |> member "data" in
+        let _id = data |> member "id" |> to_string in
+        result := Some (Ok json)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _) -> ()
@@ -945,8 +959,9 @@ let test_get_following () =
     ~user_id:"12345"
     ~max_results:100
     ()
-    (fun json -> result := Some (Ok json))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok json -> result := Some (Ok json)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _) -> ()
@@ -962,8 +977,9 @@ let test_unfollow_user () =
   Twitter.unfollow_user
     ~account_id:"test_account"
     ~target_user_id:"12345"
-    (fun () -> result := Some (Ok ()))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok () -> result := Some (Ok ())
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok ()) -> ()
@@ -979,8 +995,9 @@ let test_unblock_user () =
   Twitter.unblock_user
     ~account_id:"test_account"
     ~target_user_id:"12345"
-    (fun () -> result := Some (Ok ()))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok () -> result := Some (Ok ())
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok ()) -> ()
@@ -996,8 +1013,9 @@ let test_unmute_user () =
   Twitter.unmute_user
     ~account_id:"test_account"
     ~target_user_id:"12345"
-    (fun () -> result := Some (Ok ()))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok () -> result := Some (Ok ())
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok ()) -> ()
@@ -1015,8 +1033,9 @@ let test_search_users () =
     ~query:"ocaml"
     ~max_results:50
     ()
-    (fun json -> result := Some (Ok json))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok json -> result := Some (Ok json)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _) -> ()
@@ -1037,8 +1056,9 @@ let test_get_mentions_timeline () =
     ~account_id:"test_account"
     ~max_results:10
     ()
-    (fun json -> result := Some (Ok json))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok json -> result := Some (Ok json)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _) -> ()
@@ -1055,8 +1075,9 @@ let test_get_home_timeline () =
     ~account_id:"test_account"
     ~max_results:10
     ()
-    (fun json -> result := Some (Ok json))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok json -> result := Some (Ok json)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _) -> ()
@@ -1080,8 +1101,9 @@ let test_update_list () =
     ~description:(Some "Updated description")
     ~private_list:(Some true)
     ()
-    (fun json -> result := Some (Ok json))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok json -> result := Some (Ok json)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _) -> ()
@@ -1097,8 +1119,9 @@ let test_delete_list () =
   Twitter.delete_list
     ~account_id:"test_account"
     ~list_id:"list_12345"
-    (fun () -> result := Some (Ok ()))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok () -> result := Some (Ok ())
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok ()) -> ()
@@ -1115,8 +1138,9 @@ let test_get_list () =
     ~account_id:"test_account"
     ~list_id:"list_12345"
     ()
-    (fun json -> result := Some (Ok json))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok json -> result := Some (Ok json)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _) -> ()
@@ -1133,8 +1157,9 @@ let test_add_list_member () =
     ~account_id:"test_account"
     ~list_id:"list_12345"
     ~user_id:"user_67890"
-    (fun () -> result := Some (Ok ()))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok () -> result := Some (Ok ())
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok ()) -> ()
@@ -1151,8 +1176,9 @@ let test_remove_list_member () =
     ~account_id:"test_account"
     ~list_id:"list_12345"
     ~user_id:"user_67890"
-    (fun () -> result := Some (Ok ()))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok () -> result := Some (Ok ())
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok ()) -> ()
@@ -1170,8 +1196,9 @@ let test_get_list_members () =
     ~list_id:"list_12345"
     ~max_results:50
     ()
-    (fun json -> result := Some (Ok json))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok json -> result := Some (Ok json)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _) -> ()
@@ -1223,8 +1250,9 @@ let test_get_list_tweets () =
     ~list_id:"list_12345"
     ~max_results:50
     ()
-    (fun json -> result := Some (Ok json))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok json -> result := Some (Ok json)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _) -> ()
@@ -1244,8 +1272,9 @@ let test_unlike_tweet () =
   Twitter.unlike_tweet
     ~account_id:"test_account"
     ~tweet_id:"12345"
-    (fun () -> result := Some (Ok ()))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok () -> result := Some (Ok ())
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok ()) -> ()
@@ -1261,8 +1290,9 @@ let test_unretweet () =
   Twitter.unretweet
     ~account_id:"test_account"
     ~tweet_id:"12345"
-    (fun () -> result := Some (Ok ()))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok () -> result := Some (Ok ())
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok ()) -> ()
@@ -1278,8 +1308,9 @@ let test_remove_bookmark () =
   Twitter.remove_bookmark
     ~account_id:"test_account"
     ~tweet_id:"12345"
-    (fun () -> result := Some (Ok ()))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok () -> result := Some (Ok ())
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok ()) -> ()
@@ -1466,8 +1497,9 @@ let test_rate_limit_error () =
     ~account_id:"test_account"
     ~tweet_id:"12345"
     ()
-    (fun _json -> result := Some (Ok "unexpected success"))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok _json -> result := Some (Ok "unexpected success")
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Error err) ->
@@ -1488,12 +1520,17 @@ let test_unauthorized_error () =
     ~account_id:"test_account"
     ~tweet_id:"12345"
     ()
-    (fun _json -> result := Some (Ok "unexpected success"))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok _json -> result := Some (Ok "unexpected success")
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Error err) ->
-       assert (string_contains err "401" || string_contains (String.lowercase_ascii err) "unauthorized");
+       (* Auth errors return "Access token is invalid" *)
+       assert (string_contains err "401" || 
+               string_contains (String.lowercase_ascii err) "unauthorized" ||
+               string_contains (String.lowercase_ascii err) "token" ||
+               string_contains (String.lowercase_ascii err) "invalid");
        ()
    | Some (Ok _) -> () (* Mock might not trigger error path *)
    | None -> ());
@@ -1510,12 +1547,16 @@ let test_forbidden_error () =
     ~account_id:"test_account"
     ~tweet_id:"12345"
     ()
-    (fun _json -> result := Some (Ok "unexpected success"))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok _json -> result := Some (Ok "unexpected success")
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Error err) ->
-       assert (string_contains err "403" || string_contains (String.lowercase_ascii err) "forbidden");
+       (* Auth errors can return "Missing permissions" for 403 *)
+       assert (string_contains err "403" || 
+               string_contains (String.lowercase_ascii err) "forbidden" ||
+               string_contains (String.lowercase_ascii err) "permission");
        ()
    | Some (Ok _) -> () (* Mock might not trigger error path *)
    | None -> ());
@@ -1532,8 +1573,9 @@ let test_not_found_error () =
     ~account_id:"test_account"
     ~tweet_id:"nonexistent"
     ()
-    (fun _json -> result := Some (Ok "unexpected success"))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok _json -> result := Some (Ok "unexpected success")
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Error err) ->
@@ -1554,8 +1596,9 @@ let test_server_error () =
     ~account_id:"test_account"
     ~tweet_id:"12345"
     ()
-    (fun _json -> result := Some (Ok "unexpected success"))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok _json -> result := Some (Ok "unexpected success")
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Error err) ->
@@ -1576,8 +1619,9 @@ let test_network_error () =
     ~account_id:"test_account"
     ~tweet_id:"12345"
     ()
-    (fun _json -> result := Some (Ok "unexpected success"))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok _json -> result := Some (Ok "unexpected success")
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Error err) ->
@@ -1604,8 +1648,9 @@ let test_pagination_with_next_token () =
     ~max_results:10
     ~next_token:(Some "next123")
     ()
-    (fun json -> result := Some (Ok json))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok json -> result := Some (Ok json)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok json) ->
@@ -1659,8 +1704,9 @@ let test_get_tweet_with_expansions () =
     ~expansions:["author_id"; "referenced_tweets.id"]
     ~tweet_fields:["created_at"; "public_metrics"; "entities"]
     ()
-    (fun json -> result := Some (Ok json))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok json -> result := Some (Ok json)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _) -> ()
@@ -1680,8 +1726,9 @@ let test_search_with_fields () =
     ~expansions:["author_id"]
     ~tweet_fields:["created_at"; "public_metrics"]
     ()
-    (fun json -> result := Some (Ok json))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok json -> result := Some (Ok json)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _) -> ()
@@ -1702,8 +1749,9 @@ let test_timeline_with_pagination () =
     ~expansions:["referenced_tweets.id"]
     ~tweet_fields:["created_at"]
     ()
-    (fun json -> result := Some (Ok json))
-    (fun err -> result := Some (Error err));
+    (function
+      | Ok json -> result := Some (Ok json)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
   
   (match !result with
    | Some (Ok _) -> ()

@@ -84,9 +84,14 @@ type warning =
   | Enrichment_skipped of string    (** Generic enrichment failure *)
   | Generic_warning of { code: string; message: string; recoverable: bool }
 
-(** {1 Outcome Type} *)
+(** {1 Result Types} *)
 
-(** Result type for operations that can partially succeed *)
+(** Simple result type for operations that either succeed or fail.
+    Used for read operations, engagement actions (like, follow), etc. *)
+type 'a api_result = ('a, error) result
+
+(** Result type for operations that can partially succeed.
+    Used for posting operations where warnings can occur (e.g., link card failed). *)
 type 'a outcome =
   | Success of 'a
   | Partial_success of { result: 'a; warnings: warning list }
@@ -268,3 +273,21 @@ let media_too_large ~size_bytes ~max_bytes =
 (** Create a too many media error *)
 let too_many_media ~count ~max =
   make_validation_error (Too_many_media { count; max })
+
+(** {1 API Result Utilities} *)
+
+(** Create a successful api_result *)
+let ok x = Ok x
+
+(** Create a failed api_result *)
+let fail e = Error e
+
+(** Map over a successful api_result *)
+let api_result_map f = function
+  | Ok x -> Ok (f x)
+  | Error e -> Error e
+
+(** Check if api_result is successful *)
+let api_result_is_ok = function
+  | Ok _ -> true
+  | Error _ -> false

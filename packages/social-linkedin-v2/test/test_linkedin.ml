@@ -24,6 +24,12 @@ let handle_thread_outcome on_success on_error outcome =
   | Error_types.Partial_success { result; _ } -> on_success result.Error_types.posted_ids
   | Error_types.Failure err -> on_error (Error_types.error_to_string err)
 
+(** Helper to handle api_result in tests *)
+let handle_result on_success on_error result =
+  match result with
+  | Ok value -> on_success value
+  | Error err -> on_error (Error_types.error_to_string err)
+
 (** Mock HTTP client for testing with response queue *)
 module Mock_http = struct
   let requests = ref []
@@ -350,12 +356,13 @@ let test_get_profile () =
   Mock_http.set_response { status = 200; body = response_body; headers = [] };
   
   LinkedIn.get_profile ~account_id:"test_account"
-    (fun profile ->
-      assert (profile.sub = "abc123");
-      assert (profile.name = Some "John Doe");
-      assert (profile.email = Some "john@example.com");
-      print_endline "✓ Get profile")
-    (fun err -> failwith ("Get profile failed: " ^ err))
+    (handle_result
+      (fun profile ->
+        assert (profile.sub = "abc123");
+        assert (profile.name = Some "John Doe");
+        assert (profile.email = Some "john@example.com");
+        print_endline "✓ Get profile")
+      (fun err -> failwith ("Get profile failed: " ^ err)))
 
 (** Test: Get posts with pagination *)
 let test_get_posts () =
@@ -406,19 +413,21 @@ let test_get_posts () =
   ];
   
   LinkedIn.get_posts ~account_id:"test_account" ~start:0 ~count:10
-    (fun collection ->
-      assert (List.length collection.elements = 1);
-      let post = List.hd collection.elements in
-      assert (post.id = "urn:li:share:123");
-      assert (post.text = Some "Test post");
-      (match collection.paging with
-      | Some p -> 
-          assert (p.start = 0);
-          assert (p.count = 1);
-          assert (p.total = Some 10)
-      | None -> failwith "Expected paging metadata");
-      print_endline "✓ Get posts with pagination")
-    (fun err -> failwith ("Get posts failed: " ^ err))
+    (fun result ->
+      match result with
+      | Ok collection ->
+          assert (List.length collection.elements = 1);
+          let post = List.hd collection.elements in
+          assert (post.id = "urn:li:share:123");
+          assert (post.text = Some "Test post");
+          (match collection.paging with
+          | Some p -> 
+              assert (p.start = 0);
+              assert (p.count = 1);
+              assert (p.total = Some 10)
+          | None -> failwith "Expected paging metadata");
+          print_endline "✓ Get posts with pagination"
+      | Error err -> failwith ("Get posts failed: " ^ Error_types.error_to_string err))
 
 (** Test: Batch get posts *)
 let test_batch_get_posts () =
@@ -470,10 +479,11 @@ let test_batch_get_posts () =
   LinkedIn.batch_get_posts 
     ~account_id:"test_account" 
     ~post_urns:["urn:li:share:123"; "urn:li:share:456"]
-    (fun posts ->
-      assert (List.length posts = 2);
-      print_endline "✓ Batch get posts")
-    (fun err -> failwith ("Batch get posts failed: " ^ err))
+    (handle_result
+      (fun posts ->
+        assert (List.length posts = 2);
+        print_endline "✓ Batch get posts")
+      (fun err -> failwith ("Batch get posts failed: " ^ err)))
 
 (** Test: Posts scroller *)
 let test_posts_scroller () =
@@ -509,12 +519,13 @@ let test_posts_scroller () =
   let scroller = LinkedIn.create_posts_scroller ~account_id:"test_account" ~page_size:1 () in
   
   scroller.scroll_next
-    (fun collection ->
-      assert (List.length collection.elements = 1);
-      assert (scroller.current_position () = 1);
-      assert (scroller.has_more () = true);
-      print_endline "✓ Posts scroller")
-    (fun err -> failwith ("Posts scroller failed: " ^ err))
+    (handle_result
+      (fun collection ->
+        assert (List.length collection.elements = 1);
+        assert (scroller.current_position () = 1);
+        assert (scroller.has_more () = true);
+        print_endline "✓ Posts scroller")
+      (fun err -> failwith ("Posts scroller failed: " ^ err)))
 
 (** Test: Search posts *)
 let test_search_posts () =
@@ -547,10 +558,11 @@ let test_search_posts () =
   Mock_http.set_response { status = 200; body = search_response; headers = [] };
   
   LinkedIn.search_posts ~account_id:"test_account" ~keywords:"OCaml" ~start:0 ~count:10
-    (fun collection ->
-      assert (List.length collection.elements = 2);
-      print_endline "✓ Search posts")
-    (fun err -> failwith ("Search posts failed: " ^ err))
+    (handle_result
+      (fun collection ->
+        assert (List.length collection.elements = 2);
+        print_endline "✓ Search posts")
+      (fun err -> failwith ("Search posts failed: " ^ err)))
 
 (** Test: Like post *)
 let test_like_post () =
@@ -580,8 +592,9 @@ let test_like_post () =
   ];
   
   LinkedIn.like_post ~account_id:"test_account" ~post_urn:"urn:li:share:123"
-    (fun () -> print_endline "✓ Like post")
-    (fun err -> failwith ("Like post failed: " ^ err))
+    (handle_result
+      (fun () -> print_endline "✓ Like post")
+      (fun err -> failwith ("Like post failed: " ^ err)))
 
 (** Test: Comment on post *)
 let test_comment_on_post () =
@@ -615,10 +628,11 @@ let test_comment_on_post () =
     ~account_id:"test_account" 
     ~post_urn:"urn:li:share:123"
     ~text:"Great post!"
-    (fun comment_id ->
-      assert (comment_id = "comment123");
-      print_endline "✓ Comment on post")
-    (fun err -> failwith ("Comment failed: " ^ err))
+    (handle_result
+      (fun comment_id ->
+        assert (comment_id = "comment123");
+        print_endline "✓ Comment on post")
+      (fun err -> failwith ("Comment failed: " ^ err)))
 
 (** Test: Get post comments *)
 let test_get_post_comments () =
@@ -655,12 +669,13 @@ let test_get_post_comments () =
   Mock_http.set_response { status = 200; body = comments_response; headers = [] };
   
   LinkedIn.get_post_comments ~account_id:"test_account" ~post_urn:"urn:li:share:123"
-    (fun collection ->
-      assert (List.length collection.elements = 1);
-      let comment = List.hd collection.elements in
-      assert (comment.text = "Nice!");
-      print_endline "✓ Get post comments")
-    (fun err -> failwith ("Get comments failed: " ^ err))
+    (handle_result
+      (fun collection ->
+        assert (List.length collection.elements = 1);
+        let comment = List.hd collection.elements in
+        assert (comment.text = "Nice!");
+        print_endline "✓ Get post comments")
+      (fun err -> failwith ("Get comments failed: " ^ err)))
 
 (** Test: Post with URL preview (ARTICLE media category) *)
 let test_post_with_url_preview () =
@@ -1164,18 +1179,19 @@ let test_restli_protocol_version_header () =
   Mock_http.set_response { status = 200; body = response_body; headers = [] };
   
   LinkedIn.get_post ~account_id:"test_account" ~post_urn:"urn:li:share:123"
-    (fun _post ->
-      (* Check that X-RestLi-Protocol-Version header was sent *)
-      let requests = !Mock_http.requests in
-      match requests with
-      | (_, _, headers, _) :: _ ->
-          (match find_header headers "X-Restli-Protocol-Version" with
-          | Some version -> 
-              assert (version = "2.0.0");
-              print_endline "✓ X-RestLi-Protocol-Version header (2.0.0)"
-          | None -> failwith "X-RestLi-Protocol-Version header not found")
-      | [] -> failwith "No requests recorded")
-    (fun err -> failwith ("Get post failed: " ^ err))
+    (handle_result
+      (fun _post ->
+        (* Check that X-RestLi-Protocol-Version header was sent *)
+        let requests = !Mock_http.requests in
+        match requests with
+        | (_, _, headers, _) :: _ ->
+            (match find_header headers "X-Restli-Protocol-Version" with
+            | Some version -> 
+                assert (version = "2.0.0");
+                print_endline "✓ X-RestLi-Protocol-Version header (2.0.0)"
+            | None -> failwith "X-RestLi-Protocol-Version header not found")
+        | [] -> failwith "No requests recorded")
+      (fun err -> failwith ("Get post failed: " ^ err)))
 
 (** Test: Authorization header format is correct (Bearer token) *)
 let test_authorization_header_format () =
@@ -1201,18 +1217,19 @@ let test_authorization_header_format () =
   Mock_http.set_response { status = 200; body = response_body; headers = [] };
   
   LinkedIn.get_profile ~account_id:"test_account"
-    (fun _profile ->
-      let requests = !Mock_http.requests in
-      match requests with
-      | (_, _, headers, _) :: _ ->
-          (match find_header headers "Authorization" with
-          | Some auth -> 
-              assert (String.starts_with ~prefix:"Bearer " auth);
-              assert (string_contains auth "test_bearer_token_12345");
-              print_endline "✓ Authorization header format (Bearer token)"
-          | None -> failwith "Authorization header not found")
-      | [] -> failwith "No requests recorded")
-    (fun err -> failwith ("Get profile failed: " ^ err))
+    (handle_result
+      (fun _profile ->
+        let requests = !Mock_http.requests in
+        match requests with
+        | (_, _, headers, _) :: _ ->
+            (match find_header headers "Authorization" with
+            | Some auth -> 
+                assert (String.starts_with ~prefix:"Bearer " auth);
+                assert (string_contains auth "test_bearer_token_12345");
+                print_endline "✓ Authorization header format (Bearer token)"
+            | None -> failwith "Authorization header not found")
+        | [] -> failwith "No requests recorded")
+      (fun err -> failwith ("Get profile failed: " ^ err)))
 
 (** Test: Content-Type header is application/json for POST requests *)
 let test_content_type_header_json () =
@@ -1242,22 +1259,23 @@ let test_content_type_header_json () =
   ];
   
   LinkedIn.like_post ~account_id:"test_account" ~post_urn:"urn:li:share:123"
-    (fun () ->
-      (* Find the POST request (like_post) *)
-      let requests = List.rev !Mock_http.requests in
-      let post_request = List.find_opt (fun (method_, _, _, _) ->
-        method_ = "POST"
-      ) requests in
-      
-      match post_request with
-      | Some (_, _, headers, _) ->
-          (match find_header headers "Content-Type" with
-          | Some ct -> 
-              assert (ct = "application/json");
-              print_endline "✓ Content-Type header (application/json)"
-          | None -> failwith "Content-Type header not found on POST request")
-      | None -> failwith "No POST request found")
-    (fun err -> failwith ("Like post failed: " ^ err))
+    (handle_result
+      (fun () ->
+        (* Find the POST request (like_post) *)
+        let requests = List.rev !Mock_http.requests in
+        let post_request = List.find_opt (fun (method_, _, _, _) ->
+          method_ = "POST"
+        ) requests in
+        
+        match post_request with
+        | Some (_, _, headers, _) ->
+            (match find_header headers "Content-Type" with
+            | Some ct -> 
+                assert (ct = "application/json");
+                print_endline "✓ Content-Type header (application/json)"
+            | None -> failwith "Content-Type header not found on POST request")
+        | None -> failwith "No POST request found")
+      (fun err -> failwith ("Like post failed: " ^ err)))
 
 (** Test: URN is properly URL-encoded in path *)
 let test_urn_path_encoding () =
@@ -1291,16 +1309,17 @@ let test_urn_path_encoding () =
   let test_urn = "urn:li:share:123456789" in
   
   LinkedIn.get_post ~account_id:"test_account" ~post_urn:test_urn
-    (fun _post ->
-      let requests = !Mock_http.requests in
-      match requests with
-      | (_, url, _, _) :: _ ->
-          (* URL should contain encoded URN - colons become %3A *)
-          assert (string_contains url "urn%3Ali%3Ashare%3A123456789" ||
-                  string_contains url "urn:li:share:123456789");
-          print_endline "✓ URN path encoding"
-      | [] -> failwith "No requests recorded")
-    (fun err -> failwith ("Get post failed: " ^ err))
+    (handle_result
+      (fun _post ->
+        let requests = !Mock_http.requests in
+        match requests with
+        | (_, url, _, _) :: _ ->
+            (* URL should contain encoded URN - colons become %3A *)
+            assert (string_contains url "urn%3Ali%3Ashare%3A123456789" ||
+                    string_contains url "urn:li:share:123456789");
+            print_endline "✓ URN path encoding"
+        | [] -> failwith "No requests recorded")
+      (fun err -> failwith ("Get post failed: " ^ err)))
 
 (** Test: Batch request URL encoding for multiple URNs *)
 let test_batch_urns_encoding () =
@@ -1334,17 +1353,18 @@ let test_batch_urns_encoding () =
   LinkedIn.batch_get_posts 
     ~account_id:"test_account" 
     ~post_urns:["urn:li:share:111"; "urn:li:share:222"]
-    (fun _posts ->
-      let requests = !Mock_http.requests in
-      match requests with
-      | (_, url, _, _) :: _ ->
-          (* URL should contain ids parameter with encoded URNs *)
-          assert (string_contains url "ids=");
-          (* Should have comma-separated values *)
-          assert (string_contains url "," || string_contains url "%2C");
-          print_endline "✓ Batch URNs encoding"
-      | [] -> failwith "No requests recorded")
-    (fun err -> failwith ("Batch get posts failed: " ^ err))
+    (handle_result
+      (fun _posts ->
+        let requests = !Mock_http.requests in
+        match requests with
+        | (_, url, _, _) :: _ ->
+            (* URL should contain ids parameter with encoded URNs *)
+            assert (string_contains url "ids=");
+            (* Should have comma-separated values *)
+            assert (string_contains url "," || string_contains url "%2C");
+            print_endline "✓ Batch URNs encoding"
+        | [] -> failwith "No requests recorded")
+      (fun err -> failwith ("Batch get posts failed: " ^ err)))
 
 (** Test: Request body structure for ugcPost creation *)
 let test_ugcpost_request_body_structure () =
@@ -1430,24 +1450,25 @@ let test_comment_request_body_structure () =
     ~account_id:"test_account" 
     ~post_urn:"urn:li:share:123"
     ~text:"This is a test comment"
-    (fun _comment_id ->
-      (* Find the POST request to comments *)
-      let requests = List.rev !Mock_http.requests in
-      let comment_request = List.find_opt (fun (method_, url, _, _) ->
-        method_ = "POST" && string_contains url "comments"
-      ) requests in
-      
-      match comment_request with
-      | Some (_, _, _, body) ->
-          (* Verify required fields *)
-          assert (string_contains body "actor");
-          assert (string_contains body "object");
-          assert (string_contains body "message");
-          assert (string_contains body "text");
-          assert (string_contains body "This is a test comment");
-          print_endline "✓ Comment request body structure"
-      | None -> failwith "No comments POST request found")
-    (fun err -> failwith ("Comment on post failed: " ^ err))
+    (handle_result
+      (fun _comment_id ->
+        (* Find the POST request to comments *)
+        let requests = List.rev !Mock_http.requests in
+        let comment_request = List.find_opt (fun (method_, url, _, _) ->
+          method_ = "POST" && string_contains url "comments"
+        ) requests in
+        
+        match comment_request with
+        | Some (_, _, _, body) ->
+            (* Verify required fields *)
+            assert (string_contains body "actor");
+            assert (string_contains body "object");
+            assert (string_contains body "message");
+            assert (string_contains body "text");
+            assert (string_contains body "This is a test comment");
+            print_endline "✓ Comment request body structure"
+        | None -> failwith "No comments POST request found")
+      (fun err -> failwith ("Comment on post failed: " ^ err)))
 
 (** Test: DELETE request for unlike_post *)
 let test_unlike_post_delete () =
@@ -1477,24 +1498,25 @@ let test_unlike_post_delete () =
   ];
   
   LinkedIn.unlike_post ~account_id:"test_account" ~post_urn:"urn:li:share:123"
-    (fun () ->
-      (* Find the DELETE request *)
-      let requests = List.rev !Mock_http.requests in
-      let delete_request = List.find_opt (fun (method_, _, _, _) ->
-        method_ = "DELETE"
-      ) requests in
-      
-      match delete_request with
-      | Some (_, url, headers, _) ->
-          (* Verify DELETE request was made to likes endpoint *)
-          assert (string_contains url "socialActions");
-          assert (string_contains url "likes");
-          (* Verify headers include Authorization and X-RestLi-Protocol-Version *)
-          assert (find_header headers "Authorization" <> None);
-          assert (find_header headers "X-Restli-Protocol-Version" <> None);
-          print_endline "✓ Unlike post DELETE request"
-      | None -> failwith "No DELETE request found")
-    (fun err -> failwith ("Unlike post failed: " ^ err))
+    (handle_result
+      (fun () ->
+        (* Find the DELETE request *)
+        let requests = List.rev !Mock_http.requests in
+        let delete_request = List.find_opt (fun (method_, _, _, _) ->
+          method_ = "DELETE"
+        ) requests in
+        
+        match delete_request with
+        | Some (_, url, headers, _) ->
+            (* Verify DELETE request was made to likes endpoint *)
+            assert (string_contains url "socialActions");
+            assert (string_contains url "likes");
+            (* Verify headers include Authorization and X-RestLi-Protocol-Version *)
+            assert (find_header headers "Authorization" <> None);
+            assert (find_header headers "X-Restli-Protocol-Version" <> None);
+            print_endline "✓ Unlike post DELETE request"
+        | None -> failwith "No DELETE request found")
+      (fun err -> failwith ("Unlike post failed: " ^ err)))
 
 (** Test: Like request body structure with actor and object *)
 let test_like_request_body_structure () =
@@ -1524,23 +1546,24 @@ let test_like_request_body_structure () =
   ];
   
   LinkedIn.like_post ~account_id:"test_account" ~post_urn:"urn:li:share:456"
-    (fun () ->
-      (* Find the POST request to likes *)
-      let requests = List.rev !Mock_http.requests in
-      let like_request = List.find_opt (fun (method_, url, _, _) ->
-        method_ = "POST" && string_contains url "likes"
-      ) requests in
-      
-      match like_request with
-      | Some (_, _, _, body) ->
-          (* Verify actor (person URN) and object (post URN) are present *)
-          assert (string_contains body "actor");
-          assert (string_contains body "object");
-          assert (string_contains body "urn:li:person:user123");
-          assert (string_contains body "urn:li:share:456");
-          print_endline "✓ Like request body structure (actor + object)"
-      | None -> failwith "No likes POST request found")
-    (fun err -> failwith ("Like post failed: " ^ err))
+    (handle_result
+      (fun () ->
+        (* Find the POST request to likes *)
+        let requests = List.rev !Mock_http.requests in
+        let like_request = List.find_opt (fun (method_, url, _, _) ->
+          method_ = "POST" && string_contains url "likes"
+        ) requests in
+        
+        match like_request with
+        | Some (_, _, _, body) ->
+            (* Verify actor (person URN) and object (post URN) are present *)
+            assert (string_contains body "actor");
+            assert (string_contains body "object");
+            assert (string_contains body "urn:li:person:user123");
+            assert (string_contains body "urn:li:share:456");
+            print_endline "✓ Like request body structure (actor + object)"
+        | None -> failwith "No likes POST request found")
+      (fun err -> failwith ("Like post failed: " ^ err)))
 
 (** Test: Register upload sends correct X-Restli-Protocol-Version *)
 let test_register_upload_headers () =
@@ -1605,16 +1628,17 @@ let test_query_param_encoding () =
   Mock_http.set_response { status = 200; body = comments_response; headers = [] };
   
   LinkedIn.get_post_comments ~account_id:"test_account" ~post_urn:"urn:li:share:123" ~start:5 ~count:20
-    (fun _collection ->
-      let requests = !Mock_http.requests in
-      match requests with
-      | (_, url, _, _) :: _ ->
-          (* Verify query parameters are in URL *)
-          assert (string_contains url "start=5");
-          assert (string_contains url "count=20");
-          print_endline "✓ Query parameter encoding (start, count)"
-      | [] -> failwith "No requests recorded")
-    (fun err -> failwith ("Get comments failed: " ^ err))
+    (handle_result
+      (fun _collection ->
+        let requests = !Mock_http.requests in
+        match requests with
+        | (_, url, _, _) :: _ ->
+            (* Verify query parameters are in URL *)
+            assert (string_contains url "start=5");
+            assert (string_contains url "count=20");
+            print_endline "✓ Query parameter encoding (start, count)"
+        | [] -> failwith "No requests recorded")
+      (fun err -> failwith ("Get comments failed: " ^ err)))
 
 (** Run all tests *)
 let () =

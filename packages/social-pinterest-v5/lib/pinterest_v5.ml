@@ -258,10 +258,9 @@ module OAuth = struct
     (** Get user account info using access token
         
         @param access_token Valid access token
-        @param on_success Continuation receiving user info as JSON
-        @param on_error Continuation receiving error message
+        @param on_result Continuation receiving api_result with user info as JSON
     *)
-    let get_user_info ~access_token on_success on_error =
+    let get_user_info ~access_token on_result =
       let url = Metadata.api_base ^ "/user_account" in
       let headers = [
         ("Authorization", "Bearer " ^ access_token);
@@ -272,20 +271,19 @@ module OAuth = struct
           if response.status >= 200 && response.status < 300 then
             try
               let json = Yojson.Basic.from_string response.body in
-              on_success json
+              on_result (Ok json)
             with e ->
-              on_error (Printf.sprintf "Failed to parse user info: %s" (Printexc.to_string e))
+              on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user info: %s" (Printexc.to_string e))))
           else
-            on_error (Printf.sprintf "Get user info failed (%d): %s" response.status response.body))
-        on_error
+            on_result (Error (Error_types.Internal_error (Printf.sprintf "Get user info failed (%d): %s" response.status response.body))))
+        (fun err -> on_result (Error (Error_types.Internal_error err)))
     
     (** Get user's boards
         
         @param access_token Valid access token
-        @param on_success Continuation receiving boards list as JSON
-        @param on_error Continuation receiving error message
+        @param on_result Continuation receiving api_result with boards list as JSON
     *)
-    let get_boards ~access_token on_success on_error =
+    let get_boards ~access_token on_result =
       let url = Metadata.api_base ^ "/boards" in
       let headers = [
         ("Authorization", "Bearer " ^ access_token);
@@ -296,12 +294,12 @@ module OAuth = struct
           if response.status >= 200 && response.status < 300 then
             try
               let json = Yojson.Basic.from_string response.body in
-              on_success json
+              on_result (Ok json)
             with e ->
-              on_error (Printf.sprintf "Failed to parse boards: %s" (Printexc.to_string e))
+              on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse boards: %s" (Printexc.to_string e))))
           else
-            on_error (Printf.sprintf "Get boards failed (%d): %s" response.status response.body))
-        on_error
+            on_result (Error (Error_types.Internal_error (Printf.sprintf "Get boards failed (%d): %s" response.status response.body))))
+        (fun err -> on_result (Error (Error_types.Internal_error err)))
   end
 end
 

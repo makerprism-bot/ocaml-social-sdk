@@ -164,10 +164,9 @@ module OAuth = struct
         @param client_secret Facebook App Secret
         @param redirect_uri Registered callback URL
         @param code Authorization code from callback
-        @param on_success Continuation receiving credentials
-        @param on_error Continuation receiving error message
+        @param on_result Continuation receiving api_result with credentials
     *)
-    let exchange_code ~client_id ~client_secret ~redirect_uri ~code on_success on_error =
+    let exchange_code ~client_id ~client_secret ~redirect_uri ~code on_result =
       let params = [
         ("client_id", [client_id]);
         ("client_secret", [client_secret]);
@@ -202,12 +201,12 @@ module OAuth = struct
                 expires_at;
                 token_type;
               } in
-              on_success creds
+              on_result (Ok creds)
             with e ->
-              on_error (Printf.sprintf "Failed to parse token response: %s" (Printexc.to_string e))
+              on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse token response: %s" (Printexc.to_string e))))
           else
-            on_error (Printf.sprintf "Token exchange failed (%d): %s" response.status response.body))
-        on_error
+            on_result (Error (Error_types.Internal_error (Printf.sprintf "Token exchange failed (%d): %s" response.status response.body))))
+        (fun err -> on_result (Error (Error_types.Internal_error err)))
     
     (** Exchange short-lived token for long-lived token (60 days)
         
@@ -216,10 +215,9 @@ module OAuth = struct
         
         @param client_secret Facebook App Secret
         @param short_lived_token The short-lived token from exchange_code
-        @param on_success Continuation receiving long-lived credentials
-        @param on_error Continuation receiving error message
+        @param on_result Continuation receiving api_result with long-lived credentials
     *)
-    let exchange_for_long_lived_token ~client_secret ~short_lived_token on_success on_error =
+    let exchange_for_long_lived_token ~client_secret ~short_lived_token on_result =
       let params = [
         ("grant_type", ["ig_exchange_token"]);
         ("client_secret", [client_secret]);
@@ -253,12 +251,12 @@ module OAuth = struct
                 expires_at;
                 token_type;
               } in
-              on_success creds
+              on_result (Ok creds)
             with e ->
-              on_error (Printf.sprintf "Failed to parse long-lived token response: %s" (Printexc.to_string e))
+              on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse long-lived token response: %s" (Printexc.to_string e))))
           else
-            on_error (Printf.sprintf "Long-lived token exchange failed (%d): %s" response.status response.body))
-        on_error
+            on_result (Error (Error_types.Internal_error (Printf.sprintf "Long-lived token exchange failed (%d): %s" response.status response.body))))
+        (fun err -> on_result (Error (Error_types.Internal_error err)))
     
     (** Refresh a long-lived token to extend its validity
         
@@ -267,10 +265,9 @@ module OAuth = struct
         Uses the ig_refresh_token grant type.
         
         @param access_token The current long-lived token to refresh
-        @param on_success Continuation receiving refreshed credentials
-        @param on_error Continuation receiving error message
+        @param on_result Continuation receiving api_result with refreshed credentials
     *)
-    let refresh_token ~access_token on_success on_error =
+    let refresh_token ~access_token on_result =
       let params = [
         ("grant_type", ["ig_refresh_token"]);
         ("access_token", [access_token]);
@@ -303,12 +300,12 @@ module OAuth = struct
                 expires_at;
                 token_type;
               } in
-              on_success creds
+              on_result (Ok creds)
             with e ->
-              on_error (Printf.sprintf "Failed to parse refresh response: %s" (Printexc.to_string e))
+              on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse refresh response: %s" (Printexc.to_string e))))
           else
-            on_error (Printf.sprintf "Token refresh failed (%d): %s" response.status response.body))
-        on_error
+            on_result (Error (Error_types.Internal_error (Printf.sprintf "Token refresh failed (%d): %s" response.status response.body))))
+        (fun err -> on_result (Error (Error_types.Internal_error err)))
     
     (** Instagram Business Account info from /me/accounts discovery *)
     type instagram_account_info = {
@@ -325,10 +322,9 @@ module OAuth = struct
         the user has admin access to.
         
         @param user_access_token Long-lived user access token
-        @param on_success Continuation receiving list of Instagram accounts
-        @param on_error Continuation receiving error message
+        @param on_result Continuation receiving api_result with list of Instagram accounts
     *)
-    let get_instagram_accounts ~user_access_token on_success on_error =
+    let get_instagram_accounts ~user_access_token on_result =
       let url = Printf.sprintf "%s/me/accounts?fields=id,name,instagram_business_account{id,username}&access_token=%s"
         Metadata.api_base user_access_token in
       
@@ -358,21 +354,20 @@ module OAuth = struct
                     }
                   with _ -> None
               ) pages_data in
-              on_success accounts
+              on_result (Ok accounts)
             with e ->
-              on_error (Printf.sprintf "Failed to parse accounts response: %s" (Printexc.to_string e))
+              on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse accounts response: %s" (Printexc.to_string e))))
           else
-            on_error (Printf.sprintf "Get Instagram accounts failed (%d): %s" response.status response.body))
-        on_error
+            on_result (Error (Error_types.Internal_error (Printf.sprintf "Get Instagram accounts failed (%d): %s" response.status response.body))))
+        (fun err -> on_result (Error (Error_types.Internal_error err)))
     
     (** Debug/inspect a token to check its validity and permissions
         
         @param access_token The token to inspect
         @param app_token App access token (client_id|client_secret)
-        @param on_success Continuation receiving token info as JSON
-        @param on_error Continuation receiving error message
+        @param on_result Continuation receiving api_result with token info as JSON
     *)
-    let debug_token ~access_token ~app_token on_success on_error =
+    let debug_token ~access_token ~app_token on_result =
       let url = Printf.sprintf "%s/debug_token?input_token=%s&access_token=%s"
         Metadata.api_base access_token app_token in
       
@@ -381,12 +376,12 @@ module OAuth = struct
           if response.status >= 200 && response.status < 300 then
             try
               let json = Yojson.Basic.from_string response.body in
-              on_success json
+              on_result (Ok json)
             with e ->
-              on_error (Printf.sprintf "Failed to parse debug response: %s" (Printexc.to_string e))
+              on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse debug response: %s" (Printexc.to_string e))))
           else
-            on_error (Printf.sprintf "Debug token failed (%d): %s" response.status response.body))
-        on_error
+            on_result (Error (Error_types.Internal_error (Printf.sprintf "Debug token failed (%d): %s" response.status response.body))))
+        (fun err -> on_result (Error (Error_types.Internal_error err)))
   end
 end
 
@@ -754,7 +749,7 @@ module Make (Config : CONFIG) = struct
       "IMAGE" (* Default to image *)
   
   (** Step 1a: Create single image container *)
-  let create_image_container ~ig_user_id ~access_token ~image_url ~caption ~alt_text ~is_carousel_item on_success on_error =
+  let create_image_container ~ig_user_id ~access_token ~image_url ~caption ~alt_text ~is_carousel_item on_result =
     let url = Printf.sprintf "%s/%s/media" graph_api_base ig_user_id in
     
     let base_params = [
@@ -795,15 +790,15 @@ module Make (Config : CONFIG) = struct
             let open Yojson.Basic.Util in
             let json = Yojson.Basic.from_string response.body in
             let container_id = json |> member "id" |> to_string in
-            on_success container_id
+            on_result (Ok container_id)
           with e ->
-            on_error (Printf.sprintf "Failed to parse container response: %s" (Printexc.to_string e))
+            on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse container response: %s" (Printexc.to_string e))))
         else
-          on_error (parse_error_response response.body response.status))
-      on_error
+          on_result (Error (Error_types.Internal_error (parse_error_response response.body response.status))))
+      (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** Step 1b: Create video container *)
-  let create_video_container ~ig_user_id ~access_token ~video_url ~caption ~alt_text ~media_type ~is_carousel_item on_success on_error =
+  let create_video_container ~ig_user_id ~access_token ~video_url ~caption ~alt_text ~media_type ~is_carousel_item on_result =
     let url = Printf.sprintf "%s/%s/media" graph_api_base ig_user_id in
     
     let base_params = [
@@ -845,15 +840,15 @@ module Make (Config : CONFIG) = struct
             let open Yojson.Basic.Util in
             let json = Yojson.Basic.from_string response.body in
             let container_id = json |> member "id" |> to_string in
-            on_success container_id
+            on_result (Ok container_id)
           with e ->
-            on_error (Printf.sprintf "Failed to parse video container response: %s" (Printexc.to_string e))
+            on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse video container response: %s" (Printexc.to_string e))))
         else
-          on_error (parse_error_response response.body response.status))
-      on_error
+          on_result (Error (Error_types.Internal_error (parse_error_response response.body response.status))))
+      (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** Step 1c: Create carousel container from child containers *)
-  let create_carousel_container ~ig_user_id ~access_token ~children_ids ~caption on_success on_error =
+  let create_carousel_container ~ig_user_id ~access_token ~children_ids ~caption on_result =
     let url = Printf.sprintf "%s/%s/media" graph_api_base ig_user_id in
     
     let params = [
@@ -881,15 +876,15 @@ module Make (Config : CONFIG) = struct
             let open Yojson.Basic.Util in
             let json = Yojson.Basic.from_string response.body in
             let container_id = json |> member "id" |> to_string in
-            on_success container_id
+            on_result (Ok container_id)
           with e ->
-            on_error (Printf.sprintf "Failed to parse carousel container response: %s" (Printexc.to_string e))
+            on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse carousel container response: %s" (Printexc.to_string e))))
         else
-          on_error (parse_error_response response.body response.status))
-      on_error
+          on_result (Error (Error_types.Internal_error (parse_error_response response.body response.status))))
+      (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** Step 2: Publish container *)
-  let publish_container ~ig_user_id ~access_token ~container_id on_success on_error =
+  let publish_container ~ig_user_id ~access_token ~container_id on_result =
     let url = Printf.sprintf "%s/%s/media_publish" graph_api_base ig_user_id in
     
     let params = [
@@ -915,15 +910,15 @@ module Make (Config : CONFIG) = struct
             let open Yojson.Basic.Util in
             let json = Yojson.Basic.from_string response.body in
             let media_id = json |> member "id" |> to_string in
-            on_success media_id
+            on_result (Ok media_id)
           with e ->
-            on_error (Printf.sprintf "Failed to parse publish response: %s" (Printexc.to_string e))
+            on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse publish response: %s" (Printexc.to_string e))))
         else
-          on_error (parse_error_response response.body response.status))
-      on_error
+          on_result (Error (Error_types.Internal_error (parse_error_response response.body response.status))))
+      (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** Check container status *)
-  let check_container_status ~container_id ~access_token on_success on_error =
+  let check_container_status ~container_id ~access_token on_result =
     let proof_params = match compute_app_secret_proof ~access_token with
       | Some proof -> [("appsecret_proof", [proof])]
       | None -> []
@@ -945,12 +940,12 @@ module Make (Config : CONFIG) = struct
             let open Yojson.Basic.Util in
             let status_code = json |> member "status_code" |> to_string in
             let status = json |> member "status" |> to_string_option |> Option.value ~default:"UNKNOWN" in
-            on_success (status_code, status)
+            on_result (Ok (status_code, status))
           with e ->
-            on_error (Printf.sprintf "Failed to parse status: %s" (Printexc.to_string e))
+            on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse status: %s" (Printexc.to_string e))))
         else
-          on_error (Printf.sprintf "Status check failed (%d): %s" response.status response.body))
-      on_error
+          on_result (Error (Error_types.Internal_error (Printf.sprintf "Status check failed (%d): %s" response.status response.body))))
+      (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** Poll container status with exponential backoff *)
   let rec poll_container_status ~container_id ~access_token ~ig_user_id ~attempt ~max_attempts on_success on_error =
@@ -968,38 +963,45 @@ module Make (Config : CONFIG) = struct
       
       Config.sleep delay (fun () ->
         check_container_status ~container_id ~access_token
-          (fun (status_code, status) ->
-            match status_code with
-            | "FINISHED" ->
-                (* Container ready - publish it *)
-                publish_container ~ig_user_id ~access_token ~container_id
-                  on_success on_error
-            | "ERROR" ->
-                (* Container processing failed *)
-                let error_detail = if status <> "UNKNOWN" && status <> "" 
-                  then Printf.sprintf ": %s" status 
-                  else "" in
-                on_error (Printf.sprintf "Instagram container processing failed%s" error_detail)
-            | "IN_PROGRESS" ->
-                (* Still processing - retry with next attempt *)
-                poll_container_status ~container_id ~access_token ~ig_user_id 
-                  ~attempt:(attempt + 1) ~max_attempts on_success on_error
-            | _ ->
-                (* Unknown status code - try publishing anyway after a few attempts *)
-                if attempt >= 3 then
+          (function
+            | Ok (status_code, status) ->
+                (match status_code with
+                | "FINISHED" ->
+                    (* Container ready - publish it *)
+                    publish_container ~ig_user_id ~access_token ~container_id
+                      (function
+                        | Ok media_id -> on_success media_id
+                        | Error e -> on_error (Error_types.error_to_string e))
+                | "ERROR" ->
+                    (* Container processing failed *)
+                    let error_detail = if status <> "UNKNOWN" && status <> "" 
+                      then Printf.sprintf ": %s" status 
+                      else "" in
+                    on_error (Printf.sprintf "Instagram container processing failed%s" error_detail)
+                | "IN_PROGRESS" ->
+                    (* Still processing - retry with next attempt *)
+                    poll_container_status ~container_id ~access_token ~ig_user_id 
+                      ~attempt:(attempt + 1) ~max_attempts on_success on_error
+                | _ ->
+                    (* Unknown status code - try publishing anyway after a few attempts *)
+                    if attempt >= 3 then
+                      publish_container ~ig_user_id ~access_token ~container_id
+                        (function
+                          | Ok media_id -> on_success media_id
+                          | Error e -> on_error (Error_types.error_to_string e))
+                    else
+                      poll_container_status ~container_id ~access_token ~ig_user_id 
+                        ~attempt:(attempt + 1) ~max_attempts on_success on_error)
+            | Error _err ->
+                (* Status check failed - try publishing if we've waited long enough *)
+                if attempt >= 2 then
                   publish_container ~ig_user_id ~access_token ~container_id
-                    on_success on_error
+                    (function
+                      | Ok media_id -> on_success media_id
+                      | Error e -> on_error (Error_types.error_to_string e))
                 else
                   poll_container_status ~container_id ~access_token ~ig_user_id 
-                    ~attempt:(attempt + 1) ~max_attempts on_success on_error)
-                (fun _err ->
-                  (* Status check failed - try publishing if we've waited long enough *)
-                  if attempt >= 2 then
-              publish_container ~ig_user_id ~access_token ~container_id
-                on_success on_error
-            else
-              poll_container_status ~container_id ~access_token ~ig_user_id 
-                ~attempt:(attempt + 1) ~max_attempts on_success on_error))
+                    ~attempt:(attempt + 1) ~max_attempts on_success on_error))
   
   (** Create child containers for carousel (recursive) *)
   let rec create_carousel_children ~ig_user_id ~access_token ~media_urls_with_alt ~index ~acc on_success on_error =
@@ -1013,20 +1015,22 @@ module Make (Config : CONFIG) = struct
             (* Create video carousel item *)
             create_video_container ~ig_user_id ~access_token ~video_url:url 
               ~caption:"" ~alt_text ~media_type:"VIDEO" ~is_carousel_item:true
-              (fun child_id ->
-                create_carousel_children ~ig_user_id ~access_token 
-                  ~media_urls_with_alt:rest ~index:(index + 1) ~acc:(child_id :: acc)
-                  on_success on_error)
-              on_error
+              (function
+                | Ok child_id ->
+                    create_carousel_children ~ig_user_id ~access_token 
+                      ~media_urls_with_alt:rest ~index:(index + 1) ~acc:(child_id :: acc)
+                      on_success on_error
+                | Error e -> on_error (Error_types.error_to_string e))
         | _ ->
             (* Create image carousel item *)
             create_image_container ~ig_user_id ~access_token ~image_url:url 
               ~caption:"" ~alt_text ~is_carousel_item:true
-              (fun child_id ->
-                create_carousel_children ~ig_user_id ~access_token 
-                  ~media_urls_with_alt:rest ~index:(index + 1) ~acc:(child_id :: acc)
-                  on_success on_error)
-              on_error)
+              (function
+                | Ok child_id ->
+                    create_carousel_children ~ig_user_id ~access_token 
+                      ~media_urls_with_alt:rest ~index:(index + 1) ~acc:(child_id :: acc)
+                      on_success on_error
+                | Error e -> on_error (Error_types.error_to_string e)))
   
   (** Post to Instagram with two-step process *)
   let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_result =
@@ -1058,15 +1062,15 @@ module Make (Config : CONFIG) = struct
                           (* Step 2: Create parent carousel container *)
                           create_carousel_container ~ig_user_id ~access_token 
                             ~children_ids ~caption:text
-                            (fun carousel_id ->
-                              (* Step 3: Poll carousel status and publish when ready *)
-                              poll_container_status ~container_id:carousel_id 
-                                ~access_token ~ig_user_id ~attempt:1 ~max_attempts:5 
-                                (fun media_id -> on_result (Error_types.Success media_id))
-                                (fun err -> on_result (Error_types.Failure 
-                                  (Error_types.Internal_error err))))
-                            (fun err -> on_result (Error_types.Failure 
-                              (Error_types.Internal_error err))))
+                            (function
+                              | Ok carousel_id ->
+                                  (* Step 3: Poll carousel status and publish when ready *)
+                                  poll_container_status ~container_id:carousel_id 
+                                    ~access_token ~ig_user_id ~attempt:1 ~max_attempts:5 
+                                    (fun media_id -> on_result (Error_types.Success media_id))
+                                    (fun err -> on_result (Error_types.Failure 
+                                      (Error_types.Internal_error err)))
+                              | Error e -> on_result (Error_types.Failure e)))
                         (fun err -> on_result (Error_types.Failure 
                           (Error_types.Internal_error err))))
                     (fun err -> on_result (Error_types.Failure 
@@ -1088,27 +1092,27 @@ module Make (Config : CONFIG) = struct
                       | "VIDEO" ->
                           create_video_container ~ig_user_id ~access_token ~video_url:media_url 
                             ~caption:text ~alt_text ~media_type:"VIDEO" ~is_carousel_item:false
-                            (fun container_id ->
-                              (* Step 2: Poll container status and publish when ready *)
-                              poll_container_status ~container_id ~access_token ~ig_user_id 
-                                ~attempt:1 ~max_attempts:5 
-                                (fun media_id -> on_result (Error_types.Success media_id))
-                                (fun err -> on_result (Error_types.Failure 
-                                  (Error_types.Internal_error err))))
-                            (fun err -> on_result (Error_types.Failure 
-                              (Error_types.Internal_error err)))
+                            (function
+                              | Ok container_id ->
+                                  (* Step 2: Poll container status and publish when ready *)
+                                  poll_container_status ~container_id ~access_token ~ig_user_id 
+                                    ~attempt:1 ~max_attempts:5 
+                                    (fun media_id -> on_result (Error_types.Success media_id))
+                                    (fun err -> on_result (Error_types.Failure 
+                                      (Error_types.Internal_error err)))
+                              | Error e -> on_result (Error_types.Failure e))
                       | _ ->
                           create_image_container ~ig_user_id ~access_token ~image_url:media_url 
                             ~caption:text ~alt_text ~is_carousel_item:false
-                            (fun container_id ->
-                              (* Step 2: Poll container status and publish when ready *)
-                              poll_container_status ~container_id ~access_token ~ig_user_id 
-                                ~attempt:1 ~max_attempts:5 
-                                (fun media_id -> on_result (Error_types.Success media_id))
-                                (fun err -> on_result (Error_types.Failure 
-                                  (Error_types.Internal_error err))))
-                            (fun err -> on_result (Error_types.Failure 
-                              (Error_types.Internal_error err)))))
+                            (function
+                              | Ok container_id ->
+                                  (* Step 2: Poll container status and publish when ready *)
+                                  poll_container_status ~container_id ~access_token ~ig_user_id 
+                                    ~attempt:1 ~max_attempts:5 
+                                    (fun media_id -> on_result (Error_types.Success media_id))
+                                    (fun err -> on_result (Error_types.Failure 
+                                      (Error_types.Internal_error err)))
+                              | Error e -> on_result (Error_types.Failure e))))
                     (fun err -> on_result (Error_types.Failure 
                       (Error_types.Internal_error err))))
                 (fun err -> on_result (Error_types.Failure 
@@ -1127,15 +1131,15 @@ module Make (Config : CONFIG) = struct
                 (* Create Reel container with REELS media type *)
                 create_video_container ~ig_user_id ~access_token ~video_url 
                   ~caption:text ~alt_text ~media_type:"REELS" ~is_carousel_item:false
-                  (fun container_id ->
-                    (* Poll and publish *)
-                    poll_container_status ~container_id ~access_token ~ig_user_id 
-                      ~attempt:1 ~max_attempts:5 
-                      (fun media_id -> on_result (Error_types.Success media_id))
-                      (fun err -> on_result (Error_types.Failure 
-                        (Error_types.Internal_error err))))
-                  (fun err -> on_result (Error_types.Failure 
-                    (Error_types.Internal_error err))))
+                  (function
+                    | Ok container_id ->
+                        (* Poll and publish *)
+                        poll_container_status ~container_id ~access_token ~ig_user_id 
+                          ~attempt:1 ~max_attempts:5 
+                          (fun media_id -> on_result (Error_types.Success media_id))
+                          (fun err -> on_result (Error_types.Failure 
+                            (Error_types.Internal_error err)))
+                    | Error e -> on_result (Error_types.Failure e)))
               (fun err -> on_result (Error_types.Failure 
                 (Error_types.Internal_error err))))
           (fun err -> on_result (Error_types.Failure 
@@ -1152,10 +1156,9 @@ module Make (Config : CONFIG) = struct
       @param ig_user_id Instagram Business Account ID
       @param access_token Valid access token
       @param image_url Publicly accessible URL of the image
-      @param on_success Continuation receiving container ID
-      @param on_error Continuation receiving error message
+      @param on_result Continuation receiving api_result with container ID
   *)
-  let create_story_image_container ~ig_user_id ~access_token ~image_url on_success on_error =
+  let create_story_image_container ~ig_user_id ~access_token ~image_url on_result =
     let url = Printf.sprintf "%s/%s/media" graph_api_base ig_user_id in
     
     let params = [
@@ -1182,12 +1185,12 @@ module Make (Config : CONFIG) = struct
             let open Yojson.Basic.Util in
             let json = Yojson.Basic.from_string response.body in
             let container_id = json |> member "id" |> to_string in
-            on_success container_id
+            on_result (Ok container_id)
           with e ->
-            on_error (Printf.sprintf "Failed to parse story container response: %s" (Printexc.to_string e))
+            on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse story container response: %s" (Printexc.to_string e))))
         else
-          on_error (parse_error_response response.body response.status))
-      on_error
+          on_result (Error (Error_types.Internal_error (parse_error_response response.body response.status))))
+      (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** Create story container for video
       
@@ -1199,10 +1202,9 @@ module Make (Config : CONFIG) = struct
       @param ig_user_id Instagram Business Account ID
       @param access_token Valid access token
       @param video_url Publicly accessible URL of the video
-      @param on_success Continuation receiving container ID
-      @param on_error Continuation receiving error message
+      @param on_result Continuation receiving api_result with container ID
   *)
-  let create_story_video_container ~ig_user_id ~access_token ~video_url on_success on_error =
+  let create_story_video_container ~ig_user_id ~access_token ~video_url on_result =
     let url = Printf.sprintf "%s/%s/media" graph_api_base ig_user_id in
     
     let params = [
@@ -1229,12 +1231,12 @@ module Make (Config : CONFIG) = struct
             let open Yojson.Basic.Util in
             let json = Yojson.Basic.from_string response.body in
             let container_id = json |> member "id" |> to_string in
-            on_success container_id
+            on_result (Ok container_id)
           with e ->
-            on_error (Printf.sprintf "Failed to parse story video container response: %s" (Printexc.to_string e))
+            on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse story video container response: %s" (Printexc.to_string e))))
         else
-          on_error (parse_error_response response.body response.status))
-      on_error
+          on_result (Error (Error_types.Internal_error (parse_error_response response.body response.status))))
+      (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** Post image story to Instagram
       
@@ -1258,15 +1260,15 @@ module Make (Config : CONFIG) = struct
           (fun ig_user_id ->
             (* Create story container with image *)
             create_story_image_container ~ig_user_id ~access_token ~image_url
-              (fun container_id ->
-                (* Poll and publish *)
-                poll_container_status ~container_id ~access_token ~ig_user_id 
-                  ~attempt:1 ~max_attempts:5 
-                  (fun media_id -> on_result (Error_types.Success media_id))
-                  (fun err -> on_result (Error_types.Failure 
-                    (Error_types.Internal_error err))))
-              (fun err -> on_result (Error_types.Failure 
-                (Error_types.Internal_error err))))
+              (function
+                | Ok container_id ->
+                    (* Poll and publish *)
+                    poll_container_status ~container_id ~access_token ~ig_user_id 
+                      ~attempt:1 ~max_attempts:5 
+                      (fun media_id -> on_result (Error_types.Success media_id))
+                      (fun err -> on_result (Error_types.Failure 
+                        (Error_types.Internal_error err)))
+                | Error e -> on_result (Error_types.Failure e)))
           (fun err -> on_result (Error_types.Failure 
             (Error_types.Internal_error err))))
       (fun err -> on_result (Error_types.Failure 
@@ -1296,15 +1298,15 @@ module Make (Config : CONFIG) = struct
           (fun ig_user_id ->
             (* Create story container with video *)
             create_story_video_container ~ig_user_id ~access_token ~video_url
-              (fun container_id ->
-                (* Poll and publish - videos need more time to process *)
-                poll_container_status ~container_id ~access_token ~ig_user_id 
-                  ~attempt:1 ~max_attempts:10 
-                  (fun media_id -> on_result (Error_types.Success media_id))
-                  (fun err -> on_result (Error_types.Failure 
-                    (Error_types.Internal_error err))))
-              (fun err -> on_result (Error_types.Failure 
-                (Error_types.Internal_error err))))
+              (function
+                | Ok container_id ->
+                    (* Poll and publish - videos need more time to process *)
+                    poll_container_status ~container_id ~access_token ~ig_user_id 
+                      ~attempt:1 ~max_attempts:10 
+                      (fun media_id -> on_result (Error_types.Success media_id))
+                      (fun err -> on_result (Error_types.Failure 
+                        (Error_types.Internal_error err)))
+                | Error e -> on_result (Error_types.Failure e)))
           (fun err -> on_result (Error_types.Failure 
             (Error_types.Internal_error err))))
       (fun err -> on_result (Error_types.Failure 

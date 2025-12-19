@@ -17,6 +17,12 @@ let handle_outcome on_success on_error outcome =
   | Error_types.Partial_success { result; _ } -> on_success result
   | Error_types.Failure err -> on_error (Error_types.error_to_string err)
 
+(** Helper to handle api_result type in tests *)
+let handle_result on_success on_error result =
+  match result with
+  | Ok value -> on_success value
+  | Error err -> on_error (Error_types.error_to_string err)
+
 (** Mock HTTP client for testing *)
 module Mock_http = struct
   let requests = ref []
@@ -208,10 +214,11 @@ let test_create_container () =
     ~caption:"Test caption"
     ~alt_text:None
     ~is_carousel_item:false
-    (fun container_id ->
-      assert (container_id = "container_12345");
-      print_endline "✓ Create image container")
-    (fun err -> failwith ("Create image container failed: " ^ err))
+    (handle_result
+      (fun container_id ->
+        assert (container_id = "container_12345");
+        print_endline "✓ Create image container")
+      (fun err -> failwith ("Create image container failed: " ^ err)))
 
 (** Test: Publish container *)
 let test_publish_container () =
@@ -224,10 +231,11 @@ let test_publish_container () =
     ~ig_user_id:"ig_123"
     ~access_token:"test_token"
     ~container_id:"container_12345"
-    (fun media_id ->
-      assert (media_id = "media_67890");
-      print_endline "✓ Publish container")
-    (fun err -> failwith ("Publish container failed: " ^ err))
+    (handle_result
+      (fun media_id ->
+        assert (media_id = "media_67890");
+        print_endline "✓ Publish container")
+      (fun err -> failwith ("Publish container failed: " ^ err)))
 
 (** Test: Check container status *)
 let test_check_status () =
@@ -242,11 +250,12 @@ let test_check_status () =
   Instagram.check_container_status
     ~container_id:"container_12345"
     ~access_token:"test_token"
-    (fun (status_code, status) ->
-      assert (status_code = "FINISHED");
-      assert (status = "Processing complete");
-      print_endline "✓ Check container status")
-    (fun err -> failwith ("Check status failed: " ^ err))
+    (handle_result
+      (fun (status_code, status) ->
+        assert (status_code = "FINISHED");
+        assert (status = "Processing complete");
+        print_endline "✓ Check container status")
+      (fun err -> failwith ("Check status failed: " ^ err)))
 
 (** Test: Content validation *)
 let test_content_validation () =
@@ -494,16 +503,17 @@ let test_create_story_image_container () =
     ~ig_user_id:"ig_123"
     ~access_token:"test_token"
     ~image_url:"https://example.com/story.jpg"
-    (fun container_id ->
-      assert (container_id = "story_container_123");
-      (* Verify the request contained STORIES media_type *)
-      let requests = !Mock_http.requests in
-      let has_stories_type = List.exists (fun (_, _, _, body) ->
-        string_contains body "media_type" && string_contains body "STORIES"
-      ) requests in
-      assert has_stories_type;
-      print_endline "✓ Create story image container")
-    (fun err -> failwith ("Create story image container failed: " ^ err))
+    (handle_result
+      (fun container_id ->
+        assert (container_id = "story_container_123");
+        (* Verify the request contained STORIES media_type *)
+        let requests = !Mock_http.requests in
+        let has_stories_type = List.exists (fun (_, _, _, body) ->
+          string_contains body "media_type" && string_contains body "STORIES"
+        ) requests in
+        assert has_stories_type;
+        print_endline "✓ Create story image container")
+      (fun err -> failwith ("Create story image container failed: " ^ err)))
 
 (** Test: Create story video container *)
 let test_create_story_video_container () =
@@ -516,10 +526,11 @@ let test_create_story_video_container () =
     ~ig_user_id:"ig_123"
     ~access_token:"test_token"
     ~video_url:"https://example.com/story.mp4"
-    (fun container_id ->
-      assert (container_id = "story_video_container_456");
-      print_endline "✓ Create story video container")
-    (fun err -> failwith ("Create story video container failed: " ^ err))
+    (handle_result
+      (fun container_id ->
+        assert (container_id = "story_video_container_456");
+        print_endline "✓ Create story video container")
+      (fun err -> failwith ("Create story video container failed: " ^ err)))
 
 (** Test: Post image story (full flow) *)
 let test_post_story_image () =

@@ -17,6 +17,12 @@ let _handle_outcome on_success on_error outcome =
   | Error_types.Partial_success { result; _ } -> on_success result
   | Error_types.Failure err -> on_error (Error_types.error_to_string err)
 
+(** Helper to handle api_result type for tests - converts to legacy on_success/on_error *)
+let _handle_api_result on_success on_error result =
+  match result with
+  | Ok value -> on_success value
+  | Error err -> on_error (Error_types.error_to_string err)
+
 (** Mock HTTP client *)
 module Mock_http = struct
   let requests = ref []

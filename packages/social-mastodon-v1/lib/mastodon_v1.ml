@@ -1064,7 +1064,7 @@ module Make (Config : CONFIG) = struct
       on_error
   
   (** Favorite a status *)
-  let favorite_status ~account_id ~status_id on_success on_error =
+  let favorite_status ~account_id ~status_id on_result =
     ensure_valid_token ~account_id
       (fun mastodon_creds ->
         let url = Printf.sprintf "%s/api/v1/statuses/%s/favourite" mastodon_creds.instance_url status_id in
@@ -1075,14 +1075,14 @@ module Make (Config : CONFIG) = struct
         Config.Http.post ~headers url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              on_success ()
+              on_result (Ok ())
             else
-              on_error (Printf.sprintf "Favorite failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Unfavorite a status *)
-  let unfavorite_status ~account_id ~status_id on_success on_error =
+  let unfavorite_status ~account_id ~status_id on_result =
     ensure_valid_token ~account_id
       (fun mastodon_creds ->
         let url = Printf.sprintf "%s/api/v1/statuses/%s/unfavourite" mastodon_creds.instance_url status_id in
@@ -1093,14 +1093,14 @@ module Make (Config : CONFIG) = struct
         Config.Http.post ~headers url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              on_success ()
+              on_result (Ok ())
             else
-              on_error (Printf.sprintf "Unfavorite failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Boost (reblog) a status *)
-  let boost_status ~account_id ~status_id ?(visibility=None) on_success on_error =
+  let boost_status ~account_id ~status_id ?(visibility=None) on_result =
     ensure_valid_token ~account_id
       (fun mastodon_creds ->
         let url = Printf.sprintf "%s/api/v1/statuses/%s/reblog" mastodon_creds.instance_url status_id in
@@ -1119,14 +1119,14 @@ module Make (Config : CONFIG) = struct
         Config.Http.post ~headers ~body url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              on_success ()
+              on_result (Ok ())
             else
-              on_error (Printf.sprintf "Boost failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Unboost (unreblog) a status *)
-  let unboost_status ~account_id ~status_id on_success on_error =
+  let unboost_status ~account_id ~status_id on_result =
     ensure_valid_token ~account_id
       (fun mastodon_creds ->
         let url = Printf.sprintf "%s/api/v1/statuses/%s/unreblog" mastodon_creds.instance_url status_id in
@@ -1137,14 +1137,14 @@ module Make (Config : CONFIG) = struct
         Config.Http.post ~headers url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              on_success ()
+              on_result (Ok ())
             else
-              on_error (Printf.sprintf "Unboost failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Bookmark a status *)
-  let bookmark_status ~account_id ~status_id on_success on_error =
+  let bookmark_status ~account_id ~status_id on_result =
     ensure_valid_token ~account_id
       (fun mastodon_creds ->
         let url = Printf.sprintf "%s/api/v1/statuses/%s/bookmark" mastodon_creds.instance_url status_id in
@@ -1155,14 +1155,14 @@ module Make (Config : CONFIG) = struct
         Config.Http.post ~headers url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              on_success ()
+              on_result (Ok ())
             else
-              on_error (Printf.sprintf "Bookmark failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Unbookmark a status *)
-  let unbookmark_status ~account_id ~status_id on_success on_error =
+  let unbookmark_status ~account_id ~status_id on_result =
     ensure_valid_token ~account_id
       (fun mastodon_creds ->
         let url = Printf.sprintf "%s/api/v1/statuses/%s/unbookmark" mastodon_creds.instance_url status_id in
@@ -1173,14 +1173,14 @@ module Make (Config : CONFIG) = struct
         Config.Http.post ~headers url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              on_success ()
+              on_result (Ok ())
             else
-              on_error (Printf.sprintf "Unbookmark failed (%d): %s" response.status response.body))
-          on_error)
-      on_error
+              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
   
   (** Register an application with a Mastodon instance *)
-  let register_app ~instance_url ~client_name ~redirect_uris ~scopes ~website on_success on_error =
+  let register_app ~instance_url ~client_name ~redirect_uris ~scopes ~website on_result =
     let url = Printf.sprintf "%s/api/v1/apps" instance_url in
     
     let body_json = `Assoc [
@@ -1201,12 +1201,12 @@ module Make (Config : CONFIG) = struct
             let open Yojson.Basic.Util in
             let client_id = json |> member "client_id" |> to_string in
             let client_secret = json |> member "client_secret" |> to_string in
-            on_success (client_id, client_secret)
+            on_result (Ok (client_id, client_secret))
           with e ->
-            on_error (Printf.sprintf "Failed to parse app registration: %s" (Printexc.to_string e))
+            on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse app registration: %s" (Printexc.to_string e))))
         else
-          on_error (Printf.sprintf "App registration failed (%d): %s" response.status response.body))
-      on_error
+          on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+      (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** Generate PKCE code verifier (43-128 characters)
       
@@ -1235,7 +1235,7 @@ module Make (Config : CONFIG) = struct
       instance_url client_id redirect_uri scopes state_param pkce_params
   
   (** Exchange authorization code for access token with optional PKCE verifier *)
-  let exchange_code ~instance_url ~client_id ~client_secret ~redirect_uri ~code ?(code_verifier=None) on_success on_error =
+  let exchange_code ~instance_url ~client_id ~client_secret ~redirect_uri ~code ?(code_verifier=None) on_result =
     let url = Printf.sprintf "%s/oauth/token" instance_url in
     
     let base_fields = [
@@ -1279,8 +1279,7 @@ module Make (Config : CONFIG) = struct
             
             if not all_granted then (
               let missing = List.filter (fun req -> not (List.mem req granted_scopes)) requested_scopes in
-              on_error (Printf.sprintf "Missing required scopes: %s (granted: %s)" 
-                (String.concat ", " missing) granted_scope)
+              on_result (Error (Error_types.Auth_error (Error_types.Insufficient_permissions missing)))
             ) else (
               (* Return raw credentials - let the caller wrap with instance_url *)
               let core_creds = {
@@ -1289,16 +1288,16 @@ module Make (Config : CONFIG) = struct
                 expires_at = None;
                 token_type;
               } in
-              on_success core_creds
+              on_result (Ok core_creds)
             )
           with e ->
-            on_error (Printf.sprintf "Failed to parse token response: %s" (Printexc.to_string e))
+            on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse token response: %s" (Printexc.to_string e))))
         else
-          on_error (Printf.sprintf "Token exchange failed (%d): %s" response.status response.body))
-      on_error
+          on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+      (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** Revoke access token on logout/disconnect *)
-  let revoke_token ~account_id on_success on_error =
+  let revoke_token ~account_id on_result =
     Config.get_credentials ~account_id
       (fun creds ->
         parse_mastodon_credentials creds
@@ -1315,15 +1314,15 @@ module Make (Config : CONFIG) = struct
                 (* OAuth2 revocation endpoint returns 200 for both valid and invalid tokens
                    This is by design - it's idempotent and safe to call multiple times *)
                 if response.status >= 200 && response.status < 300 then
-                  on_success ()
+                  on_result (Ok ())
                 else
                   (* Don't fail - token might already be revoked or invalid *)
-                  on_success ()  (* Still consider it a success since the goal is achieved *)
+                  on_result (Ok ())  (* Still consider it a success since the goal is achieved *)
               )
               (fun _err ->
                 (* Network errors should also not fail the disconnect flow *)
-                on_success ()  (* Continue with disconnect even if revocation failed *)
+                on_result (Ok ())  (* Continue with disconnect even if revocation failed *)
               ))
-          on_error)
-      on_error
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
 end

@@ -276,28 +276,32 @@ module OAuth = struct
     (** Revoke access or refresh token
         
         @param token The token to revoke (access or refresh)
-        @param on_success Continuation called on success
-        @param on_error Continuation receiving error message
+        @param on_result Continuation receiving api_result
     *)
-    let revoke_token ~token on_success on_error =
+    let revoke_token ~token on_result =
       let url = Printf.sprintf "%s?token=%s" 
         Metadata.revocation_endpoint (Uri.pct_encode token) in
       
       Http.post ~headers:[] ~body:"" url
         (fun response ->
           if response.status >= 200 && response.status < 300 then
-            on_success ()
+            on_result (Ok ())
           else
-            on_error (Printf.sprintf "Token revocation failed (%d): %s" response.status response.body))
-        on_error
+            on_result (Error (Error_types.Api_error {
+              status_code = response.status;
+              message = Printf.sprintf "Token revocation failed: %s" response.body;
+              platform = Platform_types.YouTubeShorts;
+              raw_response = Some response.body;
+              request_id = None;
+            })))
+        (fun err -> on_result (Error (Error_types.Internal_error err)))
     
     (** Get user's channel info using access token
         
         @param access_token Valid access token
-        @param on_success Continuation receiving channel info as JSON
-        @param on_error Continuation receiving error message
+        @param on_result Continuation receiving api_result with channel info as JSON
     *)
-    let get_channel_info ~access_token on_success on_error =
+    let get_channel_info ~access_token on_result =
       let url = Printf.sprintf "%s/channels?part=snippet,statistics&mine=true" 
         Metadata.api_base in
       let headers = [
@@ -309,12 +313,18 @@ module OAuth = struct
           if response.status >= 200 && response.status < 300 then
             try
               let json = Yojson.Basic.from_string response.body in
-              on_success json
+              on_result (Ok json)
             with e ->
-              on_error (Printf.sprintf "Failed to parse channel info: %s" (Printexc.to_string e))
+              on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse channel info: %s" (Printexc.to_string e))))
           else
-            on_error (Printf.sprintf "Get channel info failed (%d): %s" response.status response.body))
-        on_error
+            on_result (Error (Error_types.Api_error {
+              status_code = response.status;
+              message = Printf.sprintf "Get channel info failed: %s" response.body;
+              platform = Platform_types.YouTubeShorts;
+              raw_response = Some response.body;
+              request_id = None;
+            })))
+        (fun err -> on_result (Error (Error_types.Internal_error err)))
   end
 end
 

@@ -197,10 +197,11 @@ let test_upload_photo () =
     ~page_access_token:"test_token"
     ~image_url:"https://example.com/image.jpg"
     ~alt_text:None
-    (fun photo_id ->
-      assert (photo_id = "photo_12345");
-      print_endline "✓ Upload photo")
-    (fun err -> failwith ("Upload photo failed: " ^ err))
+    (function
+      | Ok photo_id ->
+          assert (photo_id = "photo_12345");
+          print_endline "✓ Upload photo"
+      | Error e -> failwith ("Upload photo failed: " ^ Error_types.error_to_string e))
 
 (** Test: Content validation *)
 let test_content_validation () =
@@ -295,16 +296,17 @@ let test_rate_limit_parsing () =
   Mock_http.set_response { status = 200; body = response_body; headers };
   
   Facebook.get ~path:"me" ~access_token:"test_token"
-    (fun _response ->
-      (* Check that rate limit was captured *)
-      match !Mock_config.rate_limits with
-      | info :: _ ->
-          assert (info.call_count = 15);
-          assert (info.total_cputime = 25);
-          assert (info.total_time = 30);
-          print_endline "✓ Rate limit parsing"
-      | [] -> failwith "Rate limit not captured")
-    (fun err -> failwith ("Rate limit test failed: " ^ err))
+    (function
+      | Ok _response ->
+          (* Check that rate limit was captured *)
+          (match !Mock_config.rate_limits with
+          | info :: _ ->
+              assert (info.call_count = 15);
+              assert (info.total_cputime = 25);
+              assert (info.total_time = 30);
+              print_endline "✓ Rate limit parsing"
+          | [] -> failwith "Rate limit not captured")
+      | Error e -> failwith ("Rate limit test failed: " ^ Error_types.error_to_string e))
 
 (** Test: Field selection *)
 let test_field_selection () =
@@ -314,15 +316,16 @@ let test_field_selection () =
   Mock_http.set_response { status = 200; body = response_body; headers = [] };
   
   Facebook.get ~path:"me" ~access_token:"test_token" ~fields:["id"; "name"]
-    (fun _response ->
-      (* Check that request URL contains fields parameter *)
-      let requests = !Mock_http.requests in
-      match requests with
-      | (_, url, _, _) :: _ ->
-          assert (string_contains url "fields=id%2Cname");
-          print_endline "✓ Field selection"
-      | [] -> failwith "No requests made")
-    (fun err -> failwith ("Field selection test failed: " ^ err))
+    (function
+      | Ok _response ->
+          (* Check that request URL contains fields parameter *)
+          let requests = !Mock_http.requests in
+          (match requests with
+          | (_, url, _, _) :: _ ->
+              assert (string_contains url "fields=id%2Cname");
+              print_endline "✓ Field selection"
+          | [] -> failwith "No requests made")
+      | Error e -> failwith ("Field selection test failed: " ^ Error_types.error_to_string e))
 
 (** Test: Error code parsing *)
 let test_error_code_parsing () =
@@ -341,12 +344,13 @@ let test_error_code_parsing () =
   Mock_http.set_response { status = 400; body = error_response; headers = [] };
   
   Facebook.get ~path:"me" ~access_token:"invalid_token"
-    (fun _response -> failwith "Should have failed with error")
-    (fun err ->
-      assert (string_contains err "OAuthException");
-      assert (string_contains err "Invalid OAuth access token");
-      assert (string_contains err "ABC123");
-      print_endline "✓ Error code parsing")
+    (function
+      | Ok _response -> failwith "Should have failed with error"
+      | Error e ->
+          (* Token expired errors are converted to Auth_error *)
+          let err_str = Error_types.error_to_string e in
+          assert (string_contains err_str "expired" || string_contains err_str "token");
+          print_endline "✓ Error code parsing")
 
 (** Test: Pagination *)
 let test_pagination () =
@@ -371,16 +375,17 @@ let test_pagination () =
   in
   
   Facebook.get_page ~path:"me/posts" ~access_token:"test_token" parse_data
-    (fun page_result ->
-      assert (List.length page_result.data = 2);
-      match page_result.paging with
-      | Some cursors ->
-          assert (cursors.after = Some "cursor_after");
-          assert (cursors.before = Some "cursor_before");
-          assert (page_result.next_url <> None);
-          print_endline "✓ Pagination"
-      | None -> failwith "No paging info")
-    (fun err -> failwith ("Pagination test failed: " ^ err))
+    (function
+      | Ok page_result ->
+          assert (List.length page_result.data = 2);
+          (match page_result.paging with
+          | Some cursors ->
+              assert (cursors.after = Some "cursor_after");
+              assert (cursors.before = Some "cursor_before");
+              assert (page_result.next_url <> None);
+              print_endline "✓ Pagination"
+          | None -> failwith "No paging info")
+      | Error e -> failwith ("Pagination test failed: " ^ Error_types.error_to_string e))
 
 (** Test: Batch requests *)
 let test_batch_requests () =
@@ -401,16 +406,17 @@ let test_batch_requests () =
   ] in
   
   Facebook.batch_request ~requests ~access_token:"test_token"
-    (fun results ->
-      assert (List.length results = 2);
-      match results with
-      | r1 :: r2 :: _ ->
-          assert (r1.code = 200);
-          assert (r2.code = 200);
-          assert (string_contains r1.body "\"id\":\"1\"");
-          print_endline "✓ Batch requests"
-      | _ -> failwith "Unexpected batch response")
-    (fun err -> failwith ("Batch test failed: " ^ err))
+    (function
+      | Ok results ->
+          assert (List.length results = 2);
+          (match results with
+          | r1 :: r2 :: _ ->
+              assert (r1.code = 200);
+              assert (r2.code = 200);
+              assert (string_contains r1.body "\"id\":\"1\"");
+              print_endline "✓ Batch requests"
+          | _ -> failwith "Unexpected batch response")
+      | Error e -> failwith ("Batch test failed: " ^ Error_types.error_to_string e))
 
 (** Test: App secret proof *)
 let test_app_secret_proof () =
@@ -420,15 +426,16 @@ let test_app_secret_proof () =
   Mock_http.set_response { status = 200; body = {|{"id":"me"}|}; headers = [] };
   
   Facebook.get ~path:"me" ~access_token:"test_token"
-    (fun _response ->
-      (* Check that request includes appsecret_proof *)
-      let requests = !Mock_http.requests in
-      match requests with
-      | (_, url, _, _) :: _ ->
-          assert (string_contains url "appsecret_proof");
-          print_endline "✓ App secret proof"
-      | [] -> failwith "No requests made")
-    (fun err -> failwith ("App secret proof test failed: " ^ err))
+    (function
+      | Ok _response ->
+          (* Check that request includes appsecret_proof *)
+          let requests = !Mock_http.requests in
+          (match requests with
+          | (_, url, _, _) :: _ ->
+              assert (string_contains url "appsecret_proof");
+              print_endline "✓ App secret proof"
+          | [] -> failwith "No requests made")
+      | Error e -> failwith ("App secret proof test failed: " ^ Error_types.error_to_string e))
 
 (** Test: Authorization header usage *)
 let test_authorization_header () =
@@ -437,18 +444,19 @@ let test_authorization_header () =
   Mock_http.set_response { status = 200; body = {|{"id":"me"}|}; headers = [] };
   
   Facebook.get ~path:"me" ~access_token:"test_token"
-    (fun _response ->
-      (* Check that Authorization header is present *)
-      let requests = !Mock_http.requests in
-      match requests with
-      | (_, _, headers, _) :: _ ->
-          let has_auth = List.exists (fun (k, v) ->
-            k = "Authorization" && string_contains v "Bearer test_token"
-          ) headers in
-          assert has_auth;
-          print_endline "✓ Authorization header"
-      | [] -> failwith "No requests made")
-    (fun err -> failwith ("Authorization header test failed: " ^ err))
+    (function
+      | Ok _response ->
+          (* Check that Authorization header is present *)
+          let requests = !Mock_http.requests in
+          (match requests with
+          | (_, _, headers, _) :: _ ->
+              let has_auth = List.exists (fun (k, v) ->
+                k = "Authorization" && string_contains v "Bearer test_token"
+              ) headers in
+              assert has_auth;
+              print_endline "✓ Authorization header"
+          | [] -> failwith "No requests made")
+      | Error e -> failwith ("Authorization header test failed: " ^ Error_types.error_to_string e))
 
 (** Test: OAuth URL with required permissions *)
 let test_oauth_url_permissions () =
@@ -539,10 +547,11 @@ let test_page_vs_user_token () =
   Mock_http.set_response { status = 200; body = response_body; headers = [] };
   
   Facebook.get ~path:"me/accounts" ~access_token:"user_token"
-    (fun _response ->
-      (* This would return page access tokens in real usage *)
-      print_endline "✓ Page vs user token handling")
-    (fun err -> failwith ("Page token test failed: " ^ err))
+    (function
+      | Ok _response ->
+          (* This would return page access tokens in real usage *)
+          print_endline "✓ Page vs user token handling"
+      | Error e -> failwith ("Page token test failed: " ^ Error_types.error_to_string e))
 
 (** Test: Token expiry detection *)
 let test_token_expiry_detection () =
@@ -607,17 +616,18 @@ let test_app_secret_proof_generation () =
   Mock_http.set_response { status = 200; body = {|{"id":"test"}|}; headers = [] };
   
   Facebook.get ~path:"me" ~access_token:"test_token"
-    (fun _response ->
-      (* Verify request included appsecret_proof *)
-      let requests = !Mock_http.requests in
-      match requests with
-      | (_, url, _, _) :: _ ->
-          if string_contains url "appsecret_proof=" then
-            print_endline "✓ App secret proof generation"
-          else
-            failwith "App secret proof not included"
-      | [] -> failwith "No requests made")
-    (fun err -> failwith ("App secret proof test failed: " ^ err))
+    (function
+      | Ok _response ->
+          (* Verify request included appsecret_proof *)
+          let requests = !Mock_http.requests in
+          (match requests with
+          | (_, url, _, _) :: _ ->
+              if string_contains url "appsecret_proof=" then
+                print_endline "✓ App secret proof generation"
+              else
+                failwith "App secret proof not included"
+          | [] -> failwith "No requests made")
+      | Error e -> failwith ("App secret proof test failed: " ^ Error_types.error_to_string e))
 
 (** Test: Redirect URI validation *)
 let test_redirect_uri_validation () =
@@ -660,10 +670,11 @@ let test_upload_photo_with_alt_text () =
     ~page_access_token:"test_token"
     ~image_url:"https://example.com/image.jpg"
     ~alt_text:(Some "A beautiful landscape photo")
-    (fun photo_id ->
-      assert (photo_id = "photo_with_alt");
-      print_endline "✓ Upload photo with alt-text")
-    (fun err -> failwith ("Upload with alt-text failed: " ^ err))
+    (function
+      | Ok photo_id ->
+          assert (photo_id = "photo_with_alt");
+          print_endline "✓ Upload photo with alt-text"
+      | Error e -> failwith ("Upload with alt-text failed: " ^ Error_types.error_to_string e))
 
 (** Test: Post with single image and alt-text *)
 let test_post_with_alt_text () =
@@ -792,9 +803,10 @@ let test_alt_text_special_characters () =
     ~page_access_token:"test_token"
     ~image_url:"https://example.com/image.jpg"
     ~alt_text:(Some "Photo with \"quotes\", & special <chars> and emojis 🎉")
-    (fun _photo_id ->
-      print_endline "✓ Alt-text with special characters")
-    (fun err -> failwith ("Alt-text with special chars failed: " ^ err))
+    (function
+      | Ok _photo_id ->
+          print_endline "✓ Alt-text with special characters"
+      | Error e -> failwith ("Alt-text with special chars failed: " ^ Error_types.error_to_string e))
 
 (** Test: Partial alt-texts - fewer alt-texts than images *)
 let test_partial_alt_texts () =
@@ -852,16 +864,17 @@ let test_upload_photo_story () =
     ~page_id:"page_123"
     ~page_access_token:"test_token"
     ~image_url:"https://example.com/story.jpg"
-    (fun story_id ->
-      assert (story_id = "story_123");
-      (* Verify the request went to photo_stories endpoint *)
-      let requests = !Mock_http.requests in
-      let has_photo_stories = List.exists (fun (_, url, _, _) ->
-        string_contains url "photo_stories"
-      ) requests in
-      assert has_photo_stories;
-      print_endline "✓ Upload photo story")
-    (fun err -> failwith ("Upload photo story failed: " ^ err))
+    (function
+      | Ok story_id ->
+          assert (story_id = "story_123");
+          (* Verify the request went to photo_stories endpoint *)
+          let requests = !Mock_http.requests in
+          let has_photo_stories = List.exists (fun (_, url, _, _) ->
+            string_contains url "photo_stories"
+          ) requests in
+          assert has_photo_stories;
+          print_endline "✓ Upload photo story"
+      | Error e -> failwith ("Upload photo story failed: " ^ Error_types.error_to_string e))
 
 (** Test: Upload video story *)
 let test_upload_video_story () =
@@ -878,16 +891,17 @@ let test_upload_video_story () =
     ~page_id:"page_123"
     ~page_access_token:"test_token"
     ~video_url:"https://example.com/story.mp4"
-    (fun story_id ->
-      assert (story_id = "video_story_789");
-      (* Verify the request went to video_stories endpoint *)
-      let requests = !Mock_http.requests in
-      let has_video_stories = List.exists (fun (_, url, _, _) ->
-        string_contains url "video_stories"
-      ) requests in
-      assert has_video_stories;
-      print_endline "✓ Upload video story")
-    (fun err -> failwith ("Upload video story failed: " ^ err))
+    (function
+      | Ok story_id ->
+          assert (story_id = "video_story_789");
+          (* Verify the request went to video_stories endpoint *)
+          let requests = !Mock_http.requests in
+          let has_video_stories = List.exists (fun (_, url, _, _) ->
+            string_contains url "video_stories"
+          ) requests in
+          assert has_video_stories;
+          print_endline "✓ Upload video story"
+      | Error e -> failwith ("Upload video story failed: " ^ Error_types.error_to_string e))
 
 (** Test: Post photo story (high-level) *)
 let test_post_story_photo () =

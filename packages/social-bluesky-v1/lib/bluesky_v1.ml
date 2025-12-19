@@ -303,13 +303,13 @@ module Make (Config : CONFIG) = struct
           try
             let json = Yojson.Basic.from_string response.body in
             let did = json |> Yojson.Basic.Util.member "did" |> Yojson.Basic.Util.to_string in
-            on_result (Error_types.Success did)
+            on_result (Ok did)
           with e ->
-            on_result (Error_types.Failure (Error_types.Internal_error 
+            on_result (Error (Error_types.Internal_error 
               (Printf.sprintf "Failed to parse DID: %s" (Printexc.to_string e))))
         else
-          on_result (Error_types.Failure (parse_api_error ~status_code:response.status ~body:response.body)))
-      (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+      (fun err -> on_result (Error (Error_types.Network_error 
         (Error_types.Connection_failed err))))
   
   (** Extract facets from text (URLs, mentions, hashtags) *)
@@ -380,13 +380,13 @@ module Make (Config : CONFIG) = struct
       | [] -> on_complete (List.rev acc)
       | (byte_start, byte_end, handle) :: rest ->
           resolve_handle ~handle (function
-            | Error_types.Success did ->
+            | Ok did ->
                 let facet = (byte_start, byte_end, `Assoc [
                   ("$type", `String "app.bsky.richtext.facet#mention");
                   ("did", `String did);
                 ]) in
                 resolve_mentions rest (facet :: acc) on_complete on_err
-            | _ ->
+            | Error _ ->
                 (* Skip mentions that fail to resolve *)
                 resolve_mentions rest acc on_complete on_err)
     in
@@ -1008,18 +1008,18 @@ module Make (Config : CONFIG) = struct
                     let like_uri = json 
                       |> Yojson.Basic.Util.member "uri" 
                       |> Yojson.Basic.Util.to_string in
-                    on_result (Error_types.Success like_uri)
+                    on_result (Ok like_uri)
                   with e ->
-                    on_result (Error_types.Failure (Error_types.Internal_error 
+                    on_result (Error (Error_types.Internal_error 
                       (Printf.sprintf "Failed to parse like response: %s" (Printexc.to_string e))))
                 else
-                  on_result (Error_types.Failure (parse_api_error 
+                  on_result (Error (parse_api_error 
                     ~status_code:response.status ~body:response.body)))
-              (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+              (fun err -> on_result (Error (Error_types.Network_error 
                 (Error_types.Connection_failed err)))))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
   
   (** Unlike a post *)
   let unlike_post ~account_id ~like_uri on_result =
@@ -1046,15 +1046,15 @@ module Make (Config : CONFIG) = struct
             Config.Http.post ~headers ~body:body_str url
               (fun response ->
                 if response.status >= 200 && response.status < 300 then
-                  on_result (Error_types.Success ())
+                  on_result (Ok ())
                 else
-                  on_result (Error_types.Failure (parse_api_error 
+                  on_result (Error (parse_api_error 
                     ~status_code:response.status ~body:response.body)))
-              (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+              (fun err -> on_result (Error (Error_types.Network_error 
                 (Error_types.Connection_failed err)))))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
   
   (** Repost a post *)
   let repost ~account_id ~post_uri ~post_cid on_result =
@@ -1092,18 +1092,18 @@ module Make (Config : CONFIG) = struct
                     let repost_uri = json 
                       |> Yojson.Basic.Util.member "uri" 
                       |> Yojson.Basic.Util.to_string in
-                    on_result (Error_types.Success repost_uri)
+                    on_result (Ok repost_uri)
                   with e ->
-                    on_result (Error_types.Failure (Error_types.Internal_error 
+                    on_result (Error (Error_types.Internal_error 
                       (Printf.sprintf "Failed to parse repost response: %s" (Printexc.to_string e))))
                 else
-                  on_result (Error_types.Failure (parse_api_error 
+                  on_result (Error (parse_api_error 
                     ~status_code:response.status ~body:response.body)))
-              (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+              (fun err -> on_result (Error (Error_types.Network_error 
                 (Error_types.Connection_failed err)))))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
   
   (** Unrepost *)
   let unrepost ~account_id ~repost_uri on_result =
@@ -1130,15 +1130,15 @@ module Make (Config : CONFIG) = struct
             Config.Http.post ~headers ~body:body_str url
               (fun response ->
                 if response.status >= 200 && response.status < 300 then
-                  on_result (Error_types.Success ())
+                  on_result (Ok ())
                 else
-                  on_result (Error_types.Failure (parse_api_error 
+                  on_result (Error (parse_api_error 
                     ~status_code:response.status ~body:response.body)))
-              (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+              (fun err -> on_result (Error (Error_types.Network_error 
                 (Error_types.Connection_failed err)))))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
   
   (** {1 Public API - Social Graph} *)
   
@@ -1175,18 +1175,18 @@ module Make (Config : CONFIG) = struct
                     let follow_uri = json 
                       |> Yojson.Basic.Util.member "uri" 
                       |> Yojson.Basic.Util.to_string in
-                    on_result (Error_types.Success follow_uri)
+                    on_result (Ok follow_uri)
                   with e ->
-                    on_result (Error_types.Failure (Error_types.Internal_error 
+                    on_result (Error (Error_types.Internal_error 
                       (Printf.sprintf "Failed to parse follow response: %s" (Printexc.to_string e))))
                 else
-                  on_result (Error_types.Failure (parse_api_error 
+                  on_result (Error (parse_api_error 
                     ~status_code:response.status ~body:response.body)))
-              (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+              (fun err -> on_result (Error (Error_types.Network_error 
                 (Error_types.Connection_failed err)))))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
   
   (** Unfollow a user *)
   let unfollow ~account_id ~follow_uri on_result =
@@ -1213,15 +1213,15 @@ module Make (Config : CONFIG) = struct
             Config.Http.post ~headers ~body:body_str url
               (fun response ->
                 if response.status >= 200 && response.status < 300 then
-                  on_result (Error_types.Success ())
+                  on_result (Ok ())
                 else
-                  on_result (Error_types.Failure (parse_api_error 
+                  on_result (Error (parse_api_error 
                     ~status_code:response.status ~body:response.body)))
-              (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+              (fun err -> on_result (Error (Error_types.Network_error 
                 (Error_types.Connection_failed err)))))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
   
   (** {1 Public API - Read Operations} *)
   
@@ -1238,16 +1238,16 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_result (Error_types.Success json)
+                on_result (Ok json)
               with e ->
-                on_result (Error_types.Failure (Error_types.Internal_error 
+                on_result (Error (Error_types.Internal_error 
                   (Printf.sprintf "Failed to parse profile: %s" (Printexc.to_string e))))
             else
-              on_result (Error_types.Failure (parse_api_error 
+              on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
   
   (** Get a post thread *)
   let get_post_thread ~account_id ~post_uri on_result =
@@ -1262,16 +1262,16 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_result (Error_types.Success json)
+                on_result (Ok json)
               with e ->
-                on_result (Error_types.Failure (Error_types.Internal_error 
+                on_result (Error (Error_types.Internal_error 
                   (Printf.sprintf "Failed to parse thread: %s" (Printexc.to_string e))))
             else
-              on_result (Error_types.Failure (parse_api_error 
+              on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
   
   (** Get timeline *)
   let get_timeline ~account_id ?limit on_result =
@@ -1289,16 +1289,16 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_result (Error_types.Success json)
+                on_result (Ok json)
               with e ->
-                on_result (Error_types.Failure (Error_types.Internal_error 
+                on_result (Error (Error_types.Internal_error 
                   (Printf.sprintf "Failed to parse timeline: %s" (Printexc.to_string e))))
             else
-              on_result (Error_types.Failure (parse_api_error 
+              on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
   
   (** Quote a post with optional text and media *)
   let quote_post ~account_id ~post_uri ~post_cid ~text ~media_urls ?(alt_texts=[]) ?(skip_enrichments=false) on_result =
@@ -1471,16 +1471,16 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_result (Error_types.Success json)
+                on_result (Ok json)
               with e ->
-                on_result (Error_types.Failure (Error_types.Internal_error 
+                on_result (Error (Error_types.Internal_error 
                   (Printf.sprintf "Failed to parse notifications: %s" (Printexc.to_string e))))
             else
-              on_result (Error_types.Failure (parse_api_error 
+              on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
   
   (** Count unread notifications *)
   let count_unread_notifications ~account_id on_result =
@@ -1497,16 +1497,16 @@ module Make (Config : CONFIG) = struct
                 let count = json 
                   |> Yojson.Basic.Util.member "count" 
                   |> Yojson.Basic.Util.to_int in
-                on_result (Error_types.Success count)
+                on_result (Ok count)
               with e ->
-                on_result (Error_types.Failure (Error_types.Internal_error 
+                on_result (Error (Error_types.Internal_error 
                   (Printf.sprintf "Failed to parse unread count: %s" (Printexc.to_string e))))
             else
-              on_result (Error_types.Failure (parse_api_error 
+              on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
   
   (** Update seen notifications *)
   let update_seen_notifications ~account_id on_result =
@@ -1524,13 +1524,13 @@ module Make (Config : CONFIG) = struct
         Config.Http.post ~headers ~body:body_str url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              on_result (Error_types.Success ())
+              on_result (Ok ())
             else
-              on_result (Error_types.Failure (parse_api_error 
+              on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
   
   (** {1 Public API - Search} *)
   
@@ -1558,16 +1558,16 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_result (Error_types.Success json)
+                on_result (Ok json)
               with e ->
-                on_result (Error_types.Failure (Error_types.Internal_error 
+                on_result (Error (Error_types.Internal_error 
                   (Printf.sprintf "Failed to parse search results: %s" (Printexc.to_string e))))
             else
-              on_result (Error_types.Failure (parse_api_error 
+              on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
   
   (** Search for posts *)
   let search_posts ~account_id ~query ?limit ?cursor on_result =
@@ -1593,16 +1593,16 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_result (Error_types.Success json)
+                on_result (Ok json)
               with e ->
-                on_result (Error_types.Failure (Error_types.Internal_error 
+                on_result (Error (Error_types.Internal_error 
                   (Printf.sprintf "Failed to parse search results: %s" (Printexc.to_string e))))
             else
-              on_result (Error_types.Failure (parse_api_error 
+              on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
   
   (** {1 Public API - Moderation} *)
   
@@ -1621,13 +1621,13 @@ module Make (Config : CONFIG) = struct
         Config.Http.post ~headers ~body:body_str url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              on_result (Error_types.Success ())
+              on_result (Ok ())
             else
-              on_result (Error_types.Failure (parse_api_error 
+              on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
   
   (** Unmute an actor *)
   let unmute_actor ~account_id ~actor on_result =
@@ -1644,13 +1644,13 @@ module Make (Config : CONFIG) = struct
         Config.Http.post ~headers ~body:body_str url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              on_result (Error_types.Success ())
+              on_result (Ok ())
             else
-              on_result (Error_types.Failure (parse_api_error 
+              on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
   
   (** Block an actor *)
   let block_actor ~account_id ~actor on_result =
@@ -1685,18 +1685,18 @@ module Make (Config : CONFIG) = struct
                     let block_uri = json 
                       |> Yojson.Basic.Util.member "uri" 
                       |> Yojson.Basic.Util.to_string in
-                    on_result (Error_types.Success block_uri)
+                    on_result (Ok block_uri)
                   with e ->
-                    on_result (Error_types.Failure (Error_types.Internal_error 
+                    on_result (Error (Error_types.Internal_error 
                       (Printf.sprintf "Failed to parse block response: %s" (Printexc.to_string e))))
                 else
-                  on_result (Error_types.Failure (parse_api_error 
+                  on_result (Error (parse_api_error 
                     ~status_code:response.status ~body:response.body)))
-              (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+              (fun err -> on_result (Error (Error_types.Network_error 
                 (Error_types.Connection_failed err)))))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
   
   (** Unblock an actor *)
   let unblock_actor ~account_id ~block_uri on_result =
@@ -1723,15 +1723,15 @@ module Make (Config : CONFIG) = struct
             Config.Http.post ~headers ~body:body_str url
               (fun response ->
                 if response.status >= 200 && response.status < 300 then
-                  on_result (Error_types.Success ())
+                  on_result (Ok ())
                 else
-                  on_result (Error_types.Failure (parse_api_error 
+                  on_result (Error (parse_api_error 
                     ~status_code:response.status ~body:response.body)))
-              (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+              (fun err -> on_result (Error (Error_types.Network_error 
                 (Error_types.Connection_failed err)))))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
   
   (** {1 Public API - Feed Operations} *)
   
@@ -1759,16 +1759,16 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_result (Error_types.Success json)
+                on_result (Ok json)
               with e ->
-                on_result (Error_types.Failure (Error_types.Internal_error 
+                on_result (Error (Error_types.Internal_error 
                   (Printf.sprintf "Failed to parse author feed: %s" (Printexc.to_string e))))
             else
-              on_result (Error_types.Failure (parse_api_error 
+              on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
   
   (** Get likes for a post *)
   let get_likes ~account_id ~post_uri ?limit ?cursor on_result =
@@ -1794,16 +1794,16 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_result (Error_types.Success json)
+                on_result (Ok json)
               with e ->
-                on_result (Error_types.Failure (Error_types.Internal_error 
+                on_result (Error (Error_types.Internal_error 
                   (Printf.sprintf "Failed to parse likes: %s" (Printexc.to_string e))))
             else
-              on_result (Error_types.Failure (parse_api_error 
+              on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
   
   (** Get reposts for a post *)
   let get_reposted_by ~account_id ~post_uri ?limit ?cursor on_result =
@@ -1829,16 +1829,16 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_result (Error_types.Success json)
+                on_result (Ok json)
               with e ->
-                on_result (Error_types.Failure (Error_types.Internal_error 
+                on_result (Error (Error_types.Internal_error 
                   (Printf.sprintf "Failed to parse reposts: %s" (Printexc.to_string e))))
             else
-              on_result (Error_types.Failure (parse_api_error 
+              on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
   
   (** Get followers *)
   let get_followers ~account_id ~actor ?limit ?cursor on_result =
@@ -1864,16 +1864,16 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_result (Error_types.Success json)
+                on_result (Ok json)
               with e ->
-                on_result (Error_types.Failure (Error_types.Internal_error 
+                on_result (Error (Error_types.Internal_error 
                   (Printf.sprintf "Failed to parse followers: %s" (Printexc.to_string e))))
             else
-              on_result (Error_types.Failure (parse_api_error 
+              on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
   
   (** Get follows *)
   let get_follows ~account_id ~actor ?limit ?cursor on_result =
@@ -1899,14 +1899,15 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               try
                 let json = Yojson.Basic.from_string response.body in
-                on_result (Error_types.Success json)
+                on_result (Ok json)
               with e ->
-                on_result (Error_types.Failure (Error_types.Internal_error 
+                on_result (Error (Error_types.Internal_error 
                   (Printf.sprintf "Failed to parse follows: %s" (Printexc.to_string e))))
             else
-              on_result (Error_types.Failure (parse_api_error 
+              on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
-          (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+          (fun err -> on_result (Error (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error_types.Failure err))
+      (fun err -> on_result (Error err))
 end
+

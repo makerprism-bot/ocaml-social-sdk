@@ -560,7 +560,7 @@ module Make (Config : CONFIG) = struct
     with _ -> None, None, None
   
   (** Generic GET request with pagination support *)
-  let get_paginated ~path ~access_token ?fields ?cursor on_success on_error =
+  let get_paginated ~path ~access_token ?fields ?cursor on_result =
     let field_params = match fields with
       | Some f -> [("fields", String.concat "," f)]
       | None -> []
@@ -600,18 +600,10 @@ module Make (Config : CONFIG) = struct
       (fun response ->
         update_rate_limits response;
         if response.status >= 200 && response.status < 300 then
-          on_success response
+          on_result (Ok response)
         else
-          match parse_facebook_error response.body with
-          | Some err ->
-              let msg = Printf.sprintf "Facebook API error (%s): %s%s"
-                err.error_type err.message
-                (match err.fbtrace_id with Some id -> Printf.sprintf " [trace: %s]" id | None -> "")
-              in
-              on_error msg
-          | None ->
-              on_error (Printf.sprintf "HTTP error (%d): %s" response.status response.body))
-      on_error
+          on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+      (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** {1 Token Management} *)
   
@@ -650,7 +642,7 @@ module Make (Config : CONFIG) = struct
       on_error
   
   (** Upload photo to Facebook Page with optional alt text *)
-  let upload_photo ~page_id ~page_access_token ~image_url ~alt_text on_success on_error =
+  let upload_photo ~page_id ~page_access_token ~image_url ~alt_text on_result =
     (* Download image first *)
     Config.Http.get ~headers:[] image_url
       (fun image_response ->
@@ -709,20 +701,15 @@ module Make (Config : CONFIG) = struct
                   let open Yojson.Basic.Util in
                   let json = Yojson.Basic.from_string response.body in
                   let photo_id = json |> member "id" |> to_string in
-                  on_success photo_id
+                  on_result (Ok photo_id)
                 with e ->
-                  on_error (Printf.sprintf "Failed to parse photo response: %s" (Printexc.to_string e))
+                  on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse photo response: %s" (Printexc.to_string e))))
               else
-                match parse_facebook_error response.body with
-                | Some err ->
-                    let msg = Printf.sprintf "Photo upload failed (%s): %s" err.error_type err.message in
-                    on_error msg
-                | None ->
-                    on_error (Printf.sprintf "Failed to upload photo (%d): %s" response.status response.body))
-            on_error
+                on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+            (fun err -> on_result (Error (Error_types.Internal_error err)))
         else
-          on_error (Printf.sprintf "Failed to download image from %s (%d)" image_url image_response.status))
-      on_error
+          on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to download image from %s (%d)" image_url image_response.status))))
+      (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** Upload video to Facebook Page for Reels 
       
@@ -869,10 +856,9 @@ module Make (Config : CONFIG) = struct
       @param page_id Facebook Page ID
       @param page_access_token Page access token
       @param image_url Publicly accessible URL of the image
-      @param on_success Continuation receiving the story ID
-      @param on_error Continuation receiving error message
+      @param on_result Continuation receiving api_result with story ID
   *)
-  let upload_photo_story ~page_id ~page_access_token ~image_url on_success on_error =
+  let upload_photo_story ~page_id ~page_access_token ~image_url on_result =
     (* Download image first *)
     Config.Http.get ~headers:[] image_url
       (fun image_response ->
@@ -917,20 +903,15 @@ module Make (Config : CONFIG) = struct
                     try json |> member "post_id" |> to_string
                     with _ -> json |> member "id" |> to_string
                   in
-                  on_success story_id
+                  on_result (Ok story_id)
                 with e ->
-                  on_error (Printf.sprintf "Failed to parse photo story response: %s" (Printexc.to_string e))
+                  on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse photo story response: %s" (Printexc.to_string e))))
               else
-                match parse_facebook_error response.body with
-                | Some err ->
-                    let msg = Printf.sprintf "Photo story upload failed (%s): %s" err.error_type err.message in
-                    on_error msg
-                | None ->
-                    on_error (Printf.sprintf "Failed to upload photo story (%d): %s" response.status response.body))
-            on_error
+                on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+            (fun err -> on_result (Error (Error_types.Internal_error err)))
         else
-          on_error (Printf.sprintf "Failed to download image from %s (%d)" image_url image_response.status))
-      on_error
+          on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to download image from %s (%d)" image_url image_response.status))))
+      (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** Post video story to Facebook Page
       
@@ -949,10 +930,9 @@ module Make (Config : CONFIG) = struct
       @param page_id Facebook Page ID
       @param page_access_token Page access token
       @param video_url Publicly accessible URL of the video
-      @param on_success Continuation receiving the story ID
-      @param on_error Continuation receiving error message
+      @param on_result Continuation receiving api_result with story ID
   *)
-  let upload_video_story ~page_id ~page_access_token ~video_url on_success on_error =
+  let upload_video_story ~page_id ~page_access_token ~video_url on_result =
     (* Download video first *)
     Config.Http.get ~headers:[] video_url
       (fun video_response ->
@@ -1027,34 +1007,26 @@ module Make (Config : CONFIG) = struct
                                     try json |> member "post_id" |> to_string
                                     with _ -> video_id
                                   in
-                                  on_success story_id
+                                  on_result (Ok story_id)
                                 else
-                                  on_error "Facebook video story upload failed: success=false"
+                                  on_result (Error (Error_types.Internal_error "Facebook video story upload failed: success=false"))
                               with _e ->
                                 (* If we can't parse but got 2xx, consider it a success *)
-                                on_success video_id
+                                on_result (Ok video_id)
                             else
-                              match parse_facebook_error finish_response.body with
-                              | Some err ->
-                                  on_error (Printf.sprintf "Video story finish failed (%s): %s" err.error_type err.message)
-                              | None ->
-                                  on_error (Printf.sprintf "Video story finish failed (%d): %s" finish_response.status finish_response.body))
-                          on_error
+                              on_result (Error (parse_api_error ~status_code:finish_response.status ~response_body:finish_response.body)))
+                          (fun err -> on_result (Error (Error_types.Internal_error err)))
                       else
-                        on_error (Printf.sprintf "Video story upload failed (%d): %s" upload_response.status upload_response.body))
-                    on_error
+                        on_result (Error (Error_types.Internal_error (Printf.sprintf "Video story upload failed (%d): %s" upload_response.status upload_response.body))))
+                    (fun err -> on_result (Error (Error_types.Internal_error err)))
                 with e ->
-                  on_error (Printf.sprintf "Failed to parse video story init response: %s" (Printexc.to_string e))
+                  on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse video story init response: %s" (Printexc.to_string e))))
               else
-                match parse_facebook_error init_response.body with
-                | Some err ->
-                    on_error (Printf.sprintf "Video story init failed (%s): %s" err.error_type err.message)
-                | None ->
-                    on_error (Printf.sprintf "Video story init failed (%d): %s" init_response.status init_response.body))
-            on_error
+                on_result (Error (parse_api_error ~status_code:init_response.status ~response_body:init_response.body)))
+            (fun err -> on_result (Error (Error_types.Internal_error err)))
         else
-          on_error (Printf.sprintf "Failed to download video from %s (%d)" video_url video_response.status))
-      on_error
+          on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to download video from %s (%d)" video_url video_response.status))))
+      (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** Post photo story to Facebook Page (high-level)
       
@@ -1068,8 +1040,9 @@ module Make (Config : CONFIG) = struct
         Config.get_page_id ~account_id
           (fun page_id ->
             upload_photo_story ~page_id ~page_access_token ~image_url
-              (fun story_id -> on_result (Error_types.Success story_id))
-              (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+              (function
+                | Ok story_id -> on_result (Error_types.Success story_id)
+                | Error e -> on_result (Error_types.Failure e)))
           (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
       (fun err -> on_result (Error_types.Failure 
         (Error_types.Auth_error (Error_types.Refresh_failed err))))
@@ -1086,8 +1059,9 @@ module Make (Config : CONFIG) = struct
         Config.get_page_id ~account_id
           (fun page_id ->
             upload_video_story ~page_id ~page_access_token ~video_url
-              (fun story_id -> on_result (Error_types.Success story_id))
-              (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+              (function
+                | Ok story_id -> on_result (Error_types.Success story_id)
+                | Error e -> on_result (Error_types.Failure e)))
           (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
       (fun err -> on_result (Error_types.Failure 
         (Error_types.Auth_error (Error_types.Refresh_failed err))))
@@ -1155,13 +1129,14 @@ module Make (Config : CONFIG) = struct
                 Config.get_page_id ~account_id
                   (fun page_id ->
                     (* Upload all photos first *)
-                    let rec upload_all_photos urls_with_alt acc on_complete on_upload_error =
+                    let rec upload_all_photos urls_with_alt acc on_complete =
                       match urls_with_alt with
-                      | [] -> on_complete (List.rev acc)
+                      | [] -> on_complete (Ok (List.rev acc))
                       | (url, alt_text) :: rest ->
                           upload_photo ~page_id ~page_access_token ~image_url:url ~alt_text
-                            (fun photo_id -> upload_all_photos rest (photo_id :: acc) on_complete on_upload_error)
-                            on_upload_error
+                            (function
+                              | Ok photo_id -> upload_all_photos rest (photo_id :: acc) on_complete
+                              | Error e -> on_complete (Error e))
                     in
                     
                     (* Pair URLs with alt text - use None if alt text list is shorter *)
@@ -1171,7 +1146,9 @@ module Make (Config : CONFIG) = struct
                     ) media_urls in
                     
                     upload_all_photos urls_with_alt [] 
-                      (fun photo_ids ->
+                      (function
+                      | Error e -> on_result (Error_types.Failure e)
+                      | Ok photo_ids ->
                         (* Create Facebook Page post *)
                         let url = Printf.sprintf "%s/%s/feed" graph_api_base page_id in
                         
@@ -1213,8 +1190,7 @@ module Make (Config : CONFIG) = struct
                             else
                               on_result (Error_types.Failure 
                                 (parse_api_error ~status_code:response.status ~response_body:response.body)))
-                          (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
-                      (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+                          (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err)))))
                   (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
               (fun err -> on_result (Error_types.Failure 
                 (Error_types.Auth_error (Error_types.Refresh_failed err))))
@@ -1355,34 +1331,35 @@ module Make (Config : CONFIG) = struct
   (** {1 Generic API Methods} *)
   
   (** Generic GET request to any Graph API endpoint *)
-  let get ~path ~access_token ?fields on_success on_error =
-    get_paginated ~path ~access_token ?fields ?cursor:None on_success on_error
+  let get ~path ~access_token ?fields on_result =
+    get_paginated ~path ~access_token ?fields ?cursor:None on_result
   
   (** Get a page of results from a collection endpoint *)
-  let get_page ~path ~access_token ?fields ?cursor (parse_data : Yojson.Basic.t -> 'a list) on_success on_error =
+  let get_page ~path ~access_token ?fields ?cursor (parse_data : Yojson.Basic.t -> 'a list) on_result =
     get_paginated ~path ~access_token ?fields ?cursor
-      (fun response ->
-        try
-          let json = Yojson.Basic.from_string response.body in
-          let open Yojson.Basic.Util in
-          let data = json |> member "data" |> parse_data in
-          let paging, next_url, previous_url = parse_paging json in
-          on_success {
-            data;
-            paging;
-            next_url;
-            previous_url;
-          }
-        with e ->
-          on_error (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e)))
-      on_error
+      (function
+        | Error e -> on_result (Error e)
+        | Ok response ->
+            try
+              let json = Yojson.Basic.from_string response.body in
+              let open Yojson.Basic.Util in
+              let data = json |> member "data" |> parse_data in
+              let paging, next_url, previous_url = parse_paging json in
+              on_result (Ok {
+                data;
+                paging;
+                next_url;
+                previous_url;
+              })
+            with e ->
+              on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e)))))
   
   (** Fetch next page using cursor *)
-  let get_next_page ~path ~access_token ?fields ~cursor parse_data on_success on_error =
-    get_page ~path ~access_token ?fields ~cursor parse_data on_success on_error
+  let get_next_page ~path ~access_token ?fields ~cursor parse_data on_result =
+    get_page ~path ~access_token ?fields ~cursor parse_data on_result
   
   (** Generic POST request to any Graph API endpoint *)
-  let post ~path ~access_token ~params on_success on_error =
+  let post ~path ~access_token ~params on_result =
     let url = Printf.sprintf "%s/%s" graph_api_base path in
     
     let all_params = params @
@@ -1401,17 +1378,13 @@ module Make (Config : CONFIG) = struct
       (fun response ->
         update_rate_limits response;
         if response.status >= 200 && response.status < 300 then
-          on_success response
+          on_result (Ok response)
         else
-          match parse_facebook_error response.body with
-          | Some err ->
-              on_error (Printf.sprintf "POST failed (%s): %s" err.error_type err.message)
-          | None ->
-              on_error (Printf.sprintf "POST failed (%d): %s" response.status response.body))
-      on_error
+          on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+      (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** Generic DELETE request to any Graph API endpoint *)
-  let delete ~path ~access_token on_success on_error =
+  let delete ~path ~access_token on_result =
     let proof_params = match compute_app_secret_proof ~access_token with
       | Some proof -> [("appsecret_proof", [proof])]
       | None -> []
@@ -1432,14 +1405,10 @@ module Make (Config : CONFIG) = struct
       (fun response ->
         update_rate_limits response;
         if response.status >= 200 && response.status < 300 then
-          on_success response
+          on_result (Ok response)
         else
-          match parse_facebook_error response.body with
-          | Some err ->
-              on_error (Printf.sprintf "DELETE failed (%s): %s" err.error_type err.message)
-          | None ->
-              on_error (Printf.sprintf "DELETE failed (%d): %s" response.status response.body))
-      on_error
+          on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+      (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** {1 Batch Requests} *)
   
@@ -1459,11 +1428,11 @@ module Make (Config : CONFIG) = struct
   }
   
   (** Execute batch requests (up to 50 per batch) *)
-  let batch_request ~requests ~access_token on_success on_error =
+  let batch_request ~requests ~access_token on_result =
     if List.length requests = 0 then
-      on_error "Batch request list cannot be empty"
+      on_result (Error (Error_types.Internal_error "Batch request list cannot be empty"))
     else if List.length requests > 50 then
-      on_error "Facebook allows maximum 50 requests per batch"
+      on_result (Error (Error_types.Internal_error "Facebook allows maximum 50 requests per batch"))
     else
       let url = Printf.sprintf "%s/" graph_api_base in
       
@@ -1525,14 +1494,10 @@ module Make (Config : CONFIG) = struct
                 let body = item |> member "body" |> to_string in
                 { code; headers; body }
               ) in
-              on_success results
+              on_result (Ok results)
             with e ->
-              on_error (Printf.sprintf "Failed to parse batch response: %s" (Printexc.to_string e))
+              on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse batch response: %s" (Printexc.to_string e))))
           else
-            match parse_facebook_error response.body with
-            | Some err ->
-                on_error (Printf.sprintf "Batch request failed (%s): %s" err.error_type err.message)
-            | None ->
-                on_error (Printf.sprintf "Batch request failed (%d): %s" response.status response.body))
-        on_error
+            on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+        (fun err -> on_result (Error (Error_types.Internal_error err)))
 end

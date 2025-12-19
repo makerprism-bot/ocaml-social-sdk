@@ -27,3 +27,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Media size and format validation
 - Scheduled publishing support
 - Idempotency keys for safe retries
+- Structured error handling:
+  - Posting operations use `outcome` type with Success/Partial_success/Failure
+  - Non-posting operations use `api_result` type with Ok/Error

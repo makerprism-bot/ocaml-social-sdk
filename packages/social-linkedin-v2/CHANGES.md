@@ -34,3 +34,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rich type system for API responses
 - Content validation
 - CPS-based architecture for runtime independence
+- Structured error handling:
+  - Posting operations use `outcome` type with Success/Partial_success/Failure
+  - Non-posting operations use `api_result` type with Ok/Error

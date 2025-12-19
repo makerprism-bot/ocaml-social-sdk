@@ -17,3 +17,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Content validation for video descriptions (5,000 char limit)
 - Automatic #Shorts tagging
 - CPS-based architecture for runtime independence
+- Structured error handling:
+  - Posting operations use `outcome` type with Success/Partial_success/Failure
+  - Non-posting operations use `api_result` type with Ok/Error

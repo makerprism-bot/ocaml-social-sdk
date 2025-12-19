@@ -209,7 +209,10 @@ Facebook.get_page ~path:"me/posts" ~access_token parse_posts
             (match cursors.after with
              | Some cursor ->
                  Facebook.get_next_page ~path:"me/posts" ~access_token 
-                   ~cursor parse_posts handle_result
+                   ~cursor parse_posts (function
+                     | Ok next_page -> (* process next page *) ()
+                     | Error err -> Printf.eprintf "Error: %s\n" 
+                         (Social_core.Error_types.error_to_string err))
              | None -> ())
         | None -> ())
     | Error err -> 

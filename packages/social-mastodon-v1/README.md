@@ -102,8 +102,8 @@ Mastodon.register_app
       (fun credentials ->
         (* Save credentials for future use *)
         ())
-      on_error)
-  on_error
+      (fun err -> Printf.eprintf "Error: %s\n" err))
+  (fun err -> Printf.eprintf "Error: %s\n" err)
 ```
 
 ### Post a Simple Status

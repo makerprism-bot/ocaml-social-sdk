@@ -227,7 +227,9 @@ scroller.scroll_next
         
         (* Can continue scrolling *)
         if scroller.has_more () then
-          scroller.scroll_next handle_page
+          scroller.scroll_next (function
+            | Ok page -> (* handle next page *) ()
+            | Error _ -> ())
         else
           Printf.printf "No more posts\n"
     | Error err -> 
@@ -457,8 +459,8 @@ type post_info = {
 
 (* Scroller for pagination *)
 type 'a scroller = {
-  scroll_next: (('a collection_response -> unit) -> (string -> unit) -> unit);
-  scroll_back: (('a collection_response -> unit) -> (string -> unit) -> unit);
+  scroll_next: (('a collection_response, Error_types.error) result -> unit) -> unit;
+  scroll_back: (('a collection_response, Error_types.error) result -> unit) -> unit;
   current_position: unit -> int;
   has_more: unit -> bool;
 }
@@ -557,9 +559,8 @@ Get current user's profile information using OpenID Connect.
 ```ocaml
 val get_profile :
   account_id:string ->
-  (profile_info -> 'a) -> (* on_success *)
-  (string -> 'a) ->       (* on_error *)
-  'a
+  ((profile_info, Error_types.error) result -> unit) ->  (* on_result *)
+  unit
 ```
 
 Requires `openid` and `profile` scopes. Returns basic profile information including user ID, name, email, and profile picture.
@@ -573,9 +574,8 @@ Fetch a single post by its URN.
 val get_post :
   account_id:string ->
   post_urn:string ->
-  (post_info -> 'a) -> (* on_success *)
-  (string -> 'a) ->    (* on_error *)
-  'a
+  ((post_info, Error_types.error) result -> unit) ->  (* on_result *)
+  unit
 ```
 
 #### `get_posts`
@@ -586,9 +586,8 @@ val get_posts :
   account_id:string ->
   ?start:int ->              (* Starting index (default: 0) *)
   ?count:int ->              (* Number to fetch (default: 10, max: 50) *)
-  (post_info collection_response -> 'a) -> (* on_success *)
-  (string -> 'a) ->                        (* on_error *)
-  'a
+  ((post_info collection_response, Error_types.error) result -> unit) ->  (* on_result *)
+  unit
 ```
 
 Returns a collection response with posts and paging metadata. The response includes:
@@ -603,9 +602,8 @@ Efficiently fetch multiple posts in a single API call.
 val batch_get_posts :
   account_id:string ->
   post_urns:string list ->
-  (post_info list -> 'a) -> (* on_success *)
-  (string -> 'a) ->         (* on_error *)
-  'a
+  ((post_info list, Error_types.error) result -> unit) ->  (* on_result *)
+  unit
 ```
 
 Batch operations are more efficient than multiple individual requests. Useful when you have specific post URNs to fetch.
@@ -635,15 +633,16 @@ let scroller = create_posts_scroller ~account_id ~page_size:10 () in
 
 (* Scroll forward *)
 scroller.scroll_next 
-  (fun page -> (* handle page */) ()) 
-  (fun err -> (* handle error */) ());
+  (function
+    | Ok page -> (* handle page *) ()
+    | Error err -> (* handle error *) ());
 
 (* Check state *)
 if scroller.has_more () then
-  scroller.scroll_next handle_page handle_error;
+  scroller.scroll_next handle_result;
 
 (* Scroll backward *)
-scroller.scroll_back handle_page handle_error;
+scroller.scroll_back handle_result;
 ```
 
 ### Search Functions
@@ -658,9 +657,8 @@ val search_posts :
   ?author:string ->          (* Filter by author URN *)
   ?start:int ->              (* Starting index (default: 0) *)
   ?count:int ->              (* Results per page (default: 10, max: 50) *)
-  (post_info collection_response -> 'a) -> (* on_success *)
-  (string -> 'a) ->                        (* on_error *)
-  'a
+  ((post_info collection_response, Error_types.error) result -> unit) ->  (* on_result *)
+  unit
 ```
 
 More flexible than `get_posts` as it supports keyword search and filtering.
@@ -687,9 +685,8 @@ Add a like/reaction to a post.
 val like_post :
   account_id:string ->
   post_urn:string ->
-  (unit -> 'a) -> (* on_success *)
-  (string -> 'a) -> (* on_error *)
-  'a
+  ((unit, Error_types.error) result -> unit) ->  (* on_result *)
+  unit
 ```
 
 #### `unlike_post`
@@ -699,9 +696,8 @@ Remove a like/reaction from a post.
 val unlike_post :
   account_id:string ->
   post_urn:string ->
-  (unit -> 'a) -> (* on_success *)
-  (string -> 'a) -> (* on_error *)
-  'a
+  ((unit, Error_types.error) result -> unit) ->  (* on_result *)
+  unit
 ```
 
 #### `comment_on_post`
@@ -712,9 +708,8 @@ val comment_on_post :
   account_id:string ->
   post_urn:string ->
   text:string ->
-  (string -> 'a) -> (* on_success: returns comment_id *)
-  (string -> 'a) -> (* on_error *)
-  'a
+  ((string, Error_types.error) result -> unit) ->  (* on_result: Ok returns comment_id *)
+  unit
 ```
 
 #### `get_post_comments`
@@ -726,9 +721,8 @@ val get_post_comments :
   post_urn:string ->
   ?start:int ->
   ?count:int ->
-  (comment_info collection_response -> 'a) -> (* on_success *)
-  (string -> 'a) ->                           (* on_error *)
-  'a
+  ((comment_info collection_response, Error_types.error) result -> unit) ->  (* on_result *)
+  unit
 ```
 
 #### `get_post_engagement`
@@ -738,9 +732,8 @@ Get engagement statistics for a post.
 val get_post_engagement :
   account_id:string ->
   post_urn:string ->
-  (engagement_info -> 'a) -> (* on_success *)
-  (string -> 'a) ->          (* on_error *)
-  'a
+  ((engagement_info, Error_types.error) result -> unit) ->  (* on_result *)
+  unit
 ```
 
 Returns metrics including:
@@ -750,7 +743,6 @@ Returns metrics including:
 - Impression count (if available)
 
 **Note**: May require additional API permissions beyond basic posting scopes.
-```
 
 ## Platform Constraints
 
@@ -783,14 +775,20 @@ Posting operations use structured error handling with the `outcome` type:
 LinkedIn.post_single ~account_id ~text ~media_urls:[]
   (function
     | Social_core.Error_types.Success post_id -> 
-        (* Success case *)
-        handle_success post_id
+        Printf.printf "Posted: %s\n" post_id
     | Social_core.Error_types.Partial_success { result = post_id; warnings } ->
-        (* Posted but with warnings (e.g., link card failed) *)
-        handle_partial_success post_id warnings
+        Printf.printf "Posted: %s with %d warnings\n" post_id (List.length warnings)
     | Social_core.Error_types.Failure err ->
-        (* Error case *)
-        handle_error (Social_core.Error_types.error_to_string err))
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
+```
+
+Non-posting operations use `api_result` (standard OCaml result type):
+
+```ocaml
+LinkedIn.get_profile ~account_id
+  (function
+    | Ok profile -> Printf.printf "User: %s\n" profile.sub
+    | Error err -> Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 Common error messages:

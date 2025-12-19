@@ -33,16 +33,13 @@ let auth_url = get_authorization_url
   ~state:"random_state"
 
 (* Exchange code for token *)
-let () = exchange_code_for_token
-  ~client_id:"your_client_key"
-  ~client_secret:"your_client_secret"
+TikTok.exchange_code
   ~code:authorization_code
   ~redirect_uri:"https://your-app.com/callback"
-  ~http_post
-  ~on_success:(fun (access_token, refresh_token, expires_in, open_id) ->
+  (fun credentials ->
     (* Store tokens securely *)
-  )
-  ~on_error:(fun err -> print_endline err)
+    Printf.printf "Access token: %s\n" credentials.access_token)
+  (fun err -> print_endline err)
 ```
 
 ### Query Creator Info (Required Before Posting)
@@ -57,44 +54,21 @@ TikTok.get_creator_info ~account_id
         Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
-### Post a Video (FILE_UPLOAD)
+### Post a Video
 
 ```ocaml
-let post_info = {
-  title = "Check out this #video on @tiktok #fyp";
-  privacy_level = PublicToEveryone;
-  disable_duet = false;
-  disable_comment = false;
-  disable_stitch = false;
-  video_cover_timestamp_ms = Some 1000;
-}
-
-let () = init_video_upload_file
-  ~access_token
-  ~post_info
-  ~video_size:(10 * 1024 * 1024)  (* 10MB *)
-  ~http_post
-  ~on_success:(fun response ->
-    Printf.printf "Publish ID: %s\n" response.publish_id;
-    match response.upload_url with
-    | Some url -> Printf.printf "Upload to: %s\n" url
-    | None -> ()
-  )
-  ~on_error:(fun err -> print_endline err)
-```
-
-### Post a Video (PULL_FROM_URL)
-
-```ocaml
-let () = init_video_upload_url
-  ~access_token
-  ~post_info
-  ~video_url:"https://your-domain.com/video.mp4"
-  ~http_post
-  ~on_success:(fun response ->
-    Printf.printf "Publish ID: %s\n" response.publish_id
-  )
-  ~on_error:(fun err -> print_endline err)
+(* Post a video using post_single - handles the upload process *)
+TikTok.post_single
+  ~account_id:"user123"
+  ~text:""  (* TikTok uses video description, not separate text *)
+  ~media_urls:["https://your-domain.com/video.mp4"]
+  (function
+    | Social_core.Error_types.Success publish_id ->
+        Printf.printf "Published: %s\n" publish_id
+    | Social_core.Error_types.Partial_success { result = publish_id; warnings } ->
+        Printf.printf "Published: %s with %d warnings\n" publish_id (List.length warnings)
+    | Social_core.Error_types.Failure err ->
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Check Publish Status

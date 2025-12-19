@@ -18,3 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Thread_splitter` module for splitting content into thread posts
 - `Url_extractor` module for extracting URLs from text
 - CPS (Continuation Passing Style) architecture for runtime independence
+- `Error_types` module with structured error handling:
+  - `outcome` type for posting operations (Success/Partial_success/Failure)
+  - `api_result` type for non-posting operations (Ok/Error)
+  - Comprehensive error types: auth, network, validation, API, rate limiting
+  - Warning types for partial success scenarios (link card failures, etc.)
+  - `thread_result` type for tracking thread posting progress
+  - Helper functions: `ok`, `fail`, `api_result_map`, `error_to_string`

@@ -45,6 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `post` - POST any endpoint
 - `delete` - DELETE any resource
 
+#### Structured Error Handling
+- Posting operations use `outcome` type with Success/Partial_success/Failure
+- Non-posting operations use `api_result` type with Ok/Error
+
 #### Architecture
 - CPS (Continuation Passing Style) implementation
 - Runtime agnostic

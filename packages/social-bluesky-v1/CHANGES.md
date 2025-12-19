@@ -29,3 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Moderation: mute/unmute, block/unblock actors
 - Content validation (300 chars, media size/type limits)
 - Health status tracking
+- Structured error handling:
+  - Posting operations use `outcome` type with Success/Partial_success/Failure
+  - Non-posting operations use `api_result` type with Ok/Error
+  - Partial success for posts where enrichment (link cards) fails

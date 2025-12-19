@@ -63,6 +63,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`pagination_meta` type** - Structured pagination metadata
 - **Pagination support** - next_token/pagination_token parameters on all list endpoints
 
+#### Structured Error Handling
+- Posting operations use `outcome` type with Success/Partial_success/Failure
+- Non-posting operations use `api_result` type with Ok/Error
+- Partial success for posts where media upload partially fails
+
 #### Architecture
 - CPS (Continuation Passing Style) implementation
 - Runtime agnostic

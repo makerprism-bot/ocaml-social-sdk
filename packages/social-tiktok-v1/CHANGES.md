@@ -23,3 +23,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Frame rate: 23-60 FPS
   - Formats: MP4, WebM, MOV
 - CPS-based architecture for runtime independence
+- Structured error handling:
+  - Posting operations use `outcome` type with Success/Partial_success/Failure
+  - Non-posting operations use `api_result` type with Ok/Error

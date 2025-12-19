@@ -37,6 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Instagram API error code parsing
 - User-friendly error messages
 - Actionable guidance for common errors
+- Structured error handling:
+  - Posting operations use `outcome` type with Success/Partial_success/Failure
+  - Non-posting operations use `api_result` type with Ok/Error
 
 #### Architecture
 - CPS (Continuation Passing Style) implementation

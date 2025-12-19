@@ -1,3 +1,0 @@
-(test
- (name test_twitter_v1)
- (libraries social-twitter-v1 social-core yojson ptime ptime.clock.os str))

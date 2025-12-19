@@ -22,7 +22,6 @@ OCaml SDK for social media APIs. Post content, manage media, handle threads acro
 |---------|-------------|
 | `social-core` | Core interfaces and types (runtime-agnostic) |
 | `social-lwt` | Lwt runtime adapter with Cohttp |
-| `social-twitter-v1` | Twitter API v1.1 (OAuth 1.0a) |
 | `social-twitter-v2` | Twitter API v2 |
 | `social-bluesky-v1` | Bluesky/AT Protocol |
 | `social-linkedin-v2` | LinkedIn API v2 |
@@ -140,7 +139,6 @@ The SDK follows a runtime-agnostic design:
 | Bluesky | ✅ | ✅ | ✅ | ✅ | - | - | ⚠️ | ⚠️ |
 | LinkedIn | ✅ | ✅ | ✅ | - | - | - | ⚠️ | ⚠️ |
 | Mastodon | ✅ | ✅ | ✅ | ✅ | - | - | ⚠️ | ⚠️ |
-| Twitter v1 | ⚠️ | ⚠️ | ⚠️ | ⚠️ | - | - | ⚠️ | ⚠️ |
 | Facebook | ⚠️ | ⚠️ | ⚠️ | - | ⚠️ | ⚠️ | ⚠️ | ⚠️ |
 | Instagram | ⚠️ | ⚠️ | ⚠️ | - | ⚠️ | ⚠️ | ⚠️ | ⚠️ |
 | YouTube | ⚠️ | - | - | - | - | ⚠️ | ⚠️ | ⚠️ |

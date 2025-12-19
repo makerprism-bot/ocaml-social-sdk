@@ -33,19 +33,6 @@
   cohttp-lwt-unix))
 
 (package
- (name social-twitter-v1)
- (synopsis "Twitter API v1.1 client (OAuth 1.0a)")
- (description "Twitter API v1.1 client with OAuth 1.0a authentication. Supports posting tweets, threads, and media upload.")
- (depends
-  (ocaml (>= 4.14))
-  (dune (>= 3.0))
-  social-core
-  yojson
-  base64
-  ptime
-  (cryptokit (>= 1.16))))
-
-(package
  (name social-twitter-v2)
  (synopsis "Twitter API v2 client")
  (description "Twitter API v2 client. Supports posting tweets, threads, media upload, user lookup, and character counting.")

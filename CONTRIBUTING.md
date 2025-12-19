@@ -36,7 +36,6 @@ ocaml-social-sdk/
 ├── packages/
 │   ├── social-provider-core/     # Core abstractions
 │   ├── social-provider-lwt/      # Lwt runtime
-│   ├── social-twitter-v1/        # Twitter v1.1 API
 │   ├── social-twitter-v2/        # Twitter v2 API
 │   ├── social-bluesky-v1/        # Bluesky API
 │   ├── social-linkedin-v2/       # LinkedIn API

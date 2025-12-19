@@ -250,7 +250,7 @@ let test_ensure_valid_token_fresh () =
       match Mock_config.get_health_status "test_account" with
       | Some (_, "healthy", None) -> print_endline "✓ Ensure valid token (fresh)"
       | _ -> failwith "Health status not updated correctly")
-    (fun err -> failwith ("Ensure valid token failed: " ^ err))
+    (fun err -> failwith ("Ensure valid token failed: " ^ Error_types.error_to_string err))
 
 (** Test: Ensure valid token (expired token) *)
 let test_ensure_valid_token_expired () =
@@ -276,7 +276,8 @@ let test_ensure_valid_token_expired () =
   Facebook.ensure_valid_token ~account_id:"test_account"
     (fun _ -> failwith "Should fail with expired token")
     (fun err ->
-      assert (string_contains err "expired");
+      let err_str = Error_types.error_to_string err in
+      assert (string_contains err_str "expired");
       (* Verify health status was updated *)
       match Mock_config.get_health_status "test_account" with
       | Some (_, "token_expired", _) -> print_endline "✓ Ensure valid token (expired)"

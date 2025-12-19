@@ -581,8 +581,8 @@ module Make (Config : CONFIG) = struct
           | None ->
               Config.update_health_status ~account_id ~status:"token_expired" 
                 ~error_message:(Some "Token expired - please reconnect (LinkedIn tokens last 60 days)")
-                (fun () -> on_error "LinkedIn token expired - please reconnect your account")
-                on_error
+                (fun () -> on_error (Error_types.Auth_error Error_types.Token_expired))
+                (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
           | Some refresh_token ->
               let client_id = Config.get_env "LINKEDIN_CLIENT_ID" |> Option.value ~default:"" in
               let client_secret = Config.get_env "LINKEDIN_CLIENT_SECRET" |> Option.value ~default:"" in
@@ -600,8 +600,8 @@ module Make (Config : CONFIG) = struct
                     (fun () ->
                       Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
                         (fun () -> on_success new_access)
-                        on_error)
-                    on_error)
+                        (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
+                    (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
                 (fun err ->
                   let user_friendly_error = 
                     if String.length err > 100 && 
@@ -613,15 +613,15 @@ module Make (Config : CONFIG) = struct
                   in
                   Config.update_health_status ~account_id ~status:"refresh_failed" 
                     ~error_message:(Some user_friendly_error)
-                    (fun () -> on_error user_friendly_error)
-                    on_error)
+                    (fun () -> on_error (Error_types.Auth_error (Error_types.Refresh_failed user_friendly_error)))
+                    (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
         ) else (
           (* Token still valid *)
           Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
             (fun () -> on_success creds.access_token)
-            on_error
+            (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
         ))
-      on_error
+      (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
   
   (** Get person URN for posting *)
   let get_person_urn ~access_token on_success on_error =
@@ -873,12 +873,11 @@ module Make (Config : CONFIG) = struct
                             ~status_code:response.status ~body:response.body)))
                       (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
                         (Error_types.Connection_failed err)))))
-                  (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
-                    (Error_types.Connection_failed err)))))
-              (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
-                (Error_types.Connection_failed err)))))
-          (fun err -> on_result (Error_types.Failure (Error_types.Auth_error 
-            (Error_types.Refresh_failed err))))
+                   (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                     (Error_types.Connection_failed err)))))
+               (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
+                 (Error_types.Connection_failed err)))))
+           (fun err -> on_result (Error_types.Failure err))
   
   (** Post thread (LinkedIn doesn't support threads, posts only first item)
       
@@ -1089,7 +1088,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** {1 Posts API} *)
   
@@ -1139,7 +1138,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Get user's posts with pagination
       
@@ -1222,7 +1221,7 @@ module Make (Config : CONFIG) = struct
                   on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
               (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
           (fun err -> on_result (Error (Error_types.Internal_error err))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** {1 Scroller Pattern for Pagination} *)
   
@@ -1350,7 +1349,7 @@ module Make (Config : CONFIG) = struct
               else
                 on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
             (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** {1 Search API (FINDER Pattern)} *)
   
@@ -1445,7 +1444,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Create a scroller for post search *)
   let create_search_scroller ~account_id ?keywords ?author ?(page_size=10) () =
@@ -1524,7 +1523,7 @@ module Make (Config : CONFIG) = struct
                   on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
               (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
           (fun err -> on_result (Error (Error_types.Internal_error err))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Unlike a post
       
@@ -1555,7 +1554,7 @@ module Make (Config : CONFIG) = struct
                   on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
               (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
           (fun err -> on_result (Error (Error_types.Internal_error err))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Comment on a post
       
@@ -1601,7 +1600,7 @@ module Make (Config : CONFIG) = struct
                   on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
               (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
           (fun err -> on_result (Error (Error_types.Internal_error err))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Get comments on a post
       
@@ -1664,7 +1663,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
   
   (** Get engagement statistics for a post
       
@@ -1701,5 +1700,5 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
-      (fun err -> on_result (Error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+      (fun err -> on_result (Error err))
 end

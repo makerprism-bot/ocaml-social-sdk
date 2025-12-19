@@ -201,7 +201,7 @@ let test_delete_status () =
       success_called := true;
       Printf.printf "✓\n")
     (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
+      Printf.printf "✗ Error: %s\n" (Error_types.error_to_string err);
       assert false);
   assert !success_called
 
@@ -217,7 +217,7 @@ let test_edit_status () =
       success_called := true;
       Printf.printf "✓ (edited_id: %s)\n" edited_id)
     (fun err ->
-      Printf.printf "✗ Error: %s\n" err;
+      Printf.printf "✗ Error: %s\n" (Error_types.error_to_string err);
       assert false);
   assert !success_called
 

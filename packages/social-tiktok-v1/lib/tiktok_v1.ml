@@ -613,8 +613,8 @@ module Make (Config : CONFIG) = struct
           | None ->
               Config.update_health_status ~account_id ~status:"token_expired"
                 ~error_message:(Some "No refresh token available")
-                (fun () -> on_error "No refresh token - please reconnect TikTok account")
-                on_error
+                (fun () -> on_error (Error_types.Auth_error Error_types.Missing_credentials))
+                (fun _ -> on_error (Error_types.Auth_error Error_types.Missing_credentials))
           | Some rt ->
               refresh_access_token ~refresh_token:rt
                 (fun (new_access, new_refresh, expires_at) ->
@@ -628,18 +628,18 @@ module Make (Config : CONFIG) = struct
                     (fun () ->
                       Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
                         (fun () -> on_success new_access)
-                        on_error)
-                    on_error)
+                        (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
+                    (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
                 (fun err ->
                   Config.update_health_status ~account_id ~status:"refresh_failed"
                     ~error_message:(Some err)
-                    (fun () -> on_error err)
-                    on_error)
+                    (fun () -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err)))
+                    (fun _ -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err))))
         else
           Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
             (fun () -> on_success creds.access_token)
-            on_error)
-      on_error
+            (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
+      (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
   
   (** Query creator info to get available privacy options *)
   let get_creator_info ~account_id on_result =
@@ -659,7 +659,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
           (fun err -> on_result (Error (Error_types.Internal_error err))))
-      (fun err -> on_result (Error (Error_types.Internal_error err)))
+      (fun err -> on_result (Error err))
   
   (** Initialize video upload and get upload URL *)
   let init_video_upload ~account_id ~post_info ~video_size on_result =
@@ -694,7 +694,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
           (fun err -> on_result (Error (Error_types.Internal_error err))))
-      (fun err -> on_result (Error (Error_types.Internal_error err)))
+      (fun err -> on_result (Error err))
   
   (** Upload video content to the upload URL *)
   let upload_video_chunk ~upload_url ~video_content on_result =
@@ -733,7 +733,7 @@ module Make (Config : CONFIG) = struct
             else
               on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
           (fun err -> on_result (Error (Error_types.Internal_error err))))
-      (fun err -> on_result (Error (Error_types.Internal_error err)))
+      (fun err -> on_result (Error err))
   
   (** Post a video to TikTok (high-level function)
       

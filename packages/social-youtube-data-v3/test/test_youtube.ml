@@ -235,7 +235,7 @@ let test_ensure_valid_token_fresh () =
     (fun token ->
       assert (token = "valid_token");
       print_endline "✓ Ensure valid token (fresh)")
-    (fun err -> failwith ("Ensure valid token failed: " ^ err))
+    (fun err -> failwith ("Ensure valid token failed: " ^ Error_types.error_to_string err))
 
 (** Test: Ensure valid token (expired, needs refresh) *)
 let test_ensure_valid_token_expired () =
@@ -272,7 +272,7 @@ let test_ensure_valid_token_expired () =
     (fun token ->
       assert (token = "refreshed_token");
       print_endline "✓ Ensure valid token (auto-refresh)")
-    (fun err -> failwith ("Ensure valid token failed: " ^ err))
+    (fun err -> failwith ("Ensure valid token failed: " ^ Error_types.error_to_string err))
 
 (** Test: Post requires video *)
 let test_post_requires_video () =

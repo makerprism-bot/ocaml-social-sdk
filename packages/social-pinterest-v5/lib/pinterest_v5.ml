@@ -401,8 +401,8 @@ module Make (Config : CONFIG) = struct
       (fun creds ->
         Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
           (fun () -> on_success creds.access_token)
-          on_error)
-      on_error
+          (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
+      (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
   
   (** Get user's default board *)
   let get_default_board ~access_token on_success on_error =
@@ -525,7 +525,7 @@ module Make (Config : CONFIG) = struct
                       (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
                   (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
               (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
-          (fun err -> on_result (Error_types.Failure (Error_types.Auth_error (Error_types.Refresh_failed err))))
+          (fun err -> on_result (Error_types.Failure err))
   
   (** Post thread (Pinterest doesn't support threads, posts only first item) *)
   let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_result =

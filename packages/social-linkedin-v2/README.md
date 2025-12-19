@@ -175,12 +175,13 @@ let post_with_image account_id =
 ```ocaml
 (* Fetch current user's profile *)
 LinkedIn.get_profile ~account_id
-  (fun profile ->
-    Printf.printf "User ID: %s\n" profile.sub;
-    Printf.printf "Name: %s\n" (Option.value profile.name ~default:"N/A");
-    Printf.printf "Email: %s\n" (Option.value profile.email ~default:"N/A");
-    ())
-  (fun err -> Printf.eprintf "Error: %s\n" err)
+  (function
+    | Ok profile ->
+        Printf.printf "User ID: %s\n" profile.sub;
+        Printf.printf "Name: %s\n" (Option.value profile.name ~default:"N/A");
+        Printf.printf "Email: %s\n" (Option.value profile.email ~default:"N/A")
+    | Error err -> 
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Fetch User Posts with Pagination
@@ -188,22 +189,23 @@ LinkedIn.get_profile ~account_id
 ```ocaml
 (* Get first page of posts *)
 LinkedIn.get_posts ~account_id ~start:0 ~count:10
-  (fun collection ->
-    List.iter (fun post ->
-      Printf.printf "Post ID: %s\n" post.id;
-      Option.iter (Printf.printf "Text: %s\n") post.text;
-    ) collection.elements;
-    
-    (* Check pagination info *)
-    match collection.paging with
-    | Some p -> 
-        Printf.printf "Showing %d-%d of %s\n" 
-          p.start 
-          (p.start + p.count)
-          (match p.total with Some t -> string_of_int t | None -> "unknown");
-    | None -> ();
-    ())
-  (fun err -> Printf.eprintf "Error: %s\n" err)
+  (function
+    | Ok collection ->
+        List.iter (fun post ->
+          Printf.printf "Post ID: %s\n" post.id;
+          Option.iter (Printf.printf "Text: %s\n") post.text;
+        ) collection.elements;
+        
+        (* Check pagination info *)
+        (match collection.paging with
+        | Some p -> 
+            Printf.printf "Showing %d-%d of %s\n" 
+              p.start 
+              (p.start + p.count)
+              (match p.total with Some t -> string_of_int t | None -> "unknown")
+        | None -> ())
+    | Error err -> 
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Using Scrollers for Easy Pagination
@@ -214,25 +216,29 @@ let scroller = LinkedIn.create_posts_scroller ~account_id ~page_size:5 () in
 
 (* Scroll to next page *)
 scroller.scroll_next
-  (fun page ->
-    List.iter (fun post ->
-      Printf.printf "Post: %s\n" post.id;
-    ) page.elements;
-    
-    Printf.printf "Current position: %d\n" (scroller.current_position ());
-    Printf.printf "Has more: %b\n" (scroller.has_more ());
-    
-    (* Can continue scrolling *)
-    if scroller.has_more () then
-      scroller.scroll_next handle_page handle_error
-    else
-      Printf.printf "No more posts\n")
-  (fun err -> Printf.eprintf "Error: %s\n" err)
+  (function
+    | Ok page ->
+        List.iter (fun post ->
+          Printf.printf "Post: %s\n" post.id;
+        ) page.elements;
+        
+        Printf.printf "Current position: %d\n" (scroller.current_position ());
+        Printf.printf "Has more: %b\n" (scroller.has_more ());
+        
+        (* Can continue scrolling *)
+        if scroller.has_more () then
+          scroller.scroll_next handle_page
+        else
+          Printf.printf "No more posts\n"
+    | Error err -> 
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Scroll back *)
 scroller.scroll_back
-  (fun page -> (* Handle previous page *) ())
-  (fun err -> Printf.eprintf "Error: %s\n" err)
+  (function
+    | Ok page -> (* Handle previous page *) ()
+    | Error err -> 
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Get Specific Post
@@ -240,12 +246,13 @@ scroller.scroll_back
 ```ocaml
 (* Fetch a single post by URN *)
 LinkedIn.get_post ~account_id ~post_urn:"urn:li:share:123456"
-  (fun post ->
-    Printf.printf "Post ID: %s\n" post.id;
-    Printf.printf "Author: %s\n" post.author;
-    Option.iter (Printf.printf "Text: %s\n") post.text;
-    ())
-  (fun err -> Printf.eprintf "Error: %s\n" err)
+  (function
+    | Ok post ->
+        Printf.printf "Post ID: %s\n" post.id;
+        Printf.printf "Author: %s\n" post.author;
+        Option.iter (Printf.printf "Text: %s\n") post.text
+    | Error err -> 
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Batch Get Multiple Posts
@@ -259,15 +266,16 @@ let post_urns = [
 ] in
 
 LinkedIn.batch_get_posts ~account_id ~post_urns
-  (fun posts ->
-    Printf.printf "Retrieved %d posts\n" (List.length posts);
-    List.iter (fun post ->
-      Printf.printf "- %s: %s\n" 
-        post.id 
-        (Option.value post.text ~default:"(no text)");
-    ) posts;
-    ())
-  (fun err -> Printf.eprintf "Error: %s\n" err)
+  (function
+    | Ok posts ->
+        Printf.printf "Retrieved %d posts\n" (List.length posts);
+        List.iter (fun post ->
+          Printf.printf "- %s: %s\n" 
+            post.id 
+            (Option.value post.text ~default:"(no text)");
+        ) posts
+    | Error err -> 
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Search Posts (FINDER Pattern)
@@ -275,21 +283,24 @@ LinkedIn.batch_get_posts ~account_id ~post_urns
 ```ocaml
 (* Search posts by keywords *)
 LinkedIn.search_posts ~account_id ~keywords:"OCaml" ~start:0 ~count:10
-  (fun collection ->
-    Printf.printf "Found %d posts\n" (List.length collection.elements);
-    List.iter (fun post ->
-      Printf.printf "- %s\n" (Option.value post.text ~default:"(no text)");
-    ) collection.elements;
-    ())
-  (fun err -> Printf.eprintf "Error: %s\n" err)
+  (function
+    | Ok collection ->
+        Printf.printf "Found %d posts\n" (List.length collection.elements);
+        List.iter (fun post ->
+          Printf.printf "- %s\n" (Option.value post.text ~default:"(no text)");
+        ) collection.elements
+    | Error err -> 
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Use scroller for search *)
 let search_scroller = LinkedIn.create_search_scroller 
   ~account_id ~keywords:"functional programming" ~page_size:5 () in
 
 search_scroller.scroll_next
-  (fun page -> (* Handle search results *) ())
-  (fun err -> (* Handle error *) ())
+  (function
+    | Ok page -> (* Handle search results *) ()
+    | Error err -> 
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Engagement APIs
@@ -297,41 +308,47 @@ search_scroller.scroll_next
 ```ocaml
 (* Like a post *)
 LinkedIn.like_post ~account_id ~post_urn:"urn:li:share:123"
-  (fun () -> Printf.printf "Liked!\n")
-  (fun err -> Printf.eprintf "Error: %s\n" err)
+  (function
+    | Ok () -> Printf.printf "Liked!\n"
+    | Error err -> 
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Unlike a post *)
 LinkedIn.unlike_post ~account_id ~post_urn:"urn:li:share:123"
-  (fun () -> Printf.printf "Unliked!\n")
-  (fun err -> Printf.eprintf "Error: %s\n" err)
+  (function
+    | Ok () -> Printf.printf "Unliked!\n"
+    | Error err -> 
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Comment on a post *)
 LinkedIn.comment_on_post 
   ~account_id 
   ~post_urn:"urn:li:share:123"
   ~text:"Great insights!"
-  (fun comment_id ->
-    Printf.printf "Comment posted: %s\n" comment_id;
-    ())
-  (fun err -> Printf.eprintf "Error: %s\n" err)
+  (function
+    | Ok comment_id -> Printf.printf "Comment posted: %s\n" comment_id
+    | Error err -> 
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Get comments on a post *)
 LinkedIn.get_post_comments ~account_id ~post_urn:"urn:li:share:123"
-  (fun collection ->
-    List.iter (fun comment ->
-      Printf.printf "%s: %s\n" comment.actor comment.text;
-    ) collection.elements;
-    ())
-  (fun err -> Printf.eprintf "Error: %s\n" err)
+  (function
+    | Ok collection ->
+        List.iter (fun comment ->
+          Printf.printf "%s: %s\n" comment.actor comment.text;
+        ) collection.elements
+    | Error err -> 
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Get engagement statistics *)
 LinkedIn.get_post_engagement ~account_id ~post_urn:"urn:li:share:123"
-  (fun stats ->
-    Option.iter (Printf.printf "Likes: %d\n") stats.like_count;
-    Option.iter (Printf.printf "Comments: %d\n") stats.comment_count;
-    Option.iter (Printf.printf "Shares: %d\n") stats.share_count;
-    ())
-  (fun err -> Printf.eprintf "Error: %s\n" err)
+  (function
+    | Ok stats ->
+        Option.iter (Printf.printf "Likes: %d\n") stats.like_count;
+        Option.iter (Printf.printf "Comments: %d\n") stats.comment_count;
+        Option.iter (Printf.printf "Shares: %d\n") stats.share_count
+    | Error err -> 
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Validate Content

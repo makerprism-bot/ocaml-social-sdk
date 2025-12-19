@@ -116,8 +116,11 @@ Twitter.get_tweet
   ~expansions:["author_id"; "referenced_tweets.id"]
   ~tweet_fields:["created_at"; "public_metrics"]
   ()
-  (fun json -> (* Process tweet data *))
-  on_error
+  (function
+    | Ok json -> (* Process tweet data *)
+        Printf.printf "Tweet: %s\n" (Yojson.Basic.to_string json)
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Search tweets with pagination *)
 Twitter.search_tweets
@@ -126,14 +129,16 @@ Twitter.search_tweets
   ~max_results:50
   ~next_token:(Some "pagination_token")
   ()
-  (fun json -> 
-    (* Get pagination info *)
-    let meta = Twitter.parse_pagination_meta json in
-    (* Continue with next page if available *)
-    match meta.next_token with
-    | Some token -> (* Fetch next page *)
-    | None -> (* No more results *))
-  on_error
+  (function
+    | Ok json -> 
+        (* Get pagination info *)
+        let meta = Twitter.parse_pagination_meta json in
+        (* Continue with next page if available *)
+        (match meta.next_token with
+        | Some token -> (* Fetch next page *) ()
+        | None -> (* No more results *) ())
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Post a thread *)
 Twitter.post_thread
@@ -155,11 +160,13 @@ Twitter.get_mentions_timeline
   ~max_results:50
   ~tweet_fields:["created_at"; "public_metrics"]
   ()
-  (fun json ->
-    let open Yojson.Basic.Util in
-    let mentions = json |> member "data" |> to_list in
-    Printf.printf "You have %d mentions\n" (List.length mentions))
-  on_error
+  (function
+    | Ok json ->
+        let open Yojson.Basic.Util in
+        let mentions = json |> member "data" |> to_list in
+        Printf.printf "You have %d mentions\n" (List.length mentions)
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Get home timeline *)
 Twitter.get_home_timeline
@@ -167,8 +174,11 @@ Twitter.get_home_timeline
   ~max_results:20
   ~expansions:["author_id"]
   ()
-  (fun json -> (* Process home feed *))
-  on_error
+  (function
+    | Ok json -> (* Process home feed *)
+        Printf.printf "Home: %s\n" (Yojson.Basic.to_string json)
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### User Operations
@@ -180,36 +190,48 @@ Twitter.get_user_by_username
   ~username:"elonmusk"
   ~user_fields:["public_metrics"; "description"; "verified"]
   ()
-  (fun json -> (* Process user data *))
-  on_error
+  (function
+    | Ok json -> (* Process user data *)
+        Printf.printf "User: %s\n" (Yojson.Basic.to_string json)
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Get authenticated user *)
 Twitter.get_me
   ~account_id:"my_account"
   ()
-  (fun json -> (* Your user data *))
-  on_error
+  (function
+    | Ok json -> (* Your user data *)
+        Printf.printf "Me: %s\n" (Yojson.Basic.to_string json)
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Follow a user *)
 Twitter.follow_user
   ~account_id:"my_account"
   ~target_user_id:"123456789"
-  (fun () -> print_endline "Following!")
-  on_error
+  (function
+    | Ok () -> print_endline "Following!"
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Block a user *)
 Twitter.block_user
   ~account_id:"my_account"
   ~target_user_id:"987654321"
-  (fun () -> print_endline "Blocked!")
-  on_error
+  (function
+    | Ok () -> print_endline "Blocked!"
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Mute a user *)
 Twitter.mute_user
   ~account_id:"my_account"
   ~target_user_id:"987654321"
-  (fun () -> print_endline "Muted!")
-  on_error
+  (function
+    | Ok () -> print_endline "Muted!"
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Get followers *)
 Twitter.get_followers
@@ -218,11 +240,13 @@ Twitter.get_followers
   ~max_results:100
   ~user_fields:["public_metrics"; "verified"]
   ()
-  (fun json ->
-    let open Yojson.Basic.Util in
-    let followers = json |> member "data" |> to_list in
-    Printf.printf "Found %d followers\n" (List.length followers))
-  on_error
+  (function
+    | Ok json ->
+        let open Yojson.Basic.Util in
+        let followers = json |> member "data" |> to_list in
+        Printf.printf "Found %d followers\n" (List.length followers)
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Get following *)
 Twitter.get_following
@@ -230,8 +254,11 @@ Twitter.get_following
   ~user_id:"123456789"
   ~max_results:100
   ()
-  (fun json -> (* Process following list *))
-  on_error
+  (function
+    | Ok json -> (* Process following list *)
+        Printf.printf "Following: %s\n" (Yojson.Basic.to_string json)
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Engagement Operations
@@ -241,40 +268,56 @@ Twitter.get_following
 Twitter.like_tweet
   ~account_id:"my_account"
   ~tweet_id:"123456789"
-  (fun () -> print_endline "Liked!")
-  on_error
+  (function
+    | Ok () -> print_endline "Liked!"
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Retweet *)
 Twitter.retweet
   ~account_id:"my_account"
   ~tweet_id:"123456789"
-  (fun () -> print_endline "Retweeted!")
-  on_error
+  (function
+    | Ok () -> print_endline "Retweeted!"
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
-(* Quote tweet *)
+(* Quote tweet - uses outcome type for posting *)
 Twitter.quote_tweet
   ~account_id:"my_account"
   ~text:"Great insight!"
   ~quoted_tweet_id:"123456789"
   ~media_urls:[]
-  (fun tweet_id -> Printf.printf "Quote posted: %s\n" tweet_id)
-  on_error
+  (function
+    | Social_core.Error_types.Success tweet_id -> 
+        Printf.printf "Quote posted: %s\n" tweet_id
+    | Social_core.Error_types.Partial_success { result = tweet_id; warnings } ->
+        Printf.printf "Quote posted: %s with %d warnings\n" tweet_id (List.length warnings)
+    | Social_core.Error_types.Failure err ->
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
-(* Reply to tweet *)
+(* Reply to tweet - uses outcome type for posting *)
 Twitter.reply_to_tweet
   ~account_id:"my_account"
   ~text:"Thanks for sharing!"
   ~reply_to_tweet_id:"123456789"
   ~media_urls:[]
-  (fun tweet_id -> Printf.printf "Reply posted: %s\n" tweet_id)
-  on_error
+  (function
+    | Social_core.Error_types.Success tweet_id -> 
+        Printf.printf "Reply posted: %s\n" tweet_id
+    | Social_core.Error_types.Partial_success { result = tweet_id; warnings } ->
+        Printf.printf "Reply posted: %s with %d warnings\n" tweet_id (List.length warnings)
+    | Social_core.Error_types.Failure err ->
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Bookmark tweet *)
 Twitter.bookmark_tweet
   ~account_id:"my_account"
   ~tweet_id:"123456789"
-  (fun () -> print_endline "Bookmarked!")
-  on_error
+  (function
+    | Ok () -> print_endline "Bookmarked!"
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Media Upload
@@ -314,19 +357,23 @@ Twitter.create_list
   ~description:(Some "Amazing OCaml developers to follow")
   ~private_list:false
   ()
-  (fun json ->
-    let open Yojson.Basic.Util in
-    let list_id = json |> member "data" |> member "id" |> to_string in
-    Printf.printf "Created list: %s\n" list_id)
-  on_error
+  (function
+    | Ok json ->
+        let open Yojson.Basic.Util in
+        let list_id = json |> member "data" |> member "id" |> to_string in
+        Printf.printf "Created list: %s\n" list_id
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Add members to list *)
 Twitter.add_list_member
   ~account_id:"my_account"
   ~list_id:"list123"
   ~user_id:"user456"
-  (fun () -> print_endline "Member added!")
-  on_error
+  (function
+    | Ok () -> print_endline "Member added!"
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Get list tweets *)
 Twitter.get_list_tweets
@@ -335,22 +382,29 @@ Twitter.get_list_tweets
   ~max_results:50
   ~tweet_fields:["created_at"; "public_metrics"]
   ()
-  (fun json -> (* Process tweets from list *))
-  on_error
+  (function
+    | Ok json -> (* Process tweets from list *)
+        Printf.printf "List tweets: %s\n" (Yojson.Basic.to_string json)
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Follow a list *)
 Twitter.follow_list
   ~account_id:"my_account"
   ~list_id:"list123"
-  (fun () -> print_endline "Following list!")
-  on_error
+  (function
+    | Ok () -> print_endline "Following list!"
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Pin a list *)
 Twitter.pin_list
   ~account_id:"my_account"
   ~list_id:"list123"
-  (fun () -> print_endline "List pinned!")
-  on_error
+  (function
+    | Ok () -> print_endline "List pinned!"
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### User Search
@@ -363,11 +417,13 @@ Twitter.search_users
   ~max_results:20
   ~user_fields:["description"; "public_metrics"]
   ()
-  (fun json ->
-    let open Yojson.Basic.Util in
-    let users = json |> member "data" |> to_list in
-    Printf.printf "Found %d users\n" (List.length users))
-  on_error
+  (function
+    | Ok json ->
+        let open Yojson.Basic.Util in
+        let users = json |> member "data" |> to_list in
+        Printf.printf "Found %d users\n" (List.length users)
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### OAuth 2.0 Flow

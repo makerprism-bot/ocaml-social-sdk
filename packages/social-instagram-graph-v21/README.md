@@ -122,10 +122,13 @@ let post_reel account_id =
   let video_url = "https://cdn.example.com/reel.mp4" in
   
   Instagram.post_reel ~account_id ~text ~video_url
-    (fun media_id ->
-      Printf.printf "Reel posted: %s\n" media_id;
-      ())
-    (fun err -> Printf.eprintf "Error: %s\n" err)
+    (function
+      | Social_core.Error_types.Success media_id ->
+          Printf.printf "Reel posted: %s\n" media_id
+      | Social_core.Error_types.Partial_success { result = media_id; warnings } ->
+          Printf.printf "Reel posted: %s (with %d warnings)\n" media_id (List.length warnings)
+      | Social_core.Error_types.Failure err ->
+          Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ## Two-Step Publishing Process

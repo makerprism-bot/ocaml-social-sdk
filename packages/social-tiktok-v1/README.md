@@ -48,14 +48,13 @@ let () = exchange_code_for_token
 ### Query Creator Info (Required Before Posting)
 
 ```ocaml
-let () = query_creator_info
-  ~access_token
-  ~http_post
-  ~on_success:(fun info ->
-    Printf.printf "Max duration: %d seconds\n" info.max_video_post_duration_sec;
-    Printf.printf "Privacy options: %d\n" (List.length info.privacy_level_options)
-  )
-  ~on_error:(fun err -> print_endline err)
+TikTok.get_creator_info ~account_id
+  (function
+    | Ok info ->
+        Printf.printf "Max duration: %d seconds\n" info.max_video_post_duration_sec;
+        Printf.printf "Privacy options: %d\n" (List.length info.privacy_level_options)
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Post a Video (FILE_UPLOAD)
@@ -101,17 +100,16 @@ let () = init_video_upload_url
 ### Check Publish Status
 
 ```ocaml
-let () = get_publish_status
-  ~access_token
-  ~publish_id
-  ~http_post
-  ~on_success:(function
-    | Processing -> print_endline "Still processing..."
-    | Published video_id -> Printf.printf "Published! ID: %s\n" video_id
-    | Failed { error_code; error_message } ->
-        Printf.printf "Failed: %s - %s\n" error_code error_message
-  )
-  ~on_error:(fun err -> print_endline err)
+TikTok.check_publish_status ~account_id ~publish_id
+  (function
+    | Ok status ->
+        (match status with
+        | Processing -> print_endline "Still processing..."
+        | Published video_id -> Printf.printf "Published! ID: %s\n" video_id
+        | Failed { error_code; error_message } ->
+            Printf.printf "Failed: %s - %s\n" error_code error_message)
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ## Video Constraints

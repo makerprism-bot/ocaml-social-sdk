@@ -178,8 +178,10 @@ Make a GET request to any Graph API endpoint.
 ```ocaml
 (* Get user info with specific fields *)
 Facebook.get ~path:"me" ~access_token ~fields:["id"; "name"; "email"]
-  (fun response -> Printf.printf "Response: %s\n" response.body)
-  (fun err -> Printf.eprintf "Error: %s\n" err)
+  (function
+    | Ok response -> Printf.printf "Response: %s\n" response.body
+    | Error err -> 
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 #### `get_page ~path ~access_token ?fields ?cursor parse_data`
@@ -194,23 +196,24 @@ let parse_posts json =
 in
 
 Facebook.get_page ~path:"me/posts" ~access_token parse_posts
-  (fun page ->
-    List.iter (function
-      | Some msg -> Printf.printf "Post: %s\n" msg
-      | None -> ()
-    ) page.data;
-    
-    (* Fetch next page if available *)
-    match page.paging with
-    | Some cursors ->
-        (match cursors.after with
-         | Some cursor ->
-             Facebook.get_next_page ~path:"me/posts" ~access_token 
-               ~cursor parse_posts on_success on_error
-         | None -> ())
-    | None -> ()
-  )
-  (fun err -> Printf.eprintf "Error: %s\n" err)
+  (function
+    | Ok page ->
+        List.iter (function
+          | Some msg -> Printf.printf "Post: %s\n" msg
+          | None -> ()
+        ) page.data;
+        
+        (* Fetch next page if available *)
+        (match page.paging with
+        | Some cursors ->
+            (match cursors.after with
+             | Some cursor ->
+                 Facebook.get_next_page ~path:"me/posts" ~access_token 
+                   ~cursor parse_posts handle_result
+             | None -> ())
+        | None -> ())
+    | Error err -> 
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 #### `post ~path ~access_token ~params`
@@ -223,8 +226,10 @@ let params = [
 ] in
 
 Facebook.post ~path:"me/feed" ~access_token ~params
-  (fun response -> Printf.printf "Posted: %s\n" response.body)
-  (fun err -> Printf.eprintf "Error: %s\n" err)
+  (function
+    | Ok response -> Printf.printf "Posted: %s\n" response.body
+    | Error err -> 
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 #### `delete ~path ~access_token`
@@ -232,8 +237,10 @@ Delete a Graph API object.
 
 ```ocaml
 Facebook.delete ~path:"123456_post_id" ~access_token
-  (fun response -> print_endline "Post deleted")
-  (fun err -> Printf.eprintf "Error: %s\n" err)
+  (function
+    | Ok response -> print_endline "Post deleted"
+    | Error err -> 
+        Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 #### `batch_request ~requests ~access_token`
@@ -252,12 +259,14 @@ let requests = [
 ] in
 
 Facebook.batch_request ~requests ~access_token
-  (fun results ->
-    List.iteri (fun i result ->
-      Printf.printf "Request %d: HTTP %d\n%s\n" 
-        i result.code result.body
-    ) results)
-  (fun err -> Printf.eprintf "Batch failed: %s\n" err)
+  (function
+    | Ok results ->
+        List.iteri (fun i result ->
+          Printf.printf "Request %d: HTTP %d\n%s\n" 
+            i result.code result.body
+        ) results
+    | Error err -> 
+        Printf.eprintf "Batch failed: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Error Handling

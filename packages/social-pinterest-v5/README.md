@@ -72,25 +72,31 @@ Pinterest.create_board
   ~name:"My Recipe Collection"
   ~description:(Some "Delicious recipes I want to try")
   ~privacy:"PUBLIC"  (* or "PRIVATE" *)
-  (fun board_id -> Printf.printf "Created board: %s\n" board_id)
-  handle_error
+  (function
+    | Ok board_id -> Printf.printf "Created board: %s\n" board_id
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Get board by name or ID *)
 Pinterest.get_board
   ~access_token:token
   ~board_identifier:"My Recipe Collection"  (* works with name or ID *)
-  (fun board -> Printf.printf "Found board: %s (ID: %s)\n" board.name board.id)
-  handle_error
+  (function
+    | Ok board -> Printf.printf "Found board: %s (ID: %s)\n" board.name board.id
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Get all boards with pagination *)
 Pinterest.get_all_boards
   ~access_token:token
   ~page_size:50
-  (fun boards -> 
-    List.iter (fun b -> 
-      Printf.printf "- %s (%s)\n" b.name b.id
-    ) boards)
-  handle_error
+  (function
+    | Ok boards -> 
+        List.iter (fun b -> 
+          Printf.printf "- %s (%s)\n" b.name b.id
+        ) boards
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 #### Search Functionality
@@ -102,10 +108,12 @@ Pinterest.search
   ~query:"vegan recipes"
   ~scope:Pins
   ?bookmark:None  (* for pagination *)
-  (fun results -> 
-    (* Process search results as JSON *)
-    process_results results)
-  handle_error
+  (function
+    | Ok results -> 
+        (* Process search results as JSON *)
+        process_results results
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Search scopes available: *)
 (* - Pins: Search all pins *)
@@ -122,22 +130,26 @@ Pinterest.search
 Pinterest.get_user_profile
   ~access_token:token
   ?username:None  (* None = current user *)
-  (fun profile ->
-    Printf.printf "User: %s\n" profile.username;
-    Printf.printf "Followers: %d\n" profile.follower_count;
-    Printf.printf "Boards: %d\n" profile.board_count;
-    Printf.printf "Monthly views: %s\n" 
-      (match profile.monthly_views with
-       | Some v -> string_of_int v
-       | None -> "N/A"))
-  handle_error
+  (function
+    | Ok profile ->
+        Printf.printf "User: %s\n" profile.username;
+        Printf.printf "Followers: %d\n" profile.follower_count;
+        Printf.printf "Boards: %d\n" profile.board_count;
+        Printf.printf "Monthly views: %s\n" 
+          (match profile.monthly_views with
+           | Some v -> string_of_int v
+           | None -> "N/A")
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Get specific user profile *)
 Pinterest.get_user_profile
   ~access_token:token
   ~username:(Some "pinterest")
-  handle_profile
-  handle_error
+  (function
+    | Ok profile -> (* handle profile *) ()
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 #### Bulk Pin Creation
@@ -153,13 +165,15 @@ let pins = [
 Pinterest.create_pins_bulk
   ~access_token:token
   ~pins
-  (fun result ->
-    Printf.printf "Success: %d pins created\n" (List.length result.successful);
-    Printf.printf "Failed: %d pins\n" (List.length result.failed);
-    List.iter (fun (id, err) -> 
-      Printf.eprintf "  Pin %s failed: %s\n" id err
-    ) result.failed)
-  handle_error
+  (function
+    | Ok result ->
+        Printf.printf "Success: %d pins created\n" (List.length result.successful);
+        Printf.printf "Failed: %d pins\n" (List.length result.failed);
+        List.iter (fun (id, err) -> 
+          Printf.eprintf "  Pin %s failed: %s\n" id err
+        ) result.failed
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 #### Structured Error Handling

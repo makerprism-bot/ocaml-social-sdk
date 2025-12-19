@@ -215,30 +215,34 @@ Bluesky.like_post
   ~account_id:"my_account"
   ~post_uri:"at://did:plc:xyz/app.bsky.feed.post/abc123"
   ~post_cid:"bafyreiabc123"
-  (fun like_uri -> Printf.printf "Liked: %s\n" like_uri)
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Ok like_uri -> Printf.printf "Liked: %s\n" like_uri
+    | Error err -> Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Unlike a post *)
 Bluesky.unlike_post
   ~account_id:"my_account"
   ~like_uri:"at://did:plc:xyz/app.bsky.feed.like/def456"
-  (fun () -> Printf.printf "Unliked\n")
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Ok () -> Printf.printf "Unliked\n"
+    | Error err -> Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Repost *)
 Bluesky.repost
   ~account_id:"my_account"
   ~post_uri:"at://did:plc:xyz/app.bsky.feed.post/abc123"
   ~post_cid:"bafyreiabc123"
-  (fun repost_uri -> Printf.printf "Reposted: %s\n" repost_uri)
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Ok repost_uri -> Printf.printf "Reposted: %s\n" repost_uri
+    | Error err -> Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Unrepost *)
 Bluesky.unrepost
   ~account_id:"my_account"
   ~repost_uri:"at://did:plc:xyz/app.bsky.feed.repost/ghi789"
-  (fun () -> Printf.printf "Unreposted\n")
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Ok () -> Printf.printf "Unreposted\n"
+    | Error err -> Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Social Graph
@@ -248,15 +252,17 @@ Bluesky.unrepost
 Bluesky.follow
   ~account_id:"my_account"
   ~did:"did:plc:xyz123abc"
-  (fun follow_uri -> Printf.printf "Following: %s\n" follow_uri)
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Ok follow_uri -> Printf.printf "Following: %s\n" follow_uri
+    | Error err -> Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Unfollow a user *)
 Bluesky.unfollow
   ~account_id:"my_account"
   ~follow_uri:"at://did:plc:xyz/app.bsky.graph.follow/abc123"
-  (fun () -> Printf.printf "Unfollowed\n")
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Ok () -> Printf.printf "Unfollowed\n"
+    | Error err -> Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Read Operations
@@ -266,50 +272,50 @@ Bluesky.unfollow
 Bluesky.get_profile
   ~account_id:"my_account"
   ~actor:"alice.bsky.social"
-  (fun json ->
-    Printf.printf "Profile: %s\n" (Yojson.Basic.to_string json))
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Ok json -> Printf.printf "Profile: %s\n" (Yojson.Basic.to_string json)
+    | Error err -> Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Get a thread *)
 Bluesky.get_post_thread
   ~account_id:"my_account"
   ~post_uri:"at://did:plc:xyz/app.bsky.feed.post/abc123"
-  (fun json -> 
-    Printf.printf "Thread: %s\n" (Yojson.Basic.to_string json))
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Ok json -> Printf.printf "Thread: %s\n" (Yojson.Basic.to_string json)
+    | Error err -> Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Get timeline *)
 Bluesky.get_timeline
   ~account_id:"my_account"
   ~limit:50
-  (fun json ->
-    Printf.printf "Timeline: %s\n" (Yojson.Basic.to_string json))
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Ok json -> Printf.printf "Timeline: %s\n" (Yojson.Basic.to_string json)
+    | Error err -> Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Get author feed *)
 Bluesky.get_author_feed
   ~account_id:"my_account"
   ~actor:"alice.bsky.social"
   ~limit:20
-  (fun json ->
-    Printf.printf "Author feed: %s\n" (Yojson.Basic.to_string json))
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Ok json -> Printf.printf "Author feed: %s\n" (Yojson.Basic.to_string json)
+    | Error err -> Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Get likes for a post *)
 Bluesky.get_likes
   ~account_id:"my_account"
   ~post_uri:"at://did:plc:xyz/app.bsky.feed.post/abc123"
-  (fun json ->
-    Printf.printf "Likes: %s\n" (Yojson.Basic.to_string json))
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Ok json -> Printf.printf "Likes: %s\n" (Yojson.Basic.to_string json)
+    | Error err -> Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Get followers *)
 Bluesky.get_followers
   ~account_id:"my_account"
   ~actor:"alice.bsky.social"
-  (fun json ->
-    Printf.printf "Followers: %s\n" (Yojson.Basic.to_string json))
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Ok json -> Printf.printf "Followers: %s\n" (Yojson.Basic.to_string json)
+    | Error err -> Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Quote Posts
@@ -353,21 +359,23 @@ Bluesky.quote_post
 Bluesky.list_notifications
   ~account_id:"my_account"
   ~limit:20
-  (fun json ->
-    Printf.printf "Notifications: %s\n" (Yojson.Basic.to_string json))
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Ok json -> Printf.printf "Notifications: %s\n" (Yojson.Basic.to_string json)
+    | Error err -> Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Count unread *)
 Bluesky.count_unread_notifications
   ~account_id:"my_account"
-  (fun count -> Printf.printf "Unread: %d\n" count)
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Ok count -> Printf.printf "Unread: %d\n" count
+    | Error err -> Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Mark as seen *)
 Bluesky.update_seen_notifications
   ~account_id:"my_account"
-  (fun () -> Printf.printf "Marked as seen\n")
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Ok () -> Printf.printf "Marked as seen\n"
+    | Error err -> Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Search
@@ -378,18 +386,18 @@ Bluesky.search_actors
   ~account_id:"my_account"
   ~query:"ocaml"
   ~limit:10
-  (fun json ->
-    Printf.printf "Users: %s\n" (Yojson.Basic.to_string json))
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Ok json -> Printf.printf "Users: %s\n" (Yojson.Basic.to_string json)
+    | Error err -> Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Search for posts *)
 Bluesky.search_posts
   ~account_id:"my_account"
   ~query:"functional programming"
   ~limit:20
-  (fun json ->
-    Printf.printf "Posts: %s\n" (Yojson.Basic.to_string json))
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Ok json -> Printf.printf "Posts: %s\n" (Yojson.Basic.to_string json)
+    | Error err -> Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Moderation
@@ -399,22 +407,25 @@ Bluesky.search_posts
 Bluesky.mute_actor
   ~account_id:"my_account"
   ~actor:"spammer.bsky.social"
-  (fun () -> Printf.printf "Muted\n")
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Ok () -> Printf.printf "Muted\n"
+    | Error err -> Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Block a user *)
 Bluesky.block_actor
   ~account_id:"my_account"
   ~actor:"troll.bsky.social"
-  (fun block_uri -> Printf.printf "Blocked: %s\n" block_uri)
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Ok block_uri -> Printf.printf "Blocked: %s\n" block_uri
+    | Error err -> Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Unblock *)
 Bluesky.unblock_actor
   ~account_id:"my_account"
   ~block_uri:"at://did:plc:xyz/app.bsky.graph.block/abc123"
-  (fun () -> Printf.printf "Unblocked\n")
-  (fun error -> Printf.printf "Error: %s\n" error)
+  (function
+    | Ok () -> Printf.printf "Unblocked\n"
+    | Error err -> Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ## Examples

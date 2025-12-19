@@ -204,9 +204,10 @@ Mastodon.edit_status
   ~status_id:"123456"
   ~text:"Updated content"
   ~visibility:(Some Unlisted)
-  (fun edited_id ->
-    Printf.printf "Edited: %s\n" edited_id)
-  on_error
+  (function
+    | Ok edited_id -> Printf.printf "Edited: %s\n" edited_id
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Delete a Status
@@ -215,22 +216,36 @@ Mastodon.edit_status
 Mastodon.delete_status
   ~account_id:"user_123"
   ~status_id:"123456"
-  (fun () -> Printf.printf "Deleted!\n")
-  on_error
+  (function
+    | Social_core.Error_types.Success () -> Printf.printf "Deleted!\n"
+    | Social_core.Error_types.Partial_success _ -> Printf.printf "Deleted!\n"
+    | Social_core.Error_types.Failure err ->
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Favorite, Boost, and Bookmark
 
 ```ocaml
 (* Favorite *)
-Mastodon.favorite_status ~account_id ~status_id on_success on_error
+Mastodon.favorite_status ~account_id ~status_id
+  (function
+    | Ok () -> Printf.printf "Favorited!\n"
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Boost with custom visibility *)
-Mastodon.boost_status ~account_id ~status_id 
-  ~visibility:(Some Unlisted) on_success on_error
+Mastodon.boost_status ~account_id ~status_id ~visibility:(Some Unlisted)
+  (function
+    | Ok () -> Printf.printf "Boosted!\n"
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
 (* Bookmark *)
-Mastodon.bookmark_status ~account_id ~status_id on_success on_error
+Mastodon.bookmark_status ~account_id ~status_id
+  (function
+    | Ok () -> Printf.printf "Bookmarked!\n"
+    | Error err -> 
+        Printf.printf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ## Important Notes

@@ -1074,6 +1074,139 @@ let test_validate_story_invalid_format () =
       print_endline "✓ Story validation - rejects invalid format"
   | _ -> failwith "Should reject invalid format"
 
+(** {1 Video Reel Tests} *)
+
+(** Test: Upload video reel (3-phase resumable upload)
+    
+    Tests the Facebook Reel upload flow which uses:
+    1. Initialize upload session (upload_phase=start)
+    2. Upload video binary to upload_url
+    3. Finish upload (upload_phase=finish)
+    
+    @see <https://developers.facebook.com/docs/video-api/guides/reels-publishing>
+*)
+let test_upload_video_reel () =
+  Mock_config.reset ();
+  
+  Mock_http.set_responses [
+    (* GET video from URL *)
+    { status = 200; body = "fake_video_binary_data"; headers = [] };
+    (* POST init - returns video_id and upload_url *)
+    { status = 200; body = {|{"video_id": "reel_video_123", "upload_url": "https://rupload.facebook.com/video-upload/v123"}|}; headers = [] };
+    (* POST upload binary to upload_url *)
+    { status = 200; body = {|{"success": true}|}; headers = [] };
+    (* POST finish *)
+    { status = 200; body = {|{"success": true, "id": "reel_post_123"}|}; headers = [] };
+  ];
+  
+  Facebook.upload_video_reel
+    ~page_id:"page_123"
+    ~page_access_token:"test_token"
+    ~video_url:"https://example.com/reel.mp4"
+    ~description:"My first Reel!"
+    (fun video_id ->
+      assert (video_id = "reel_video_123");
+      (* Verify the init request contained upload_phase=start *)
+      let requests = !Mock_http.requests in
+      let has_init = List.exists (fun (_, url, _, body) ->
+        string_contains url "video_reels" && string_contains body "upload_phase"
+      ) requests in
+      assert has_init;
+      print_endline "✓ Upload video reel (3-phase)")
+    (fun err -> failwith ("Upload video reel failed: " ^ err))
+
+(** Test: Post reel (high-level) *)
+let test_post_reel () =
+  Mock_config.reset ();
+  
+  let future_time = 
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+  
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = None;
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+  
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_config._set_page_id ~account_id:"test_account" ~page_id:"page_123";
+  
+  Mock_http.set_responses [
+    { status = 200; body = "video_data"; headers = [] };
+    { status = 200; body = {|{"video_id": "vid_456", "upload_url": "https://upload.facebook.com/v1"}|}; headers = [] };
+    { status = 200; body = {|{"success": true}|}; headers = [] };
+    { status = 200; body = {|{"success": true}|}; headers = [] };
+  ];
+  
+  Facebook.post_reel
+    ~account_id:"test_account"
+    ~text:"Check out my Reel! #facebook #reel"
+    ~video_url:"https://example.com/reel.mp4"
+    (handle_outcome
+      (fun video_id ->
+        assert (video_id = "vid_456");
+        print_endline "✓ Post reel (high-level)")
+      (fun err -> failwith ("Post reel failed: " ^ err)))
+
+(** Test: Video reel validation - caption too long *)
+let test_reel_caption_validation () =
+  Mock_config.reset ();
+  
+  let future_time = 
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+  
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = None;
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+  
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_config._set_page_id ~account_id:"test_account" ~page_id:"page_123";
+  
+  (* Facebook's actual post limit is 63206 chars - test exceeding that *)
+  let long_caption = String.make 63300 'x' in
+  
+  Facebook.post_reel
+    ~account_id:"test_account"
+    ~text:long_caption
+    ~video_url:"https://example.com/reel.mp4"
+    (fun outcome ->
+      match outcome with
+      | Error_types.Failure (Error_types.Validation_error _) ->
+          print_endline "✓ Reel caption validation - too long rejected"
+      | _ -> failwith "Should reject caption over 63206 chars")
+
+(** Test: Video media validation - validates URLs are accessible *)
+let test_video_media_validation () =
+  (* Valid video URL *)
+  (match Facebook.validate_media ~media_urls:["https://example.com/video.mp4"] with
+   | Ok () -> print_endline "✓ Valid video URL passes"
+   | Error _ -> failwith "Valid video URL should pass");
+  
+  (* Multiple valid URLs *)
+  (match Facebook.validate_media ~media_urls:[
+    "https://example.com/photo1.jpg";
+    "https://example.com/photo2.jpg"
+  ] with
+   | Ok () -> print_endline "✓ Multiple valid URLs pass"
+   | Error _ -> failwith "Multiple valid URLs should pass");
+  
+  (* Invalid URL (not http/https) rejected *)
+  (match Facebook.validate_media ~media_urls:["ftp://example.com/video.mp4"] with
+   | Error _ -> print_endline "✓ Invalid URL rejected"
+   | Ok () -> failwith "Invalid URL should fail")
+
 (** Run all tests *)
 let () =
   print_endline "\n=== Facebook Provider Tests ===\n";
@@ -1124,5 +1257,11 @@ let () =
   test_validate_story_invalid_url ();
   test_validate_story_invalid_format ();
   
-  print_endline "\n=== All 38 tests passed! ===\n"
+  print_endline "\n--- Video Reel Tests ---";
+  test_upload_video_reel ();
+  test_post_reel ();
+  test_reel_caption_validation ();
+  test_video_media_validation ();
+  
+  print_endline "\n=== All 42 tests passed! ===\n"
 

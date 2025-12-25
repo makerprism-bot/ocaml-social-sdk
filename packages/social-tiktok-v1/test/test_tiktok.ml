@@ -306,27 +306,240 @@ let test_get_oauth_url () =
         failwith ("Unexpected error: " ^ err)));
   assert !success_called
 
+(** {1 Video Upload Tests} *)
+
+(** Test: Video validation - resolution too low *)
+let test_validate_video_resolution_too_low () =
+  print_string "Test: validate_video resolution too low... ";
+  match Social_tiktok_v1.validate_video ~duration_sec:30 ~file_size_bytes:10_000_000 ~width:240 ~height:240 with
+  | Error msg when String.length msg > 0 -> print_endline "PASSED"
+  | Error _ -> print_endline "PASSED"
+  | Ok () -> failwith "Expected Error for low resolution video"
+
+(** Test: Video validation - resolution too high *)
+let test_validate_video_resolution_too_high () =
+  print_string "Test: validate_video resolution too high... ";
+  match Social_tiktok_v1.validate_video ~duration_sec:30 ~file_size_bytes:10_000_000 ~width:8000 ~height:8000 with
+  | Error msg when String.length msg > 0 -> print_endline "PASSED"
+  | Error _ -> print_endline "PASSED"
+  | Ok () -> failwith "Expected Error for high resolution video"
+
+(** Test: Video validation - duration too long *)
+let test_validate_video_duration_too_long () =
+  print_string "Test: validate_video duration too long... ";
+  match Social_tiktok_v1.validate_video ~duration_sec:700 ~file_size_bytes:10_000_000 ~width:1080 ~height:1920 with
+  | Error msg when String.length msg > 0 -> print_endline "PASSED"
+  | Error _ -> print_endline "PASSED"
+  | Ok () -> failwith "Expected Error for too long video"
+
+(** Test: Video at exact limits *)
+let test_validate_video_at_limits () =
+  print_string "Test: validate_video at exact limits... ";
+  (* Exactly at max duration (600s), max size (50MB), max resolution (4096) *)
+  match Social_tiktok_v1.validate_video 
+    ~duration_sec:600 
+    ~file_size_bytes:(50 * 1024 * 1024)
+    ~width:4096 
+    ~height:2160 with
+  | Ok () -> print_endline "PASSED"
+  | Error msg -> failwith ("Expected Ok at limits, got Error: " ^ msg)
+
+(** Test: Caption validation - valid caption *)
+let test_validate_caption_valid () =
+  print_string "Test: validate_caption valid... ";
+  match Social_tiktok_v1.validate_caption "Check out my video! #tiktok #viral" with
+  | Ok () -> print_endline "PASSED"
+  | Error msg -> failwith ("Expected Ok, got Error: " ^ msg)
+
+(** Test: Caption validation - too long *)
+let test_validate_caption_too_long () =
+  print_string "Test: validate_caption too long... ";
+  let long_caption = String.make 2300 'a' in
+  match Social_tiktok_v1.validate_caption long_caption with
+  | Error msg when String.length msg > 0 -> print_endline "PASSED"
+  | Error _ -> print_endline "PASSED"
+  | Ok () -> failwith "Expected Error for too long caption"
+
+(** Test: Post info creation with defaults *)
+let test_make_post_info_defaults () =
+  print_string "Test: make_post_info with defaults... ";
+  let info = Social_tiktok_v1.make_post_info ~title:"Test video" () in
+  assert (info.title = "Test video");
+  assert (info.privacy_level = Social_tiktok_v1.SelfOnly);  (* Default is SelfOnly *)
+  assert (info.disable_duet = false);
+  assert (info.disable_comment = false);
+  assert (info.disable_stitch = false);
+  assert (info.video_cover_timestamp_ms = None);
+  print_endline "PASSED"
+
+(** Test: Post info creation with all options *)
+let test_make_post_info_all_options () =
+  print_string "Test: make_post_info with all options... ";
+  let info = Social_tiktok_v1.make_post_info 
+    ~title:"My viral video"
+    ~privacy_level:Social_tiktok_v1.PublicToEveryone
+    ~disable_duet:true
+    ~disable_comment:true
+    ~disable_stitch:true
+    ~video_cover_timestamp_ms:5000
+    () in
+  assert (info.title = "My viral video");
+  assert (info.privacy_level = Social_tiktok_v1.PublicToEveryone);
+  assert (info.disable_duet = true);
+  assert (info.disable_comment = true);
+  assert (info.disable_stitch = true);
+  assert (info.video_cover_timestamp_ms = Some 5000);
+  print_endline "PASSED"
+
+(** Test: Post info to JSON serialization *)
+let test_post_info_to_json () =
+  print_string "Test: post_info_to_json... ";
+  let info = Social_tiktok_v1.make_post_info 
+    ~title:"Test"
+    ~privacy_level:Social_tiktok_v1.MutualFollowFriends
+    () in
+  let json = Social_tiktok_v1.post_info_to_json info in
+  let json_str = Yojson.Basic.to_string json in
+  assert (String.length json_str > 0);
+  assert (try ignore (String.index json_str '{'); true with Not_found -> false);
+  print_endline "PASSED"
+
+(** Test: Privacy level string roundtrip *)
+let test_all_privacy_levels () =
+  print_string "Test: all privacy levels... ";
+  let levels = [
+    Social_tiktok_v1.PublicToEveryone;
+    Social_tiktok_v1.MutualFollowFriends;
+    Social_tiktok_v1.SelfOnly
+  ] in
+  List.iter (fun level ->
+    let s = Social_tiktok_v1.string_of_privacy_level level in
+    let level2 = Social_tiktok_v1.privacy_level_of_string s in
+    assert (level = level2)
+  ) levels;
+  print_endline "PASSED"
+
+(** Test: Init video upload request *)
+let test_init_video_upload () =
+  print_string "Test: init_video_upload... ";
+  let success_called = ref false in
+  let post_info = Social_tiktok_v1.make_post_info 
+    ~title:"Test upload" 
+    ~privacy_level:Social_tiktok_v1.SelfOnly
+    () in
+  TikTok.init_video_upload
+    ~account_id:"test_account"
+    ~post_info
+    ~video_size:1000000
+    (handle_api_result
+      (fun (publish_id, upload_url) ->
+        assert (publish_id = "pub_123");
+        assert (String.length upload_url > 0);
+        success_called := true;
+        print_endline "PASSED")
+      (fun err ->
+        failwith ("Unexpected error: " ^ err)));
+  assert !success_called
+
+(** Test: post_info privacy level options *)
+let test_post_info_privacy_options () =
+  print_string "Test: post_info with all privacy options... ";
+  
+  (* Test each privacy level creates valid post_info *)
+  let levels = [
+    Social_tiktok_v1.PublicToEveryone;
+    Social_tiktok_v1.MutualFollowFriends;
+    Social_tiktok_v1.SelfOnly;
+  ] in
+  
+  List.iter (fun privacy ->
+    let info = Social_tiktok_v1.make_post_info ~title:"Test" ~privacy_level:privacy () in
+    assert (info.privacy_level = privacy);
+    (* Verify JSON serialization includes correct privacy level *)
+    let json = Social_tiktok_v1.post_info_to_json info in
+    let json_str = Yojson.Basic.to_string json in
+    let expected_str = Social_tiktok_v1.string_of_privacy_level privacy in
+    assert (try ignore (Str.search_forward (Str.regexp_string expected_str) json_str 0); true with Not_found -> false)
+  ) levels;
+  
+  print_endline "PASSED"
+
+(** Test: Thread validation - missing media *)
+let test_thread_validation_missing_media () =
+  print_string "Test: thread validation - missing media... ";
+  let error_received = ref false in
+  TikTok.post_thread
+    ~account_id:"test_account"
+    ~texts:["First post"; "Second post"]
+    ~media_urls_per_post:[["https://example.com/video1.mp4"]; []]  (* Second post missing media *)
+    (fun outcome ->
+      match outcome with
+      | Error_types.Failure (Error_types.Validation_error _) ->
+          error_received := true;
+          print_endline "PASSED"
+      | Error_types.Partial_success _ ->
+          (* Partial success could also happen if first post succeeded but second validation failed *)
+          error_received := true;
+          print_endline "PASSED"
+      | _ ->
+          failwith "Expected validation error for missing media");
+  assert !error_received
+
+(** Test: Content validation function *)
+let test_validate_content () =
+  print_string "Test: validate_content... ";
+  (* Valid content *)
+  (match TikTok.validate_content ~text:"Valid caption #tiktok" with
+   | Ok () -> ()
+   | Error msg -> failwith ("Valid content should pass: " ^ msg));
+  
+  (* Too long content *)
+  let long_text = String.make 2500 'x' in
+  (match TikTok.validate_content ~text:long_text with
+   | Error _ -> ()  (* Expected *)
+   | Ok () -> failwith "Long content should fail");
+  
+  print_endline "PASSED"
+
 let () =
   print_endline "\n=== TikTok Provider Tests ===\n";
   
-  print_endline "--- Validation ---";
+  print_endline "--- Video Validation ---";
   test_validate_video_ok ();
   test_validate_video_too_short ();
   test_validate_video_too_large ();
+  test_validate_video_resolution_too_low ();
+  test_validate_video_resolution_too_high ();
+  test_validate_video_duration_too_long ();
+  test_validate_video_at_limits ();
+  
+  print_endline "\n--- Caption Validation ---";
+  test_validate_caption_valid ();
+  test_validate_caption_too_long ();
+  test_validate_content ();
+  
+  print_endline "\n--- Privacy & Post Info ---";
   test_privacy_level_roundtrip ();
+  test_all_privacy_levels ();
+  test_make_post_info_defaults ();
+  test_make_post_info_all_options ();
+  test_post_info_to_json ();
   test_authorization_url ();
   
   print_endline "\n--- Post Operations ---";
   test_post_single_no_media ();
   test_post_single_caption_too_long ();
   test_post_single_success ();
+  test_post_info_privacy_options ();
   test_post_thread_success ();
   test_post_thread_empty ();
+  test_thread_validation_missing_media ();
   
-  print_endline "\n--- API Operations (on_result pattern) ---";
+  print_endline "\n--- API Operations ---";
   test_get_creator_info ();
   test_check_publish_status ();
+  test_init_video_upload ();
   test_exchange_code ();
   test_get_oauth_url ();
   
-  print_endline "\n=== All 14 tests passed! ==="
+  print_endline "\n=== All 28 tests passed! ==="

@@ -1640,6 +1640,200 @@ let test_query_param_encoding () =
         | [] -> failwith "No requests recorded")
       (fun err -> failwith ("Get comments failed: " ^ err)))
 
+(** {1 Video Upload Tests}
+    
+    LinkedIn video upload follows the same register/upload pattern as images:
+    1. Register upload with "video" recipe
+    2. Upload binary to returned URL
+    3. Include asset URN in post with VIDEO media category
+    
+    Note: LinkedIn supports videos up to 200MB for standard accounts.
+    Videos longer than 10 minutes may be rejected.
+    
+    Gap vs ebx-linkedin-sdk (Java):
+    - Our implementation uses single-chunk upload
+    - For large videos (>200MB), chunked upload with ETags is needed
+    - ebx-linkedin-sdk implements full chunked upload with ETags collection
+    
+    @see <https://learn.microsoft.com/en-us/linkedin/marketing/community-management/shares/videos-api>
+*)
+
+(** Helper to create mock responses for video upload *)
+let make_video_upload_responses () =
+  (* 1. GET userinfo *)
+  let userinfo_response = { status = 200; body = {|{"sub": "user123"}|}; headers = [] } in
+  (* 2. GET video URL - fake binary data *)
+  let video_response = { status = 200; body = "fake_video_binary_data"; headers = [] } in
+  (* 3. POST register upload *)
+  let register_response = { status = 200; body = {|{"value": {"asset": "urn:li:digitalmediaAsset:video456", "uploadMechanism": {"com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest": {"uploadUrl": "https://api.linkedin.com/upload/video/123"}}}}|}; headers = [] } in
+  (* 4. PUT upload binary *)
+  let upload_response = { status = 200; body = ""; headers = [] } in
+  (* 5. POST create ugcPost *)
+  let create_response = { status = 201; body = {|{"id": "urn:li:share:video789"}|}; headers = [] } in
+  [userinfo_response; video_response; register_response; upload_response; create_response]
+
+(** Test: Post with video *)
+let test_post_with_video () =
+  Mock_config.reset ();
+  
+  let future_time = 
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+  
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+  
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_responses (make_video_upload_responses ());
+  
+  LinkedIn.post_single 
+    ~account_id:"test_account"
+    ~text:"Check out this video!"
+    ~media_urls:["https://example.com/video.mp4"]
+    ~alt_texts:[Some "A video about OCaml programming"]
+    (handle_outcome
+      (fun post_id ->
+        assert (post_id = "urn:li:share:video789");
+        (* Verify the request used VIDEO media category *)
+        let requests = List.rev !Mock_http.requests in
+        let ugc_post_request = List.find_opt (fun (method_, url, _, _) ->
+          method_ = "POST" && string_contains url "ugcPosts"
+        ) requests in
+        
+        (match ugc_post_request with
+        | Some (_, _, _, body) ->
+            assert (string_contains body "VIDEO");
+            assert (string_contains body "urn:li:digitalmediaAsset:video456");
+            print_endline "✓ Post with video"
+        | None -> failwith "No ugcPosts request found"))
+      (fun err -> failwith ("Post with video failed: " ^ err)))
+
+(** Test: Register video upload uses video recipe *)
+let test_register_video_upload () =
+  Mock_config.reset ();
+  
+  let response_body = {|{
+    "value": {
+      "asset": "urn:li:digitalmediaAsset:videotest123",
+      "uploadMechanism": {
+        "com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest": {
+          "uploadUrl": "https://upload.linkedin.com/video"
+        }
+      }
+    }
+  }|} in
+  
+  Mock_http.set_response { status = 200; body = response_body; headers = [] };
+  
+  LinkedIn.register_upload 
+    ~access_token:"test_token"
+    ~person_urn:"urn:li:person:test"
+    ~media_type:"video"
+    (fun (asset, _upload_url) ->
+      assert (asset = "urn:li:digitalmediaAsset:videotest123");
+      (* Verify video recipe was used *)
+      let requests = !Mock_http.requests in
+      (match requests with
+      | (_, _, _, body) :: _ ->
+          assert (string_contains body "feedshare-video");
+          print_endline "✓ Register video upload uses video recipe"
+      | [] -> failwith "No requests recorded"))
+    (fun err -> failwith ("Register video upload failed: " ^ err))
+
+(** Test: Video media validation - valid video *)
+let test_video_validation_valid () =
+  let valid_video = {
+    Platform_types.media_type = Platform_types.Video;
+    mime_type = "video/mp4";
+    file_size_bytes = 50_000_000; (* 50 MB *)
+    width = Some 1920;
+    height = Some 1080;
+    duration_seconds = Some 120.0; (* 2 minutes *)
+    alt_text = Some "Video description";
+  } in
+  (match LinkedIn.validate_media ~media:valid_video with
+   | Ok () -> print_endline "✓ Valid video passes validation"
+   | Error _ -> failwith "Valid video should pass")
+
+(** Test: Video media validation - video too large *)
+let test_video_validation_too_large () =
+  let large_video = {
+    Platform_types.media_type = Platform_types.Video;
+    mime_type = "video/mp4";
+    file_size_bytes = 250_000_000; (* 250 MB - over 200MB limit *)
+    width = Some 1920;
+    height = Some 1080;
+    duration_seconds = Some 60.0;
+    alt_text = None;
+  } in
+  (match LinkedIn.validate_media ~media:large_video with
+   | Error _ -> print_endline "✓ Video over 200MB rejected"
+   | Ok () -> failwith "Video over 200MB should fail")
+
+(** Test: Video media validation - video too long *)
+let test_video_validation_too_long () =
+  let long_video = {
+    Platform_types.media_type = Platform_types.Video;
+    mime_type = "video/mp4";
+    file_size_bytes = 50_000_000;
+    width = Some 1920;
+    height = Some 1080;
+    duration_seconds = Some 700.0; (* 11+ minutes - over 10 min limit *)
+    alt_text = None;
+  } in
+  (match LinkedIn.validate_media ~media:long_video with
+   | Error _ -> print_endline "✓ Video over 10 minutes rejected"
+   | Ok () -> failwith "Video over 10 minutes should fail")
+
+(** Test: Post with mixed media (video detected from URL extension) *)
+let test_post_video_detection_from_url () =
+  Mock_config.reset ();
+  
+  let future_time = 
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+  
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+  
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_responses (make_video_upload_responses ());
+  
+  (* URL with .mov extension should be detected as video *)
+  LinkedIn.post_single 
+    ~account_id:"test_account"
+    ~text:"QuickTime video post"
+    ~media_urls:["https://example.com/clip.mov"]
+    ~alt_texts:[]
+    (handle_outcome
+      (fun _post_id ->
+        (* Verify video recipe was used (not image) *)
+        let requests = List.rev !Mock_http.requests in
+        let register_request = List.find_opt (fun (method_, url, _, _) ->
+          method_ = "POST" && string_contains url "registerUpload"
+        ) requests in
+        
+        (match register_request with
+        | Some (_, _, _, body) ->
+            assert (string_contains body "feedshare-video");
+            print_endline "✓ .mov URL detected as video"
+        | None -> failwith "No registerUpload request found"))
+      (fun err -> failwith ("Video detection failed: " ^ err)))
+
 (** Run all tests *)
 let () =
   print_endline "\n=== LinkedIn Provider Tests ===\n";
@@ -1695,4 +1889,12 @@ let () =
   test_register_upload_headers ();
   test_query_param_encoding ();
   
-  print_endline "\n=== All 42 tests passed! ===\n"
+  print_endline "\n--- Video Upload Tests ---";
+  test_post_with_video ();
+  test_register_video_upload ();
+  test_video_validation_valid ();
+  test_video_validation_too_large ();
+  test_video_validation_too_long ();
+  test_post_video_detection_from_url ();
+  
+  print_endline "\n=== All 48 tests passed! ===\n"

@@ -703,6 +703,256 @@ let test_validate_story_invalid_format () =
       print_endline "✓ Story validation - rejects invalid format"
   | _ -> failwith "Should reject invalid format"
 
+(** {1 Video Upload Tests} *)
+
+(** Test: Video validation - valid video URL detection *)
+let test_video_url_detection () =
+  (* MP4 should be detected as video *)
+  let mp4_type = Instagram.detect_media_type "https://example.com/video.mp4" in
+  assert (mp4_type = "VIDEO");
+  
+  (* MOV should be detected as video *)
+  let mov_type = Instagram.detect_media_type "https://example.com/video.mov" in
+  assert (mov_type = "VIDEO");
+  
+  (* AVI should be detected as video *)
+  let avi_type = Instagram.detect_media_type "https://example.com/video.avi" in
+  assert (avi_type = "VIDEO");
+  
+  (* JPG should be detected as image *)
+  let jpg_type = Instagram.detect_media_type "https://example.com/image.jpg" in
+  assert (jpg_type = "IMAGE");
+  
+  print_endline "✓ Video URL detection"
+
+(** Test: Video container creation parameters *)
+let test_video_container_creation () =
+  Mock_config.reset ();
+  
+  let response_body = {|{"id": "video_container_123"}|} in
+  Mock_http.set_response { status = 200; body = response_body; headers = [] };
+  
+  Instagram.create_video_container
+    ~ig_user_id:"ig_123"
+    ~access_token:"test_token"
+    ~video_url:"https://example.com/video.mp4"
+    ~caption:"Test video caption"
+    ~alt_text:(Some "A video showing product demo")
+    ~media_type:"VIDEO"
+    ~is_carousel_item:false
+    (handle_result
+      (fun container_id ->
+        assert (container_id = "video_container_123");
+        (* Verify the request contained VIDEO media_type *)
+        let requests = !Mock_http.requests in
+        let has_video_type = List.exists (fun (_, _, _, body) ->
+          string_contains body "media_type" && string_contains body "VIDEO"
+        ) requests in
+        assert has_video_type;
+        print_endline "✓ Video container creation")
+      (fun err -> failwith ("Video container creation failed: " ^ err)))
+
+(** Test: Reel container creation (REELS media type) *)
+let test_reel_container_creation () =
+  Mock_config.reset ();
+  
+  let response_body = {|{"id": "reel_container_456"}|} in
+  Mock_http.set_response { status = 200; body = response_body; headers = [] };
+  
+  Instagram.create_video_container
+    ~ig_user_id:"ig_123"
+    ~access_token:"test_token"
+    ~video_url:"https://example.com/reel.mp4"
+    ~caption:"My awesome reel"
+    ~alt_text:None
+    ~media_type:"REELS"
+    ~is_carousel_item:false
+    (handle_result
+      (fun container_id ->
+        assert (container_id = "reel_container_456");
+        (* Verify the request contained REELS media_type *)
+        let requests = !Mock_http.requests in
+        let has_reels_type = List.exists (fun (_, _, _, body) ->
+          string_contains body "media_type" && string_contains body "REELS"
+        ) requests in
+        assert has_reels_type;
+        print_endline "✓ Reel container creation (REELS type)")
+      (fun err -> failwith ("Reel container creation failed: " ^ err)))
+
+(** Test: Video in carousel *)
+let test_video_carousel_item () =
+  Mock_config.reset ();
+  
+  let response_body = {|{"id": "carousel_video_item"}|} in
+  Mock_http.set_response { status = 200; body = response_body; headers = [] };
+  
+  Instagram.create_video_container
+    ~ig_user_id:"ig_123"
+    ~access_token:"test_token"
+    ~video_url:"https://example.com/carousel_video.mp4"
+    ~caption:""  (* Carousel items don't have captions *)
+    ~alt_text:(Some "Video showing a tutorial")
+    ~media_type:"VIDEO"
+    ~is_carousel_item:true
+    (handle_result
+      (fun container_id ->
+        assert (container_id = "carousel_video_item");
+        (* Verify is_carousel_item was set *)
+        let requests = !Mock_http.requests in
+        let has_carousel_flag = List.exists (fun (_, _, _, body) ->
+          string_contains body "is_carousel_item" && string_contains body "true"
+        ) requests in
+        assert has_carousel_flag;
+        print_endline "✓ Video carousel item")
+      (fun err -> failwith ("Video carousel item failed: " ^ err)))
+
+(** Test: Video format validation *)
+let test_video_format_validation () =
+  (* Valid MP4 *)
+  (match Instagram.validate_video ~video_url:"https://example.com/video.mp4" ~media_type:"VIDEO" with
+   | Ok () -> ()
+   | Error e -> failwith ("MP4 should be valid: " ^ e));
+  
+  (* Valid MOV *)
+  (match Instagram.validate_video ~video_url:"https://example.com/video.mov" ~media_type:"VIDEO" with
+   | Ok () -> ()
+   | Error e -> failwith ("MOV should be valid: " ^ e));
+  
+  (* Invalid format *)
+  (match Instagram.validate_video ~video_url:"https://example.com/video.avi" ~media_type:"VIDEO" with
+   | Error _ -> ()  (* AVI is not supported by Instagram *)
+   | Ok () -> failwith "AVI should be rejected");
+  
+  (* Valid REELS *)
+  (match Instagram.validate_video ~video_url:"https://example.com/reel.mp4" ~media_type:"REELS" with
+   | Ok () -> ()
+   | Error e -> failwith ("REELS MP4 should be valid: " ^ e));
+  
+  print_endline "✓ Video format validation"
+
+(** Test: Full video post flow *)
+let test_video_post_full_flow () =
+  Mock_config.reset ();
+  
+  let future_time = 
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+  
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = None;
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+  
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_config.set_ig_user_id ~account_id:"test_account" ~ig_user_id:"ig_123";
+  
+  (* Video requires more polling: create container, poll status, publish *)
+  Mock_http.set_responses [
+    { status = 200; body = {|{"id": "video_container"}|}; headers = [] };  (* Create container *)
+    { status = 200; body = {|{"status_code": "IN_PROGRESS", "status": "Processing"}|}; headers = [] };  (* First status check *)
+    { status = 200; body = {|{"status_code": "FINISHED", "status": "OK"}|}; headers = [] };  (* Second status check *)
+    { status = 200; body = {|{"id": "video_post_123"}|}; headers = [] };  (* Publish *)
+  ];
+  
+  Instagram.post_single
+    ~account_id:"test_account"
+    ~text:"Check out this video!"
+    ~media_urls:["https://example.com/video.mp4"]
+    (handle_outcome
+      (fun media_id ->
+        assert (media_id = "video_post_123");
+        (* Verify polling happened (sleep was called) *)
+        assert (List.length !Mock_config.sleep_calls >= 1);
+        print_endline "✓ Full video post flow with polling")
+      (fun err -> failwith ("Video post failed: " ^ err)))
+
+(** Test: Mixed carousel (images and video) *)
+let test_mixed_carousel () =
+  Mock_config.reset ();
+  
+  let future_time = 
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+  
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = None;
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+  
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_config.set_ig_user_id ~account_id:"test_account" ~ig_user_id:"ig_123";
+  
+  (* Mixed carousel: image, video, image *)
+  Mock_http.set_responses [
+    { status = 200; body = {|{"id": "child_image_1"}|}; headers = [] };  (* First image child *)
+    { status = 200; body = {|{"id": "child_video"}|}; headers = [] };  (* Video child *)
+    { status = 200; body = {|{"id": "child_image_2"}|}; headers = [] };  (* Second image child *)
+    { status = 200; body = {|{"id": "carousel_container"}|}; headers = [] };  (* Parent carousel *)
+    { status = 200; body = {|{"status_code": "FINISHED"}|}; headers = [] };  (* Status check *)
+    { status = 200; body = {|{"id": "mixed_carousel_post"}|}; headers = [] };  (* Publish *)
+  ];
+  
+  Instagram.post_single
+    ~account_id:"test_account"
+    ~text:"Mixed media carousel"
+    ~media_urls:[
+      "https://example.com/photo1.jpg";
+      "https://example.com/video.mp4";
+      "https://example.com/photo2.png"
+    ]
+    ~alt_texts:[Some "First photo"; Some "Video description"; Some "Second photo"]
+    (handle_outcome
+      (fun media_id ->
+        assert (media_id = "mixed_carousel_post");
+        print_endline "✓ Mixed carousel (images + video)")
+      (fun err -> failwith ("Mixed carousel failed: " ^ err)))
+
+(** Test: Video processing error handling *)
+let test_video_processing_error () =
+  Mock_config.reset ();
+  
+  let future_time = 
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+  
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = None;
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+  
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_config.set_ig_user_id ~account_id:"test_account" ~ig_user_id:"ig_123";
+  
+  (* Video processing fails *)
+  Mock_http.set_responses [
+    { status = 200; body = {|{"id": "video_container"}|}; headers = [] };  (* Create container *)
+    { status = 200; body = {|{"status_code": "ERROR", "status": "Video format not supported"}|}; headers = [] };  (* Processing failed *)
+  ];
+  
+  Instagram.post_single
+    ~account_id:"test_account"
+    ~text:"This video will fail"
+    ~media_urls:["https://example.com/bad_video.mp4"]
+    (fun outcome ->
+      match outcome with
+      | Error_types.Failure _ -> print_endline "✓ Video processing error handled"
+      | _ -> failwith "Expected failure for processing error")
+
 (** Run all tests *)
 let () =
   print_endline "\n=== Instagram Provider Tests ===\n";
@@ -733,4 +983,14 @@ let () =
   test_validate_story_invalid_url ();
   test_validate_story_invalid_format ();
   
-  print_endline "\n=== All 22 tests passed! ===\n"
+  print_endline "\n--- Video Upload Tests ---";
+  test_video_url_detection ();
+  test_video_container_creation ();
+  test_reel_container_creation ();
+  test_video_carousel_item ();
+  test_video_format_validation ();
+  test_video_post_full_flow ();
+  test_mixed_carousel ();
+  test_video_processing_error ();
+  
+  print_endline "\n=== All 30 tests passed! ===\n"

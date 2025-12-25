@@ -979,6 +979,247 @@ let test_partial_alt_texts () =
         assert false));
   assert !success_called
 
+(** {1 Video Upload Tests} *)
+
+(** Test: Video validation - valid video under size limit *)
+let test_video_validation_valid () =
+  Printf.printf "Test: Video validation - valid video... ";
+  let media : Platform_types.post_media = {
+    media_type = Platform_types.Video;
+    file_size_bytes = 50 * 1024 * 1024;  (* 50 MB - under 100 MB limit *)
+    duration_seconds = Some 300.0;  (* 5 minutes - under 2 hour limit *)
+    width = Some 1920;
+    height = Some 1080;
+    mime_type = "video/mp4";
+    alt_text = None;
+  } in
+  match Mastodon.validate_media ~media with
+  | Ok () -> Printf.printf "✓\n"
+  | Error msg -> 
+      Printf.printf "✗ Unexpected error: %s\n" msg;
+      assert false
+
+(** Test: Video validation - video too large *)
+let test_video_validation_too_large () =
+  Printf.printf "Test: Video validation - too large... ";
+  let media : Platform_types.post_media = {
+    media_type = Platform_types.Video;
+    file_size_bytes = 150 * 1024 * 1024;  (* 150 MB - over 100 MB limit *)
+    duration_seconds = Some 60.0;
+    width = Some 1920;
+    height = Some 1080;
+    mime_type = "video/mp4";
+    alt_text = None;
+  } in
+  match Mastodon.validate_media ~media with
+  | Error msg when string_contains msg "100MB" -> Printf.printf "✓ (correctly rejected)\n"
+  | Error msg -> Printf.printf "✗ Wrong error: %s\n" msg; assert false
+  | Ok () -> Printf.printf "✗ Should reject large video\n"; assert false
+
+(** Test: Video validation - duration too long *)
+let test_video_validation_too_long () =
+  Printf.printf "Test: Video validation - duration too long... ";
+  let media : Platform_types.post_media = {
+    media_type = Platform_types.Video;
+    file_size_bytes = 50 * 1024 * 1024;
+    duration_seconds = Some 8000.0;  (* > 7200 seconds (2 hours) *)
+    width = Some 1920;
+    height = Some 1080;
+    mime_type = "video/mp4";
+    alt_text = None;
+  } in
+  match Mastodon.validate_media ~media with
+  | Error msg when string_contains msg "2 hour" -> Printf.printf "✓ (correctly rejected)\n"
+  | Error msg -> Printf.printf "✗ Wrong error: %s\n" msg; assert false
+  | Ok () -> Printf.printf "✗ Should reject long video\n"; assert false
+
+(** Test: Video at exact limits *)
+let test_video_at_limits () =
+  Printf.printf "Test: Video at exact limits... ";
+  let media : Platform_types.post_media = {
+    media_type = Platform_types.Video;
+    file_size_bytes = 100 * 1024 * 1024;  (* Exactly 100 MB *)
+    duration_seconds = Some 7200.0;  (* Exactly 2 hours *)
+    width = Some 1920;
+    height = Some 1080;
+    mime_type = "video/mp4";
+    alt_text = None;
+  } in
+  match Mastodon.validate_media ~media with
+  | Ok () -> Printf.printf "✓\n"
+  | Error msg -> Printf.printf "✗ Should accept at limits: %s\n" msg; assert false
+
+(** Test: GIF validation (uses different limits) *)
+let test_gif_validation () =
+  Printf.printf "Test: GIF validation... ";
+  let media : Platform_types.post_media = {
+    media_type = Platform_types.Gif;
+    file_size_bytes = 8 * 1024 * 1024;  (* 8 MB - under 10 MB limit for GIF *)
+    duration_seconds = None;
+    width = Some 480;
+    height = Some 480;
+    mime_type = "image/gif";
+    alt_text = None;
+  } in
+  match Mastodon.validate_media ~media with
+  | Ok () -> Printf.printf "✓\n"
+  | Error msg -> Printf.printf "✗ Unexpected error: %s\n" msg; assert false
+
+(** Test: GIF too large *)
+let test_gif_too_large () =
+  Printf.printf "Test: GIF too large... ";
+  let media : Platform_types.post_media = {
+    media_type = Platform_types.Gif;
+    file_size_bytes = 15 * 1024 * 1024;  (* 15 MB - over 10 MB limit *)
+    duration_seconds = None;
+    width = Some 480;
+    height = Some 480;
+    mime_type = "image/gif";
+    alt_text = None;
+  } in
+  match Mastodon.validate_media ~media with
+  | Error msg when string_contains msg "10MB" -> Printf.printf "✓ (correctly rejected)\n"
+  | Error msg -> Printf.printf "✗ Wrong error: %s\n" msg; assert false
+  | Ok () -> Printf.printf "✗ Should reject large GIF\n"; assert false
+
+(** Test: Image validation *)
+let test_image_validation () =
+  Printf.printf "Test: Image validation... ";
+  let media : Platform_types.post_media = {
+    media_type = Platform_types.Image;
+    file_size_bytes = 5 * 1024 * 1024;  (* 5 MB - under 10 MB limit *)
+    duration_seconds = None;
+    width = Some 1920;
+    height = Some 1080;
+    mime_type = "image/jpeg";
+    alt_text = None;
+  } in
+  match Mastodon.validate_media ~media with
+  | Ok () -> Printf.printf "✓\n"
+  | Error msg -> Printf.printf "✗ Unexpected error: %s\n" msg; assert false
+
+(** Test: Post with video URL *)
+let test_post_with_video () =
+  Printf.printf "Test: Post with video URL... ";
+  let success_called = ref false in
+  Mastodon.post_single
+    ~account_id:"test_account"
+    ~text:"Check out this video!"
+    ~media_urls:["https://example.com/video.mp4"]
+    ~alt_texts:[Some "A video showing a demonstration"]
+    (handle_outcome
+      (fun post_id ->
+        success_called := true;
+        Printf.printf "✓ (post_id: %s)\n" post_id)
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
+  assert !success_called
+
+(** Test: Post with mixed media (image and video) *)
+let test_post_with_mixed_media () =
+  Printf.printf "Test: Post with mixed media... ";
+  let success_called = ref false in
+  Mastodon.post_single
+    ~account_id:"test_account"
+    ~text:"Mixed media post"
+    ~media_urls:[
+      "https://example.com/image.jpg";
+      "https://example.com/video.mp4"
+    ]
+    ~alt_texts:[Some "An image"; Some "A video"]
+    (handle_outcome
+      (fun post_id ->
+        success_called := true;
+        Printf.printf "✓ (post_id: %s)\n" post_id)
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
+  assert !success_called
+
+(** Test: Maximum media attachments (4) *)
+let test_max_media_attachments () =
+  Printf.printf "Test: Maximum media attachments (4)... ";
+  let success_called = ref false in
+  Mastodon.post_single
+    ~account_id:"test_account"
+    ~text:"Four media items"
+    ~media_urls:[
+      "https://example.com/img1.jpg";
+      "https://example.com/img2.jpg";
+      "https://example.com/img3.jpg";
+      "https://example.com/img4.jpg"
+    ]
+    (handle_outcome
+      (fun post_id ->
+        success_called := true;
+        Printf.printf "✓ (post_id: %s)\n" post_id)
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
+  assert !success_called
+
+(** Test: Too many media attachments (> 4) rejected *)
+let test_too_many_media () =
+  Printf.printf "Test: Too many media attachments (> 4)... ";
+  let error_received = ref false in
+  Mastodon.post_single
+    ~account_id:"test_account"
+    ~text:"Five media items - should fail"
+    ~media_urls:[
+      "https://example.com/img1.jpg";
+      "https://example.com/img2.jpg";
+      "https://example.com/img3.jpg";
+      "https://example.com/img4.jpg";
+      "https://example.com/img5.jpg"
+    ]
+    (fun outcome ->
+      match outcome with
+      | Error_types.Failure (Error_types.Validation_error errs) ->
+          (* Verify the error is specifically about too many media *)
+          let has_too_many_media = List.exists (function
+            | Error_types.Too_many_media { count = 5; max = 4 } -> true
+            | _ -> false
+          ) errs in
+          if has_too_many_media then begin
+            error_received := true;
+            Printf.printf "✓ (Too_many_media error returned)\n"
+          end else begin
+            Printf.printf "✗ Wrong validation error\n";
+            assert false
+          end
+      | Error_types.Success _ ->
+          Printf.printf "✗ Should have returned validation error\n";
+          assert false
+      | _ ->
+          Printf.printf "✗ Unexpected outcome\n";
+          assert false);
+  assert !error_received
+
+(** Test: Thread with video in each post *)
+let test_thread_with_videos () =
+  Printf.printf "Test: Thread with videos... ";
+  let success_called = ref false in
+  Mastodon.post_thread
+    ~account_id:"test_account"
+    ~texts:["First video post"; "Second video post"]
+    ~media_urls_per_post:[
+      ["https://example.com/video1.mp4"];
+      ["https://example.com/video2.mp4"]
+    ]
+    ~alt_texts_per_post:[
+      [Some "First video description"];
+      [Some "Second video description"]
+    ]
+    (handle_thread_outcome
+      (fun post_ids ->
+        success_called := true;
+        Printf.printf "✓ (%d posts)\n" (List.length post_ids))
+      (fun err ->
+        Printf.printf "✗ Error: %s\n" err;
+        assert false));
+  assert !success_called
+
 (** Run all tests *)
 let () =
   Printf.printf "\n=== Mastodon Provider Tests ===\n\n";
@@ -1045,4 +1286,19 @@ let () =
   test_alt_text_with_unicode ();
   test_partial_alt_texts ();
   
-  Printf.printf "\n✓ All 46 tests passed!\n"
+  (* Video upload tests *)
+  Printf.printf "\n--- Video Upload Tests ---\n";
+  test_video_validation_valid ();
+  test_video_validation_too_large ();
+  test_video_validation_too_long ();
+  test_video_at_limits ();
+  test_gif_validation ();
+  test_gif_too_large ();
+  test_image_validation ();
+  test_post_with_video ();
+  test_post_with_mixed_media ();
+  test_max_media_attachments ();
+  test_too_many_media ();
+  test_thread_with_videos ();
+  
+  Printf.printf "\n✓ All 58 tests passed!\n"

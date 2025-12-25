@@ -488,42 +488,6 @@ module Make (Config : CONFIG) = struct
     if !errors = [] then Ok ()
     else Error (List.rev !errors)
   
-  (** Validate media file for Instagram
-      
-      Instagram limits:
-      - Images: 8MB
-      - Videos/Reels: 1GB (100MB for Stories)
-  *)
-  let validate_media_file ~(media : Platform_types.post_media) =
-    match media.Platform_types.media_type with
-    | Platform_types.Image ->
-        let max_image_bytes = 8 * 1024 * 1024 in (* 8MB *)
-        if media.file_size_bytes > max_image_bytes then
-          Error [Error_types.Media_too_large { 
-            size_bytes = media.file_size_bytes; 
-            max_bytes = max_image_bytes 
-          }]
-        else
-          Ok ()
-    | Platform_types.Video ->
-        let max_video_bytes = 1024 * 1024 * 1024 in (* 1GB *)
-        if media.file_size_bytes > max_video_bytes then
-          Error [Error_types.Media_too_large { 
-            size_bytes = media.file_size_bytes; 
-            max_bytes = max_video_bytes 
-          }]
-        else
-          Ok ()
-    | Platform_types.Gif ->
-        let max_gif_bytes = 8 * 1024 * 1024 in (* 8MB, treat like images *)
-        if media.file_size_bytes > max_gif_bytes then
-          Error [Error_types.Media_too_large { 
-            size_bytes = media.file_size_bytes; 
-            max_bytes = max_gif_bytes 
-          }]
-        else
-          Ok ()
-  
   (** {1 Rate Limiting} *)
   
   (** Parse X-App-Usage header *)
@@ -1070,14 +1034,11 @@ module Make (Config : CONFIG) = struct
   
   (** Post to Instagram with two-step process
       
-      @param validate_media_before_upload This parameter is accepted for API consistency
-             but has no effect on Instagram. Instagram uses URL-based container creation
-             where the platform fetches media directly - we don't download files ourselves.
-             Instagram limits: 8MB images, 1GB video (enforced by platform).
-             Default: false
+      Note: Instagram uses URL-based container creation where the platform
+      fetches media directly. Client-side file size validation is not possible.
+      Instagram enforces its own limits: 8MB images, 1GB video.
   *)
-  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) ?(validate_media_before_upload=false) on_result =
-    let _ = validate_media_before_upload in (* Instagram fetches URLs directly - no client-side validation possible *)
+  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_result =
     let media_count = List.length media_urls in
     
     (* Validate content first - includes media count check *)
@@ -1387,13 +1348,8 @@ module Make (Config : CONFIG) = struct
       else
         Ok ()
   
-  (** Post thread (Instagram doesn't support threads, posts only first item with warning)
-      
-      @param validate_media_before_upload This parameter is accepted for API consistency
-             but has no effect on Instagram. See post_single for details.
-             Default: false
-  *)
-  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) ?(validate_media_before_upload=false) on_result =
+  (** Post thread (Instagram doesn't support threads, posts only first item with warning) *)
+  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_result =
     if List.length texts = 0 then
       on_result (Error_types.Failure (Error_types.Validation_error [Error_types.Thread_empty]))
     else
@@ -1403,7 +1359,6 @@ module Make (Config : CONFIG) = struct
       let total_posts = List.length texts in
       
       post_single ~account_id ~text:first_text ~media_urls:first_media ~alt_texts:first_alt_texts
-        ~validate_media_before_upload
         (fun outcome ->
           match outcome with
           | Error_types.Success post_id ->

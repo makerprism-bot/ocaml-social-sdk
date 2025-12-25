@@ -709,17 +709,47 @@ module Make (Config : CONFIG) = struct
       on_error
   
   (** Upload image or video to LinkedIn with optional alt text *)
-  let upload_media ~access_token ~person_urn ~media_url ~media_type ~alt_text on_success on_error =
+  let upload_media ~access_token ~person_urn ~media_url ~media_type ~alt_text ?(validate_before_upload=false) ~on_validation_error on_success on_error =
     (* Download media from URL *)
     Config.Http.get ~headers:[] media_url
       (fun media_response ->
         if media_response.status >= 200 && media_response.status < 300 then
-          register_upload ~access_token ~person_urn ~media_type
-            (fun (asset_urn, upload_url) ->
-              upload_binary ~access_token ~upload_url ~media_data:media_response.body
-                (fun () -> on_success (asset_urn, alt_text))
+          let file_size = String.length media_response.body in
+          
+          (* Validate media if requested *)
+          let validation_result =
+            if validate_before_upload then
+              let mime_type = 
+                List.assoc_opt "content-type" media_response.headers 
+                |> Option.value ~default:(if media_type = "video" then "video/mp4" else "image/jpeg")
+              in
+              let media_type_enum = 
+                if media_type = "video" then Platform_types.Video 
+                else Platform_types.Image 
+              in
+              let media : Platform_types.post_media = {
+                media_type = media_type_enum;
+                mime_type = mime_type;
+                file_size_bytes = file_size;
+                width = None;
+                height = None;
+                duration_seconds = None;
+                alt_text = alt_text;
+              } in
+              validate_media ~media
+            else
+              Ok ()
+          in
+          
+          (match validation_result with
+          | Error errs -> on_validation_error errs
+          | Ok () ->
+              register_upload ~access_token ~person_urn ~media_type
+                (fun (asset_urn, upload_url) ->
+                  upload_binary ~access_token ~upload_url ~media_data:media_response.body
+                    (fun () -> on_success (asset_urn, alt_text))
+                    on_error)
                 on_error)
-            on_error
         else
           on_error (Printf.sprintf "Failed to download media from %s (%d)" media_url media_response.status))
       on_error
@@ -740,9 +770,12 @@ module Make (Config : CONFIG) = struct
       @param text The post text (max 3000 characters)
       @param media_urls List of media URLs to attach (max 9)
       @param alt_texts Optional alt text for each media item
+      @param validate_media_before_upload When true, validates media size after download
+             but before upload. LinkedIn limits: 200MB video, 10min duration, 8MB images.
+             Default: false
       @param on_result Callback receiving the outcome with post ID
   *)
-  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_result =
+  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) ?(validate_media_before_upload=false) on_result =
     (* Validate before making any API calls *)
     let media_count = List.length media_urls in
     match validate_post ~text ~media_count () with
@@ -771,6 +804,9 @@ module Make (Config : CONFIG) = struct
                         ~media_url:url 
                         ~media_type
                         ~alt_text
+                        ~validate_before_upload:validate_media_before_upload
+                        ~on_validation_error:(fun errs -> 
+                          on_result (Error_types.Failure (Error_types.Validation_error errs)))
                         (fun (asset_urn, alt_text) ->
                           let uploaded = { 
                             asset_urn; 
@@ -885,9 +921,10 @@ module Make (Config : CONFIG) = struct
       @param texts List of post texts (only first is used)
       @param media_urls_per_post Media URLs for each post
       @param alt_texts_per_post Alt texts for each post's media
+      @param validate_media_before_upload When true, validates media after download. Default: false
       @param on_result Callback receiving the outcome with thread_result
   *)
-  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_result =
+  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) ?(validate_media_before_upload=false) on_result =
     let media_counts = List.map List.length media_urls_per_post in
     match validate_thread ~texts ~media_counts () with
     | Error errs ->
@@ -896,7 +933,7 @@ module Make (Config : CONFIG) = struct
         let first_text = List.hd texts in
         let first_media = if List.length media_urls_per_post > 0 then List.hd media_urls_per_post else [] in
         let first_alt_texts = if List.length alt_texts_per_post > 0 then List.hd alt_texts_per_post else [] in
-        post_single ~account_id ~text:first_text ~media_urls:first_media ~alt_texts:first_alt_texts
+        post_single ~account_id ~text:first_text ~media_urls:first_media ~alt_texts:first_alt_texts ~validate_media_before_upload
           (fun outcome ->
             match outcome with
             | Error_types.Success post_id ->

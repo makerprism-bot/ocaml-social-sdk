@@ -780,8 +780,13 @@ module Make (Config : CONFIG) = struct
       
       This is a convenience function that:
       1. Downloads video from URL
-      2. Uploads to TikTok
-      3. Returns publish_id
+      2. Optionally validates video size
+      3. Uploads to TikTok
+      4. Returns publish_id
+      
+      @param validate_before_upload When true, validates video size after download.
+             TikTok limits: 50MB default (up to 4GB via API), 3-600s duration.
+             Default: false
   *)
   let post_video_from_url ~account_id ~caption ~video_url
       ?(privacy_level=SelfOnly)
@@ -789,21 +794,43 @@ module Make (Config : CONFIG) = struct
       ?(disable_comment=false) 
       ?(disable_stitch=false)
       ?video_cover_timestamp_ms
+      ?(validate_before_upload=false)
       on_result =
     (* Download video *)
     Config.Http.get video_url
       (fun response ->
         if response.status >= 200 && response.status < 300 then
-          post_video ~account_id ~caption ~video_content:response.body
-            ~privacy_level ~disable_duet ~disable_comment ~disable_stitch
-            ?video_cover_timestamp_ms
-            on_result
+          let video_size = String.length response.body in
+          
+          (* Validate if requested - only size check since we don't parse video *)
+          let validation_error =
+            if validate_before_upload && video_size > max_video_size_bytes then
+              Some (Error_types.Media_too_large { 
+                size_bytes = video_size; 
+                max_bytes = max_video_size_bytes 
+              })
+            else
+              None
+          in
+          
+          (match validation_error with
+          | Some err ->
+              on_result (Error (Error_types.Validation_error [err]))
+          | None ->
+              post_video ~account_id ~caption ~video_content:response.body
+                ~privacy_level ~disable_duet ~disable_comment ~disable_stitch
+                ?video_cover_timestamp_ms
+                on_result)
         else
           on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to download video (%d)" response.status))))
       (fun err -> on_result (Error (Error_types.Internal_error err)))
   
-  (** Post single video (matches other provider signatures) *)
-  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_result =
+  (** Post single video (matches other provider signatures)
+      
+      @param validate_media_before_upload When true, validates video size after download.
+             Default: false
+  *)
+  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) ?(validate_media_before_upload=false) on_result =
     let _ = alt_texts in (* TikTok doesn't support alt text *)
     let media_count = List.length media_urls in
     match validate_post ~text ~media_count () with
@@ -812,6 +839,7 @@ module Make (Config : CONFIG) = struct
         (* Validation ensures media_urls is non-empty *)
         let video_url = List.hd media_urls in
         post_video_from_url ~account_id ~caption:text ~video_url
+          ~validate_before_upload:validate_media_before_upload
           (function
             | Ok publish_id -> on_result (Error_types.Success publish_id)
             | Error err -> on_result (Error_types.Failure err))

@@ -802,15 +802,19 @@ module Make (Config : CONFIG) = struct
             init_response.status init_response.body))
       on_error
   
-  (** Post single tweet
+  (** Post a single tweet with optional media
       
       @param account_id The account identifier
-      @param text The tweet text (max 280 weighted characters)
-      @param media_urls List of media URLs to attach (max 4)
-      @param alt_texts Optional alt text for each media item
+      @param text The tweet text (max 280 characters, URLs count as ~23)
+      @param media_urls List of media URLs to attach (max 4 images, or 1 video/GIF)
+      @param alt_texts Optional alt text for each media item (for accessibility)
+      @param validate_media_before_upload When true, validates media size/format after 
+             download but before upload to Twitter. Returns validation error if media 
+             exceeds limits (512MB for video, 5MB for images, 15MB for GIFs).
+             Default: false (for backward compatibility)
       @param on_result Callback receiving the outcome with tweet ID
   *)
-  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_result =
+  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) ?(validate_media_before_upload=false) on_result =
     (* Validate before making any API calls *)
     let media_count = List.length media_urls in
     match validate_post ~text ~media_count () with
@@ -854,6 +858,13 @@ module Make (Config : CONFIG) = struct
                   (url, alt_text)
                 ) media_urls in
                 
+                (* Helper to determine media type from MIME type *)
+                let media_type_of_mime mime_type =
+                  if String.starts_with ~prefix:"video/" mime_type then Platform_types.Video
+                  else if mime_type = "image/gif" then Platform_types.Gif
+                  else Platform_types.Image
+                in
+                
                 (* Helper to upload multiple media in sequence, accumulating warnings for alt text failures *)
                 let rec upload_media_seq urls_with_alt acc on_complete on_err =
                   match urls_with_alt with
@@ -865,13 +876,36 @@ module Make (Config : CONFIG) = struct
                             List.assoc_opt "content-type" media_resp.headers 
                             |> Option.value ~default:"image/jpeg"
                           in
-                          (* Upload to Twitter - alt text failures become warnings, not errors *)
-                          upload_media ~access_token ~media_data:media_resp.body ~mime_type ~alt_text
-                            (fun (media_id, alt_text_failed) -> 
-                              if alt_text_failed then
-                                accumulated_warnings := Error_types.Alt_text_failed media_id :: !accumulated_warnings;
-                              upload_media_seq rest (media_id :: acc) on_complete on_err)
-                            on_err)
+                          let file_size = String.length media_resp.body in
+                          
+                          (* Validate media if requested *)
+                          let validation_result =
+                            if validate_media_before_upload then
+                              let media : Platform_types.post_media = {
+                                media_type = media_type_of_mime mime_type;
+                                mime_type = mime_type;
+                                file_size_bytes = file_size;
+                                width = None;  (* Not available from download *)
+                                height = None;
+                                duration_seconds = None;  (* Would require parsing video *)
+                                alt_text = alt_text;
+                              } in
+                              validate_media ~media
+                            else
+                              Ok ()
+                          in
+                          
+                          match validation_result with
+                          | Error errs ->
+                              on_result (Error_types.Failure (Error_types.Validation_error errs))
+                          | Ok () ->
+                              (* Upload to Twitter - alt text failures become warnings, not errors *)
+                              upload_media ~access_token ~media_data:media_resp.body ~mime_type ~alt_text
+                                (fun (media_id, alt_text_failed) -> 
+                                  if alt_text_failed then
+                                    accumulated_warnings := Error_types.Alt_text_failed media_id :: !accumulated_warnings;
+                                  upload_media_seq rest (media_id :: acc) on_complete on_err)
+                                on_err)
                         on_err
                 in
                 
@@ -1116,9 +1150,11 @@ module Make (Config : CONFIG) = struct
       @param texts List of tweet texts
       @param media_urls_per_post Media URLs for each post
       @param alt_texts_per_post Alt texts for each post's media
+      @param validate_media_before_upload When true, validates each media file after 
+             download but before upload. Default: false
       @param on_result Callback receiving the outcome with thread_result
   *)
-  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_result =
+  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) ?(validate_media_before_upload=false) on_result =
     let media_counts = List.map List.length media_urls_per_post in
     match validate_thread ~texts ~media_counts () with
     | Error errs ->
@@ -1146,6 +1182,13 @@ module Make (Config : CONFIG) = struct
               attempt 0
             in
             
+            (* Helper to determine media type from MIME type *)
+            let media_type_of_mime mime_type =
+              if String.starts_with ~prefix:"video/" mime_type then Platform_types.Video
+              else if mime_type = "image/gif" then Platform_types.Gif
+              else Platform_types.Image
+            in
+            
             (* Helper to upload multiple media in sequence with alt text *)
             let rec upload_media_seq urls_with_alt acc on_complete on_err =
               match urls_with_alt with
@@ -1157,13 +1200,36 @@ module Make (Config : CONFIG) = struct
                         List.assoc_opt "content-type" media_resp.headers 
                         |> Option.value ~default:"image/jpeg"
                       in
-                      (* Upload with alt text - failures become warnings *)
-                      upload_media ~access_token ~media_data:media_resp.body ~mime_type ~alt_text
-                        (fun (media_id, alt_text_failed) -> 
-                          if alt_text_failed then
-                            accumulated_warnings := Error_types.Alt_text_failed media_id :: !accumulated_warnings;
-                          upload_media_seq rest (media_id :: acc) on_complete on_err)
-                        on_err)
+                      let file_size = String.length media_resp.body in
+                      
+                      (* Validate media if requested *)
+                      let validation_result =
+                        if validate_media_before_upload then
+                          let media : Platform_types.post_media = {
+                            media_type = media_type_of_mime mime_type;
+                            mime_type = mime_type;
+                            file_size_bytes = file_size;
+                            width = None;
+                            height = None;
+                            duration_seconds = None;
+                            alt_text = alt_text;
+                          } in
+                          validate_media ~media
+                        else
+                          Ok ()
+                      in
+                      
+                      match validation_result with
+                      | Error errs ->
+                          on_result (Error_types.Failure (Error_types.Validation_error errs))
+                      | Ok () ->
+                          (* Upload with alt text - failures become warnings *)
+                          upload_media ~access_token ~media_data:media_resp.body ~mime_type ~alt_text
+                            (fun (media_id, alt_text_failed) -> 
+                              if alt_text_failed then
+                                accumulated_warnings := Error_types.Alt_text_failed media_id :: !accumulated_warnings;
+                              upload_media_seq rest (media_id :: acc) on_complete on_err)
+                            on_err)
                     on_err
             in
             

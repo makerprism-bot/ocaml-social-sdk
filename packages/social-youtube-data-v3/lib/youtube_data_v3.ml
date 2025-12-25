@@ -381,6 +381,29 @@ module Make (Config : CONFIG) = struct
       | Error errs -> Error [Error_types.Thread_post_invalid { index = 0; errors = errs }]
       | Ok () -> Ok ()
   
+  (** Validate video file for YouTube
+      
+      YouTube Shorts limits:
+      - Videos: 256GB max (but Shorts are typically under 60 seconds)
+      - For practical purposes we limit to 2GB since larger files would
+        require chunked upload which isn't implemented
+  *)
+  let validate_media_file ~(media : Platform_types.post_media) =
+    match media.Platform_types.media_type with
+    | Platform_types.Video ->
+        (* 2GB practical limit - avoids integer overflow and matches realistic upload scenarios *)
+        let max_video_bytes = 2 * 1024 * 1024 * 1024 in (* 2GB *)
+        if media.file_size_bytes > max_video_bytes then
+          Error [Error_types.Media_too_large { 
+            size_bytes = media.file_size_bytes; 
+            max_bytes = max_video_bytes 
+          }]
+        else
+          Ok ()
+    | Platform_types.Image | Platform_types.Gif ->
+        (* YouTube Shorts requires video, but we don't fail here - let validate_post handle it *)
+        Ok ()
+  
   (** Parse API error response and return structured Error_types.error *)
   let parse_api_error ~status_code ~response_body =
     try
@@ -524,8 +547,13 @@ module Make (Config : CONFIG) = struct
             (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
       (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
   
-  (** Upload video to YouTube Shorts *)
-  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_result =
+  (** Upload video to YouTube Shorts
+      
+      @param validate_media_before_upload When true, validates video file size after 
+             download but before upload. Practical limit: 2GB.
+             Default: false
+  *)
+  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) ?(validate_media_before_upload=false) on_result =
     let _ = alt_texts in (* YouTube doesn't support alt text for videos *)
     let media_count = List.length media_urls in
     match validate_post ~text ~media_count () with
@@ -540,6 +568,29 @@ module Make (Config : CONFIG) = struct
               (fun video_response ->
                 if video_response.status >= 200 && video_response.status < 300 then
                   let video_data = video_response.body in
+                  let file_size = String.length video_data in
+                  
+                  (* Validate if requested *)
+                  let validation_result =
+                    if validate_media_before_upload then
+                      let media : Platform_types.post_media = {
+                        media_type = Platform_types.Video;
+                        mime_type = List.assoc_opt "content-type" video_response.headers 
+                                    |> Option.value ~default:"video/mp4";
+                        file_size_bytes = file_size;
+                        width = None;
+                        height = None;
+                        duration_seconds = None;
+                        alt_text = None;
+                      } in
+                      validate_media_file ~media
+                    else
+                      Ok ()
+                  in
+                  
+                  (match validation_result with
+                  | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+                  | Ok () ->
                   let content_type = 
                     match List.assoc_opt "content-type" video_response.headers with
                     | Some ct -> ct
@@ -599,14 +650,19 @@ module Make (Config : CONFIG) = struct
                             on_result (Error_types.Failure (Error_types.Internal_error (Printf.sprintf "No upload URL in response: %s" init_response.body)))
                       else
                         on_result (Error_types.Failure (parse_api_error ~status_code:init_response.status ~response_body:init_response.body)))
-                    (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err)))
+                    (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
                 else
                   on_result (Error_types.Failure (Error_types.Internal_error (Printf.sprintf "Failed to download video (%d)" video_response.status))))
               (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
           (fun err -> on_result (Error_types.Failure err))
   
-  (** Post thread (YouTube doesn't support threads, posts only first item) *)
-  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_result =
+  (** Post thread (YouTube doesn't support threads, posts only first item)
+      
+      @param validate_media_before_upload When true, validates video file size after 
+             download but before upload. Practical limit: 2GB.
+             Default: false
+  *)
+  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) ?(validate_media_before_upload=false) on_result =
     let _ = alt_texts_per_post in
     let media_counts = List.map List.length media_urls_per_post in
     match validate_thread ~texts ~media_counts () with
@@ -617,6 +673,7 @@ module Make (Config : CONFIG) = struct
         let first_media = List.hd media_urls_per_post in
         let total_requested = List.length texts in
         post_single ~account_id ~text:first_text ~media_urls:first_media
+          ~validate_media_before_upload
           (fun outcome ->
             match outcome with
             | Error_types.Success video_id ->

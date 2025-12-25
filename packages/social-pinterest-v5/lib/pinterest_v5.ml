@@ -356,6 +356,36 @@ module Make (Config : CONFIG) = struct
       | Error errs -> Error [Error_types.Thread_post_invalid { index = 0; errors = errs }]
       | Ok () -> Ok ()
   
+  (** Validate media file for Pinterest
+      
+      Pinterest limits:
+      - Images: 20MB (recommended under 10MB)
+      - Videos: Not supported in current implementation
+  *)
+  let validate_media_file ~(media : Platform_types.post_media) =
+    match media.Platform_types.media_type with
+    | Platform_types.Image ->
+        let max_image_bytes = 20 * 1024 * 1024 in (* 20MB *)
+        if media.file_size_bytes > max_image_bytes then
+          Error [Error_types.Media_too_large { 
+            size_bytes = media.file_size_bytes; 
+            max_bytes = max_image_bytes 
+          }]
+        else
+          Ok ()
+    | Platform_types.Gif ->
+        let max_gif_bytes = 20 * 1024 * 1024 in (* 20MB *)
+        if media.file_size_bytes > max_gif_bytes then
+          Error [Error_types.Media_too_large { 
+            size_bytes = media.file_size_bytes; 
+            max_bytes = max_gif_bytes 
+          }]
+        else
+          Ok ()
+    | Platform_types.Video ->
+        (* Video pins are not supported in this implementation *)
+        Ok ()
+  
   (** Parse API error response and return structured Error_types.error *)
   let parse_api_error ~status_code ~response_body =
     try
@@ -430,11 +460,34 @@ module Make (Config : CONFIG) = struct
       on_error
   
   (** Upload image to Pinterest with optional alt text *)
-  let upload_image ~access_token ~image_url ~alt_text on_success on_error =
+  let upload_image ~access_token ~image_url ~alt_text ?(validate_before_upload=false) on_success on_error =
     (* Download image first *)
     Config.Http.get ~headers:[] image_url
       (fun image_response ->
         if image_response.status >= 200 && image_response.status < 300 then
+          let file_size = String.length image_response.body in
+          
+          (* Validate if requested *)
+          let validation_result =
+            if validate_before_upload then
+              let media : Platform_types.post_media = {
+                media_type = Platform_types.Image;
+                mime_type = List.assoc_opt "content-type" image_response.headers 
+                            |> Option.value ~default:"image/jpeg";
+                file_size_bytes = file_size;
+                width = None;
+                height = None;
+                duration_seconds = None;
+                alt_text = alt_text;
+              } in
+              validate_media_file ~media
+            else
+              Ok ()
+          in
+          
+          (match validation_result with
+          | Error errs -> on_error (Printf.sprintf "Validation failed: %s" (String.concat ", " (List.map Error_types.validation_error_to_string errs)))
+          | Ok () ->
           let url = pinterest_api_base ^ "/media" in
           
           (* Create multipart form data *)
@@ -461,13 +514,18 @@ module Make (Config : CONFIG) = struct
                   on_error (Printf.sprintf "Failed to parse media response: %s" (Printexc.to_string e))
               else
                 on_error (Printf.sprintf "Media upload error (%d): %s" response.status response.body))
-            on_error
+            on_error)
         else
           on_error (Printf.sprintf "Failed to download image (%d)" image_response.status))
       on_error
   
-  (** Post to Pinterest *)
-  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_result =
+  (** Post to Pinterest
+      
+      @param validate_media_before_upload When true, validates image file size after 
+             download but before upload. Pinterest limit: 20MB.
+             Default: false
+  *)
+  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) ?(validate_media_before_upload=false) on_result =
     let media_count = List.length media_urls in
     match validate_post ~text ~media_count () with
     | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
@@ -480,6 +538,7 @@ module Make (Config : CONFIG) = struct
             get_default_board ~access_token
               (fun board_id ->
                 upload_image ~access_token ~image_url ~alt_text
+                  ~validate_before_upload:validate_media_before_upload
                   (fun (media_id, alt_text_opt) ->
                     (* Create pin with uploaded media *)
                     let url = pinterest_api_base ^ "/pins" in
@@ -527,8 +586,13 @@ module Make (Config : CONFIG) = struct
               (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
           (fun err -> on_result (Error_types.Failure err))
   
-  (** Post thread (Pinterest doesn't support threads, posts only first item) *)
-  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_result =
+  (** Post thread (Pinterest doesn't support threads, posts only first item)
+      
+      @param validate_media_before_upload When true, validates image file size after 
+             download but before upload. Pinterest limit: 20MB.
+             Default: false
+  *)
+  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) ?(validate_media_before_upload=false) on_result =
     let media_counts = List.map List.length media_urls_per_post in
     match validate_thread ~texts ~media_counts () with
     | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
@@ -539,6 +603,7 @@ module Make (Config : CONFIG) = struct
         let first_alt_texts = try List.hd alt_texts_per_post with _ -> [] in
         let total_requested = List.length texts in
         post_single ~account_id ~text:first_text ~media_urls:first_media ~alt_texts:first_alt_texts
+          ~validate_media_before_upload
           (fun outcome ->
             match outcome with
             | Error_types.Success pin_id ->

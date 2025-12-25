@@ -406,7 +406,7 @@ module Make (Config : CONFIG) = struct
       else Error (List.rev !errors)
   
   (** Validate media URLs *)
-  let validate_media ~media_urls =
+  let validate_media_urls ~media_urls =
     let errors = ref [] in
     List.iter (fun url ->
       if not (String.starts_with ~prefix:"http://" url || String.starts_with ~prefix:"https://" url) then
@@ -414,6 +414,46 @@ module Make (Config : CONFIG) = struct
     ) media_urls;
     if !errors = [] then Ok ()
     else Error (List.rev !errors)
+  
+  (** Validate media file for Facebook
+      
+      Facebook limits:
+      - Images: 4MB for regular posts
+      - Videos: ~1GB for Reels, 10GB for regular video
+      - Reels: 90 seconds max duration
+  *)
+  let validate_media_file ~(media : Platform_types.post_media) =
+    match media.Platform_types.media_type with
+    | Platform_types.Image ->
+        let max_image_bytes = 4 * 1024 * 1024 in (* 4MB *)
+        if media.file_size_bytes > max_image_bytes then
+          Error [Error_types.Media_too_large { 
+            size_bytes = media.file_size_bytes; 
+            max_bytes = max_image_bytes 
+          }]
+        else
+          Ok ()
+    | Platform_types.Video ->
+        let max_video_bytes = 1024 * 1024 * 1024 in (* 1GB for Reels *)
+        if media.file_size_bytes > max_video_bytes then
+          Error [Error_types.Media_too_large { 
+            size_bytes = media.file_size_bytes; 
+            max_bytes = max_video_bytes 
+          }]
+        else
+          Ok ()
+    | Platform_types.Gif ->
+        let max_gif_bytes = 8 * 1024 * 1024 in (* 8MB *)
+        if media.file_size_bytes > max_gif_bytes then
+          Error [Error_types.Media_too_large { 
+            size_bytes = media.file_size_bytes; 
+            max_bytes = max_gif_bytes 
+          }]
+        else
+          Ok ()
+  
+  (* Keep old name for backward compatibility *)
+  let validate_media = validate_media_urls
   
   (** {1 Error Handling} *)
   
@@ -642,71 +682,94 @@ module Make (Config : CONFIG) = struct
       (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
   
   (** Upload photo to Facebook Page with optional alt text *)
-  let upload_photo ~page_id ~page_access_token ~image_url ~alt_text on_result =
+  let upload_photo ~page_id ~page_access_token ~image_url ~alt_text ?(validate_before_upload=false) on_result =
     (* Download image first *)
     Config.Http.get ~headers:[] image_url
       (fun image_response ->
         if image_response.status >= 200 && image_response.status < 300 then
-          let url = Printf.sprintf "%s/%s/photos" graph_api_base page_id in
+          let file_size = String.length image_response.body in
           
-          (* Add app secret proof if available *)
-          let proof_params = match compute_app_secret_proof ~access_token:page_access_token with
-            | Some proof -> [("appsecret_proof", [proof])]
-            | None -> []
+          (* Validate if requested *)
+          let validation_result =
+            if validate_before_upload then
+              let media : Platform_types.post_media = {
+                media_type = Platform_types.Image;
+                mime_type = List.assoc_opt "content-type" image_response.headers 
+                            |> Option.value ~default:"image/jpeg";
+                file_size_bytes = file_size;
+                width = None;
+                height = None;
+                duration_seconds = None;
+                alt_text = alt_text;
+              } in
+              validate_media_file ~media
+            else
+              Ok ()
           in
           
-          let final_url = 
-            if List.length proof_params > 0 then
-              url ^ "?" ^ Uri.encoded_of_query proof_params
-            else url
-          in
-          
-          (* Create multipart form data *)
-          let base_parts = [
-            {
-              name = "source";
-              filename = Some "image.jpg";
-              content_type = Some "image/jpeg";
-              content = image_response.body;
-            };
-            {
-              name = "published";
-              filename = None;
-              content_type = None;
-              content = "false";  (* Upload unpublished, attach to post later *)
-            };
-          ] in
-          
-          (* Add alt text if provided *)
-          let parts = match alt_text with
-            | Some alt when String.length alt > 0 ->
-                base_parts @ [{
-                  name = "alt_text_custom";
+          (match validation_result with
+          | Error errs -> on_result (Error (Error_types.Validation_error errs))
+          | Ok () ->
+              let url = Printf.sprintf "%s/%s/photos" graph_api_base page_id in
+              
+              (* Add app secret proof if available *)
+              let proof_params = match compute_app_secret_proof ~access_token:page_access_token with
+                | Some proof -> [("appsecret_proof", [proof])]
+                | None -> []
+              in
+              
+              let final_url = 
+                if List.length proof_params > 0 then
+                  url ^ "?" ^ Uri.encoded_of_query proof_params
+                else url
+              in
+              
+              (* Create multipart form data *)
+              let base_parts = [
+                {
+                  name = "source";
+                  filename = Some "image.jpg";
+                  content_type = Some "image/jpeg";
+                  content = image_response.body;
+                };
+                {
+                  name = "published";
                   filename = None;
                   content_type = None;
-                  content = alt;
-                }]
-            | _ -> base_parts
-          in
-          
-          let headers = [
-            ("Authorization", Printf.sprintf "Bearer %s" page_access_token);
-          ] in
-          
-          Config.Http.post_multipart ~headers ~parts final_url
-            (fun response ->
-              update_rate_limits response;
-              if response.status >= 200 && response.status < 300 then
-                try
-                  let open Yojson.Basic.Util in
-                  let json = Yojson.Basic.from_string response.body in
-                  let photo_id = json |> member "id" |> to_string in
-                  on_result (Ok photo_id)
-                with e ->
-                  on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse photo response: %s" (Printexc.to_string e))))
-              else
-                on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
-            (fun err -> on_result (Error (Error_types.Internal_error err)))
+                  content = "false";  (* Upload unpublished, attach to post later *)
+                };
+              ] in
+              
+              (* Add alt text if provided *)
+              let parts = match alt_text with
+                | Some alt when String.length alt > 0 ->
+                    base_parts @ [{
+                      name = "alt_text_custom";
+                      filename = None;
+                      content_type = None;
+                      content = alt;
+                    }]
+                | _ -> base_parts
+              in
+              
+              let headers = [
+                ("Authorization", Printf.sprintf "Bearer %s" page_access_token);
+              ] in
+              
+              Config.Http.post_multipart ~headers ~parts final_url
+                (fun response ->
+                  update_rate_limits response;
+                  if response.status >= 200 && response.status < 300 then
+                    try
+                      let open Yojson.Basic.Util in
+                      let json = Yojson.Basic.from_string response.body in
+                      let photo_id = json |> member "id" |> to_string in
+                      on_result (Ok photo_id)
+                    with e ->
+                      on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse photo response: %s" (Printexc.to_string e))))
+                  else
+                    on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+                (fun err -> on_result (Error (Error_types.Internal_error err))))
         else
           on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to download image from %s (%d)" image_url image_response.status))))
       (fun err -> on_result (Error (Error_types.Internal_error err)))
@@ -1109,8 +1172,13 @@ module Make (Config : CONFIG) = struct
       else
         Ok ()
   
-  (** Post to Facebook Page *)
-  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_result =
+  (** Post to Facebook Page
+      
+      @param validate_media_before_upload When true, validates media file size after 
+             download but before upload. Facebook limits: 4MB images, 1GB video.
+             Default: false
+  *)
+  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) ?(validate_media_before_upload=false) on_result =
     let media_count = List.length media_urls in
     
     (* Validate content first *)
@@ -1131,6 +1199,7 @@ module Make (Config : CONFIG) = struct
                       | [] -> on_complete (Ok (List.rev acc))
                       | (url, alt_text) :: rest ->
                           upload_photo ~page_id ~page_access_token ~image_url:url ~alt_text
+                            ~validate_before_upload:validate_media_before_upload
                             (function
                               | Ok photo_id -> upload_all_photos rest (photo_id :: acc) on_complete
                               | Error e -> on_complete (Error e))
@@ -1191,8 +1260,13 @@ module Make (Config : CONFIG) = struct
                   (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
               (fun err -> on_result (Error_types.Failure err))
   
-  (** Post thread (Facebook doesn't support threads, posts only first item with warning) *)
-  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_result =
+  (** Post thread (Facebook doesn't support threads, posts only first item with warning)
+      
+      @param validate_media_before_upload When true, validates media file size after 
+             download but before upload. Facebook limits: 4MB images, 1GB video.
+             Default: false
+  *)
+  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) ?(validate_media_before_upload=false) on_result =
     if List.length texts = 0 then
       on_result (Error_types.Failure (Error_types.Validation_error [Error_types.Thread_empty]))
     else
@@ -1202,6 +1276,7 @@ module Make (Config : CONFIG) = struct
       let total_posts = List.length texts in
       
       post_single ~account_id ~text:first_text ~media_urls:first_media ~alt_texts:first_alt_texts
+        ~validate_media_before_upload
         (fun outcome ->
           match outcome with
           | Error_types.Success post_id ->

@@ -636,7 +636,7 @@ module Make (Config : CONFIG) = struct
   (** {1 Public API - Posting} *)
   
   (** Post with optional reply references (internal implementation) *)
-  let post_with_reply_impl ~account_id ~text ~media_urls ?(alt_texts=[]) ?(skip_enrichments=false) ~reply_refs on_result =
+  let post_with_reply_impl ~account_id ~text ~media_urls ?(alt_texts=[]) ?(skip_enrichments=false) ?(validate_media_before_upload=false) ~reply_refs on_result =
     (* Validate first *)
     match validate_post ~text ~media_count:(List.length media_urls) () with
     | Error errs ->
@@ -656,6 +656,13 @@ module Make (Config : CONFIG) = struct
                   (url, alt_text)
                 ) media_urls in
                 
+                (* Helper to determine media type from MIME type *)
+                let media_type_of_mime mime_type =
+                  if String.starts_with ~prefix:"video/" mime_type then Platform_types.Video
+                  else if mime_type = "image/gif" then Platform_types.Gif
+                  else Platform_types.Image
+                in
+                
                 (* Helper to upload multiple blobs in sequence *)
                 let rec upload_blobs_seq urls_with_alt acc on_complete on_err =
                   match urls_with_alt with
@@ -669,10 +676,33 @@ module Make (Config : CONFIG) = struct
                               List.assoc_opt "content-type" media_resp.headers 
                               |> Option.value ~default:"application/octet-stream"
                             in
-                            (* Upload blob with alt text *)
-                            upload_blob ~access_jwt ~blob_data:media_resp.body ~mime_type ~alt_text
-                              (fun (blob, alt) -> upload_blobs_seq rest ((blob, alt) :: acc) on_complete on_err)
-                              (fun err -> on_err (Error_types.Internal_error err))
+                            let file_size = String.length media_resp.body in
+                            
+                            (* Validate media if requested *)
+                            let validation_result =
+                              if validate_media_before_upload then
+                                let media : Platform_types.post_media = {
+                                  media_type = media_type_of_mime mime_type;
+                                  mime_type = mime_type;
+                                  file_size_bytes = file_size;
+                                  width = None;
+                                  height = None;
+                                  duration_seconds = None;
+                                  alt_text = alt_text;
+                                } in
+                                validate_media ~media
+                              else
+                                Ok ()
+                            in
+                            
+                            (match validation_result with
+                            | Error errs ->
+                                on_result (Error_types.Failure (Error_types.Validation_error errs))
+                            | Ok () ->
+                                (* Upload blob with alt text *)
+                                upload_blob ~access_jwt ~blob_data:media_resp.body ~mime_type ~alt_text
+                                  (fun (blob, alt) -> upload_blobs_seq rest ((blob, alt) :: acc) on_complete on_err)
+                                  (fun err -> on_err (Error_types.Internal_error err)))
                           else
                             on_err (Error_types.make_api_error
                               ~platform:Platform_types.Bluesky
@@ -825,10 +855,13 @@ module Make (Config : CONFIG) = struct
       @param media_urls List of media URLs to attach (max 4)
       @param alt_texts Optional alt text for each media item
       @param skip_enrichments Skip link card fetching (default: false)
+      @param validate_media_before_upload When true, validates media size after download
+             but before upload. Bluesky limits: 50MB video, 60s duration, 1MB images.
+             Default: false
       @param on_result Callback receiving the outcome
   *)
-  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) ?(skip_enrichments=false) on_result =
-    post_with_reply_impl ~account_id ~text ~media_urls ~alt_texts ~skip_enrichments ~reply_refs:None on_result
+  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) ?(skip_enrichments=false) ?(validate_media_before_upload=false) on_result =
+    post_with_reply_impl ~account_id ~text ~media_urls ~alt_texts ~skip_enrichments ~validate_media_before_upload ~reply_refs:None on_result
   
   (** Post a thread to Bluesky
       
@@ -837,9 +870,11 @@ module Make (Config : CONFIG) = struct
       @param media_urls_per_post Media URLs for each post
       @param alt_texts_per_post Alt texts for each post's media
       @param skip_enrichments Skip link card fetching (default: false)
+      @param validate_media_before_upload When true, validates each media file after download.
+             Default: false
       @param on_result Callback receiving the outcome with thread_result
   *)
-  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) ?(skip_enrichments=false) on_result =
+  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) ?(skip_enrichments=false) ?(validate_media_before_upload=false) on_result =
     (* Validate entire thread upfront *)
     let media_counts = List.map List.length media_urls_per_post in
     match validate_thread ~texts ~media_counts () with
@@ -890,7 +925,7 @@ module Make (Config : CONFIG) = struct
                         Some (root_uri, root_cid, root_uri, root_cid)
               in
               
-              post_with_reply_impl ~account_id ~text ~media_urls:media ~alt_texts ~skip_enrichments ~reply_refs
+              post_with_reply_impl ~account_id ~text ~media_urls:media ~alt_texts ~skip_enrichments ~validate_media_before_upload ~reply_refs
                 (function
                   | Error_types.Success uri_cid ->
                       process_post_result uri_cid [] rest_texts rest_media root_ref acc_uris

@@ -592,7 +592,13 @@ module Make (Config : CONFIG) = struct
           (fun err -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err))))
       (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
   
-  (** Post single status with full options *)
+  (** Post single status with full options
+      
+      @param validate_media_before_upload When true, validates media size after download
+             but before upload. Mastodon limits: 100MB video, 2hr duration, 10MB images.
+             Note: Actual limits depend on instance configuration.
+             Default: false
+  *)
   let post_single 
       ~account_id 
       ~text 
@@ -606,6 +612,7 @@ module Make (Config : CONFIG) = struct
       ?(poll=None)
       ?(scheduled_at=None)
       ?(idempotency_key=None)
+      ?(validate_media_before_upload=false)
       on_result =
     (* Validate content first *)
     let media_count = List.length media_urls in
@@ -620,6 +627,13 @@ module Make (Config : CONFIG) = struct
           (url, alt_text)
         ) media_urls in
         
+        (* Helper to determine media type from MIME type *)
+        let media_type_of_mime mime_type =
+          if String.starts_with ~prefix:"video/" mime_type then Platform_types.Video
+          else if mime_type = "image/gif" then Platform_types.Gif
+          else Platform_types.Image
+        in
+        
         (* Helper to upload media from URLs *)
         let rec upload_media_seq urls_with_alt acc on_complete on_err =
           match urls_with_alt with
@@ -633,12 +647,43 @@ module Make (Config : CONFIG) = struct
                       List.assoc_opt "content-type" media_resp.headers 
                       |> Option.value ~default:"image/jpeg"
                     in
-                    (* Upload to Mastodon with alt text *)
-                    upload_media ~mastodon_creds 
-                      ~media_data:media_resp.body ~mime_type ~description:alt_text ~focus:None
-                      (fun media_id -> 
-                        upload_media_seq rest (media_id :: acc) on_complete on_err)
-                      on_err
+                    let file_size = String.length media_resp.body in
+                    
+                    (* Validate media if requested - inline validation for Mastodon *)
+                    let validation_error =
+                      if validate_media_before_upload then
+                        let media_type = media_type_of_mime mime_type in
+                        match media_type with
+                        | Platform_types.Image when file_size > 10 * 1024 * 1024 ->
+                            Some (Error_types.Media_too_large { 
+                              size_bytes = file_size; 
+                              max_bytes = 10 * 1024 * 1024 
+                            })
+                        | Platform_types.Video when file_size > 100 * 1024 * 1024 ->
+                            Some (Error_types.Media_too_large { 
+                              size_bytes = file_size; 
+                              max_bytes = 100 * 1024 * 1024 
+                            })
+                        | Platform_types.Gif when file_size > 10 * 1024 * 1024 ->
+                            Some (Error_types.Media_too_large { 
+                              size_bytes = file_size; 
+                              max_bytes = 10 * 1024 * 1024 
+                            })
+                        | _ -> None
+                      else
+                        None
+                    in
+                    
+                    (match validation_error with
+                    | Some err ->
+                        on_result (Error_types.Failure (Error_types.Validation_error [err]))
+                    | None ->
+                        (* Upload to Mastodon with alt text *)
+                        upload_media ~mastodon_creds 
+                          ~media_data:media_resp.body ~mime_type ~description:alt_text ~focus:None
+                          (fun media_id -> 
+                            upload_media_seq rest (media_id :: acc) on_complete on_err)
+                          on_err)
                   else
                     on_err (Printf.sprintf "Failed to fetch media from %s" url))
                 on_err
@@ -747,7 +792,11 @@ module Make (Config : CONFIG) = struct
           on_media_error)
       (fun err -> on_result (Error_types.Failure err))
   
-  (** Post thread with full options *)
+  (** Post thread with full options
+      
+      @param validate_media_before_upload When true, validates each media file after download.
+             Default: false
+  *)
   let post_thread 
       ~account_id 
       ~texts 
@@ -756,6 +805,7 @@ module Make (Config : CONFIG) = struct
       ?(visibility=Public)
       ?(sensitive=false)
       ?(spoiler_text=None)
+      ?(validate_media_before_upload=false)
       on_result =
     (* Validate thread content first *)
     let media_counts = List.map List.length media_urls_per_post in
@@ -764,6 +814,13 @@ module Make (Config : CONFIG) = struct
     | Ok () ->
     ensure_valid_token ~account_id
       (fun mastodon_creds ->
+          (* Helper to determine media type from MIME type *)
+          let media_type_of_mime mime_type =
+            if String.starts_with ~prefix:"video/" mime_type then Platform_types.Video
+            else if mime_type = "image/gif" then Platform_types.Gif
+            else Platform_types.Image
+          in
+          
           (* Helper to upload media from URLs for a single post *)
           let upload_post_media media_urls alt_texts on_complete on_err =
             (* Pair URLs with alt text *)
@@ -783,10 +840,41 @@ module Make (Config : CONFIG) = struct
                           List.assoc_opt "content-type" media_resp.headers 
                           |> Option.value ~default:"image/jpeg"
                         in
-                        upload_media ~mastodon_creds 
-                          ~media_data:media_resp.body ~mime_type ~description:alt_text ~focus:None
-                          (fun media_id -> upload_seq rest (media_id :: acc))
-                          on_err
+                        let file_size = String.length media_resp.body in
+                        
+                        (* Validate media if requested - inline validation for Mastodon *)
+                        let validation_error =
+                          if validate_media_before_upload then
+                            let media_type = media_type_of_mime mime_type in
+                            match media_type with
+                            | Platform_types.Image when file_size > 10 * 1024 * 1024 ->
+                                Some (Error_types.Media_too_large { 
+                                  size_bytes = file_size; 
+                                  max_bytes = 10 * 1024 * 1024 
+                                })
+                            | Platform_types.Video when file_size > 100 * 1024 * 1024 ->
+                                Some (Error_types.Media_too_large { 
+                                  size_bytes = file_size; 
+                                  max_bytes = 100 * 1024 * 1024 
+                                })
+                            | Platform_types.Gif when file_size > 10 * 1024 * 1024 ->
+                                Some (Error_types.Media_too_large { 
+                                  size_bytes = file_size; 
+                                  max_bytes = 10 * 1024 * 1024 
+                                })
+                            | _ -> None
+                          else
+                            None
+                        in
+                        
+                        (match validation_error with
+                        | Some err ->
+                            on_result (Error_types.Failure (Error_types.Validation_error [err]))
+                        | None ->
+                            upload_media ~mastodon_creds 
+                              ~media_data:media_resp.body ~mime_type ~description:alt_text ~focus:None
+                              (fun media_id -> upload_seq rest (media_id :: acc))
+                              on_err)
                       else
                         on_err (Printf.sprintf "Failed to fetch media from %s" url))
                     on_err

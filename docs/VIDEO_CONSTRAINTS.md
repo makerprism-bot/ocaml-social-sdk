@@ -286,6 +286,123 @@ Pinterest supports video pins via their Media API, but video upload functionalit
 
 ---
 
+## Media Validation
+
+The SDK provides two ways to validate media before uploading:
+
+### 1. Automatic Validation During Upload
+
+Use the `~validate_media_before_upload` parameter when posting:
+
+```ocaml
+(* Twitter example *)
+Twitter.post_single
+  ~account_id:"my_account"
+  ~text:"Check out this video!"
+  ~media_urls:["https://example.com/video.mp4"]
+  ~validate_media_before_upload:true  (* Enable pre-upload validation *)
+  (function
+    | Error_types.Success id -> print_endline ("Posted: " ^ id)
+    | Error_types.Failure (Error_types.Validation_error errs) ->
+        (* Handle validation errors - e.g., file too large *)
+        List.iter (fun e -> print_endline (Error_types.validation_error_to_string e)) errs
+    | Error_types.Failure err -> print_endline (Error_types.error_to_string err)
+    | Error_types.Partial_success { result; warnings } -> 
+        print_endline ("Posted with warnings: " ^ result))
+
+(* Bluesky example *)
+Bluesky.post_single
+  ~account_id:"my_account"
+  ~text:"New video post"
+  ~media_urls:["https://example.com/video.mp4"]
+  ~validate_media_before_upload:true
+  callback
+
+(* LinkedIn example *)
+LinkedIn.post_single
+  ~account_id:"my_account"
+  ~text:"Professional video content"
+  ~media_urls:["https://example.com/video.mp4"]
+  ~validate_media_before_upload:true
+  callback
+
+(* Mastodon example *)
+Mastodon.post_single
+  ~account_id:"my_account"
+  ~text:"Fediverse video"
+  ~media_urls:["https://example.com/video.mp4"]
+  ~validate_media_before_upload:true
+  callback
+```
+
+**Supported providers**: Twitter, Bluesky, LinkedIn, Mastodon
+
+**What gets validated**:
+- File size (after download, before upload)
+- Media type detection from MIME type
+
+**Not validated** (requires parsing video file):
+- Video duration
+- Resolution/dimensions
+- Codec compatibility
+
+### 2. Standalone Validation
+
+For more control, call `validate_media` directly before uploading:
+
+```ocaml
+(* Create a post_media record with known metadata *)
+let media : Platform_types.post_media = {
+  media_type = Platform_types.Video;
+  mime_type = "video/mp4";
+  file_size_bytes = 100_000_000;  (* 100 MB *)
+  width = Some 1920;
+  height = Some 1080;
+  duration_seconds = Some 120.0;  (* 2 minutes *)
+  alt_text = Some "Video description";
+} in
+
+(* Validate against Twitter limits *)
+match Twitter.validate_media ~media with
+| Ok () -> 
+    (* Safe to upload *)
+    Twitter.post_single ~account_id ~text ~media_urls callback
+| Error errs ->
+    (* Handle validation errors *)
+    List.iter (fun e -> 
+      match e with
+      | Error_types.Media_too_large { size_bytes; max_bytes } ->
+          Printf.printf "File too large: %d bytes (max: %d)\n" size_bytes max_bytes
+      | Error_types.Video_too_long { duration_seconds; max_seconds } ->
+          Printf.printf "Video too long: %.1fs (max: %d)\n" duration_seconds max_seconds
+      | _ -> ()
+    ) errs
+```
+
+### Validation Error Types
+
+```ocaml
+type validation_error =
+  | Media_too_large of { size_bytes: int; max_bytes: int }
+  | Video_too_long of { duration_seconds: float; max_seconds: int }
+  | Too_many_media of { count: int; max: int }
+  | Text_too_long of { length: int; max: int }
+  | ...
+```
+
+### Platform-Specific Limits
+
+| Platform | Max Video Size | Max Duration | Max Images |
+|----------|---------------|--------------|------------|
+| Twitter | 512 MB | 140 sec | 5 MB each |
+| Bluesky | 50 MB | 60 sec | 1 MB each |
+| LinkedIn | 200 MB | 10 min | 8 MB each |
+| Mastodon | 100 MB* | 2 hours* | 10 MB* |
+
+*Mastodon limits vary by instance
+
+---
+
 ## Common Video Best Practices
 
 ### Format Recommendations

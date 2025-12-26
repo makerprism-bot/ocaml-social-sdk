@@ -163,5 +163,4 @@
   yojson
   uri
   base64
-  str
   ptime))

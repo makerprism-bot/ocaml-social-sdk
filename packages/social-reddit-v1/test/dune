@@ -1,0 +1,8 @@
+(test
+ (name test_reddit)
+ (libraries
+  social-reddit-v1
+  social-core
+  str
+  ptime
+  ptime.clock.os))

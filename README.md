@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![OCaml](https://img.shields.io/badge/OCaml-%3E%3D4.14-orange)](https://ocaml.org/)
 
-OCaml SDK for social media APIs. Post content, manage media, handle threads across Twitter, LinkedIn, Bluesky, Mastodon, Facebook, Instagram, YouTube, Pinterest, TikTok. Runtime-agnostic design works with Lwt, Eio, or sync code.
+OCaml SDK for social media APIs. Post content, manage media, handle threads across Twitter, LinkedIn, Bluesky, Mastodon, Facebook, Instagram, YouTube, Pinterest, Reddit, TikTok. Runtime-agnostic design works with Lwt, Eio, or sync code.
 
 > **Warning: Experimental Software**
 >
@@ -30,6 +30,7 @@ OCaml SDK for social media APIs. Post content, manage media, handle threads acro
 | `social-instagram-graph-v21` | Instagram Graph API v21 |
 | `social-youtube-data-v3` | YouTube Data API v3 |
 | `social-pinterest-v5` | Pinterest API v5 |
+| `social-reddit-v1` | Reddit API v1 |
 | `social-tiktok-v1` | TikTok Content Posting API |
 
 ## Installation
@@ -108,6 +109,26 @@ let post = Bluesky_v1.create_post client
   ()
 ```
 
+### Posting to Reddit
+
+```ocaml
+open Social_reddit_v1
+
+module Reddit = Reddit_v1.Make(Your_config)
+
+let () = Reddit.submit_self_post
+  ~account_id:"account123"
+  ~subreddit:"your_subreddit"
+  ~title:"Hello from OCaml!"
+  ~body:"Posted using ocaml-social-sdk"
+  ()
+  (fun outcome ->
+    match outcome with
+    | Error_types.Success post_id -> 
+        Printf.printf "Posted: %s\n" post_id
+    | _ -> ())
+```
+
 ### With Lwt Runtime
 
 ```ocaml
@@ -143,6 +164,7 @@ The SDK follows a runtime-agnostic design:
 | Instagram | ⚠️ | ⚠️ | ⚠️ | - | ⚠️ | ⚠️ | ⚠️ | ⚠️ |
 | YouTube | ⚠️ | - | - | - | - | ⚠️ | ⚠️ | ⚠️ |
 | Pinterest | ⚠️ | ⚠️ | ⚠️ | - | - | - | ⚠️ | ⚠️ |
+| Reddit | ⚠️ | ⚠️ | ⚠️ | - | - | - | ⚠️ | - |
 | TikTok | ⚠️ | - | - | - | - | ⚠️ | ⚠️ | ⚠️ |
 
 ✅ = Used successfully, ⚠️ = Implemented but untested, ❌ = Not implemented (API available), - = Not applicable

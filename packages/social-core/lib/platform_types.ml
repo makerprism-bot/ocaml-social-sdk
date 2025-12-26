@@ -12,6 +12,7 @@ type platform =
   | Pinterest
   | Threads
   | TikTok
+  | Reddit
 
 (** Convert platform to string *)
 let platform_to_string = function
@@ -25,6 +26,7 @@ let platform_to_string = function
   | Pinterest -> "pinterest"
   | Threads -> "threads"
   | TikTok -> "tiktok"
+  | Reddit -> "reddit"
 
 (** Parse platform from string *)
 let platform_of_string = function
@@ -38,6 +40,7 @@ let platform_of_string = function
   | "pinterest" -> Some Pinterest
   | "threads" -> Some Threads
   | "tiktok" -> Some TikTok
+  | "reddit" -> Some Reddit
   | _ -> None
 
 (** Media type *)

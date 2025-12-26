@@ -151,3 +151,17 @@
   yojson
   uri
   ptime))
+
+(package
+ (name social-reddit-v1)
+ (synopsis "Reddit API v1 client")
+ (description "Reddit API v1 client. Supports posting to subreddits (self-posts, links, images, videos, galleries), crossposting, flair management, and subreddit moderation.")
+ (depends
+  (ocaml (>= 4.14))
+  (dune (>= 3.0))
+  (social-core (= :version))
+  yojson
+  uri
+  base64
+  str
+  ptime))

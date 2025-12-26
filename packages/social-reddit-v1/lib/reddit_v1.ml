@@ -1,0 +1,1247 @@
+(** Reddit API v1 Provider
+    
+    This implementation supports posting to Reddit subreddits.
+    
+    Key characteristics:
+    - OAuth 2.0 with Basic Auth (similar to Pinterest)
+    - Access tokens expire in 1 hour
+    - Refresh tokens are long-lived (use duration=permanent)
+    - Posts go to subreddits, not user timelines
+    - All posts require a title (max 300 chars)
+    - Supports self-posts (text), link posts, images, videos, and galleries
+    
+    Required scopes: submit, read, mysubreddits, flair, modposts
+*)
+
+open Social_core
+
+(** {1 Platform Constants} *)
+
+(** Maximum title length for Reddit posts *)
+let max_title_length = 300
+
+(** Maximum body length for self-posts *)
+let max_body_length = 40_000
+
+(** Maximum image size in bytes (20MB) *)
+let max_image_size_bytes = 20 * 1024 * 1024
+
+(** Maximum video size in bytes (1GB) *)
+let max_video_size_bytes = 1024 * 1024 * 1024
+
+(** Maximum video duration in seconds (15 minutes) *)
+let max_video_duration_seconds = 900
+
+(** Maximum images in a gallery *)
+let max_gallery_images = 20
+
+(** {1 Types} *)
+
+(** Reddit post types *)
+type post_kind =
+  | Self      (** Text post with title + body *)
+  | Link      (** Link post with title + URL *)
+  | Image     (** Image post with title + uploaded image *)
+  | Video     (** Video post with title + uploaded video *)
+  | Gallery   (** Gallery post with title + multiple images *)
+  | Crosspost (** Crosspost from another subreddit *)
+
+(** Subreddit information *)
+type subreddit = {
+  id: string;                     (** Subreddit ID (without t5_ prefix) *)
+  name: string;                   (** Subreddit name (without r/ prefix) *)
+  display_name: string;           (** Display name *)
+  subscribers: int;               (** Number of subscribers *)
+  over18: bool;                   (** Whether the subreddit is NSFW *)
+  user_is_moderator: bool;        (** Whether authenticated user is a moderator *)
+  submission_type: string option; (** Allowed submission type: any, link, self *)
+  flair_enabled: bool;            (** Whether link flair is enabled *)
+}
+
+(** Flair information *)
+type flair = {
+  flair_id: string;               (** Flair template ID *)
+  flair_text: string;             (** Flair text *)
+  flair_text_editable: bool;      (** Whether user can edit the text *)
+  flair_css_class: string option; (** CSS class for styling *)
+  background_color: string option;(** Background color *)
+  text_color: string option;      (** Text color: light or dark *)
+}
+
+(** Reddit user info *)
+type user_info = {
+  id: string;                     (** User ID (without t2_ prefix) *)
+  name: string;                   (** Username *)
+  icon_img: string option;        (** Profile icon URL *)
+  total_karma: int;               (** Total karma *)
+  created_utc: float;             (** Account creation timestamp *)
+}
+
+(** Submitted post result *)
+type submitted_post = {
+  id: string;                     (** Post ID (without t3_ prefix) *)
+  full_id: string;                (** Full ID (t3_xxx) *)
+  url: string;                    (** Reddit URL to the post *)
+  subreddit: string;              (** Subreddit name *)
+}
+
+(** Media upload result *)
+type media_upload = {
+  asset_id: string;               (** Asset ID from Reddit *)
+  websocket_url: string option;   (** WebSocket URL for upload status (videos) *)
+  upload_url: string;             (** S3 presigned URL for upload *)
+}
+
+(** {1 OAuth Module} *)
+
+module OAuth = struct
+  (** Scope definitions for Reddit API *)
+  module Scopes = struct
+    (** Scopes required for posting to subreddits *)
+    let posting = [
+      "submit";        (* Submit posts *)
+      "read";          (* Read content *)
+      "mysubreddits";  (* Access moderated/subscribed subreddits *)
+      "flair";         (* Set flair on posts *)
+    ]
+    
+    (** Additional scopes for moderation *)
+    let moderation = posting @ [
+      "modposts";      (* Moderate posts *)
+    ]
+    
+    (** All commonly used scopes *)
+    let all = [
+      "identity";
+      "submit";
+      "read";
+      "mysubreddits";
+      "flair";
+      "modposts";
+      "edit";
+      "history";
+    ]
+    
+    (** Operations that can be performed *)
+    type operation =
+      | Post_text
+      | Post_link
+      | Post_media
+      | Post_crosspost
+      | Read_subreddits
+      | Manage_flair
+      | Moderate
+    
+    (** Get scopes required for specific operations *)
+    let for_operations ops =
+      let needs_submit = List.exists (fun o -> 
+        o = Post_text || o = Post_link || o = Post_media || o = Post_crosspost
+      ) ops in
+      let needs_read = List.exists (fun o -> 
+        o = Read_subreddits || o = Post_crosspost
+      ) ops in
+      let needs_mysubreddits = List.exists (fun o -> 
+        o = Read_subreddits
+      ) ops in
+      let needs_flair = List.exists (fun o -> o = Manage_flair) ops in
+      let needs_modposts = List.exists (fun o -> o = Moderate) ops in
+      (if needs_submit then ["submit"] else []) @
+      (if needs_read then ["read"] else []) @
+      (if needs_mysubreddits then ["mysubreddits"] else []) @
+      (if needs_flair then ["flair"] else []) @
+      (if needs_modposts then ["modposts"] else [])
+  end
+  
+  (** Platform metadata for Reddit OAuth *)
+  module Metadata = struct
+    (** Reddit does NOT support PKCE *)
+    let supports_pkce = false
+    
+    (** Reddit supports token refresh *)
+    let supports_refresh = true
+    
+    (** Access tokens last 1 hour (3600 seconds) *)
+    let access_token_seconds = Some 3600
+    
+    (** Refresh tokens are long-lived (no defined expiration) *)
+    let refresh_token_seconds = None
+    
+    (** Recommended buffer before expiry (5 minutes) *)
+    let refresh_buffer_seconds = 300
+    
+    (** Maximum retry attempts for token operations *)
+    let max_refresh_attempts = 3
+    
+    (** Reddit OAuth authorization endpoint *)
+    let authorization_endpoint = "https://www.reddit.com/api/v1/authorize"
+    
+    (** Reddit OAuth token endpoint *)
+    let token_endpoint = "https://www.reddit.com/api/v1/access_token"
+    
+    (** Reddit API base URL (oauth.reddit.com for authenticated requests) *)
+    let api_base = "https://oauth.reddit.com"
+    
+    (** Reddit public API base URL *)
+    let public_api_base = "https://www.reddit.com"
+  end
+  
+  (** Generate authorization URL for Reddit OAuth 2.0 flow
+      
+      @param client_id Reddit App ID
+      @param redirect_uri Registered callback URL
+      @param state CSRF protection state parameter
+      @param scopes OAuth scopes to request (defaults to Scopes.posting)
+      @param duration Token duration: "temporary" or "permanent" (for refresh tokens)
+      @return Full authorization URL to redirect user to
+  *)
+  let get_authorization_url ~client_id ~redirect_uri ~state 
+      ?(scopes=Scopes.posting) ?(duration="permanent") () =
+    let scope_str = String.concat " " scopes in
+    let params = [
+      ("client_id", client_id);
+      ("redirect_uri", redirect_uri);
+      ("state", state);
+      ("scope", scope_str);
+      ("response_type", "code");
+      ("duration", duration);
+    ] in
+    let query = List.map (fun (k, v) -> 
+      Printf.sprintf "%s=%s" k (Uri.pct_encode v)
+    ) params |> String.concat "&" in
+    Printf.sprintf "%s?%s" Metadata.authorization_endpoint query
+  
+  (** OAuth operations requiring HTTP client *)
+  module Make (Http : HTTP_CLIENT) = struct
+    (** Helper to create Basic Auth header
+        Reddit requires credentials in Basic Auth format for token operations.
+    *)
+    let make_basic_auth ~client_id ~client_secret =
+      let auth_string = String.trim client_id ^ ":" ^ String.trim client_secret in
+      "Basic " ^ Base64.encode_exn auth_string
+    
+    (** Exchange authorization code for access token
+        
+        Note: Reddit uses Basic Authentication - client credentials go
+        in the Authorization header, not in the request body.
+        
+        @param client_id Reddit App ID
+        @param client_secret Reddit App Secret
+        @param redirect_uri Registered callback URL
+        @param code Authorization code from callback
+        @param on_success Continuation receiving credentials
+        @param on_error Continuation receiving error message
+    *)
+    let exchange_code ~client_id ~client_secret ~redirect_uri ~code on_success on_error =
+      let body = Printf.sprintf
+        "grant_type=authorization_code&code=%s&redirect_uri=%s"
+        (Uri.pct_encode code)
+        (Uri.pct_encode redirect_uri)
+      in
+      let headers = [
+        ("Content-Type", "application/x-www-form-urlencoded");
+        ("Authorization", make_basic_auth ~client_id ~client_secret);
+      ] in
+      
+      Http.post ~headers ~body Metadata.token_endpoint
+        (fun response ->
+          if response.status >= 200 && response.status < 300 then
+            try
+              let json = Yojson.Basic.from_string response.body in
+              let open Yojson.Basic.Util in
+              let access_token = json |> member "access_token" |> to_string in
+              let refresh_token = 
+                try Some (json |> member "refresh_token" |> to_string)
+                with _ -> None in
+              let expires_in = 
+                try json |> member "expires_in" |> to_int
+                with _ -> 3600 (* Default to 1 hour *)
+              in
+              let expires_at = 
+                let now = Ptime_clock.now () in
+                match Ptime.add_span now (Ptime.Span.of_int_s expires_in) with
+                | Some exp -> Some (Ptime.to_rfc3339 exp)
+                | None -> None in
+              let token_type = 
+                try json |> member "token_type" |> to_string
+                with _ -> "Bearer" in
+              let creds : credentials = {
+                access_token;
+                refresh_token;
+                expires_at;
+                token_type;
+              } in
+              on_success creds
+            with e ->
+              on_error (Printf.sprintf "Failed to parse token response: %s" (Printexc.to_string e))
+          else
+            on_error (Printf.sprintf "Token exchange failed (%d): %s" response.status response.body))
+        on_error
+    
+    (** Refresh access token
+        
+        Reddit access tokens last 1 hour. Refresh tokens last indefinitely
+        as long as they're used within 1 year.
+        
+        @param client_id Reddit App ID
+        @param client_secret Reddit App Secret
+        @param refresh_token The refresh token from initial auth
+        @param on_success Continuation receiving refreshed credentials
+        @param on_error Continuation receiving error message
+    *)
+    let refresh_token ~client_id ~client_secret ~refresh_token on_success on_error =
+      let body = Printf.sprintf
+        "grant_type=refresh_token&refresh_token=%s"
+        (Uri.pct_encode refresh_token)
+      in
+      let headers = [
+        ("Content-Type", "application/x-www-form-urlencoded");
+        ("Authorization", make_basic_auth ~client_id ~client_secret);
+      ] in
+      
+      Http.post ~headers ~body Metadata.token_endpoint
+        (fun response ->
+          if response.status >= 200 && response.status < 300 then
+            try
+              let json = Yojson.Basic.from_string response.body in
+              let open Yojson.Basic.Util in
+              let access_token = json |> member "access_token" |> to_string in
+              let new_refresh_token = 
+                try Some (json |> member "refresh_token" |> to_string)
+                with _ -> Some refresh_token in  (* Keep old if not returned *)
+              let expires_in = 
+                try json |> member "expires_in" |> to_int
+                with _ -> 3600
+              in
+              let expires_at = 
+                let now = Ptime_clock.now () in
+                match Ptime.add_span now (Ptime.Span.of_int_s expires_in) with
+                | Some exp -> Some (Ptime.to_rfc3339 exp)
+                | None -> None in
+              let token_type = 
+                try json |> member "token_type" |> to_string
+                with _ -> "Bearer" in
+              let creds : credentials = {
+                access_token;
+                refresh_token = new_refresh_token;
+                expires_at;
+                token_type;
+              } in
+              on_success creds
+            with e ->
+              on_error (Printf.sprintf "Failed to parse refresh response: %s" (Printexc.to_string e))
+          else
+            on_error (Printf.sprintf "Token refresh failed (%d): %s" response.status response.body))
+        on_error
+    
+    (** Get user account info using access token
+        
+        @param access_token Valid access token
+        @param on_success Continuation receiving user info
+        @param on_error Continuation receiving error message
+    *)
+    let get_user_info ~access_token on_success on_error =
+      let url = Metadata.api_base ^ "/api/v1/me" in
+      let headers = [
+        ("Authorization", "Bearer " ^ access_token);
+        ("User-Agent", "ocaml:social-reddit-v1:v0.1.0");
+      ] in
+      
+      Http.get ~headers url
+        (fun response ->
+          if response.status >= 200 && response.status < 300 then
+            try
+              let open Yojson.Basic.Util in
+              let json = Yojson.Basic.from_string response.body in
+              let user : user_info = {
+                id = json |> member "id" |> to_string;
+                name = json |> member "name" |> to_string;
+                icon_img = (try Some (json |> member "icon_img" |> to_string) with _ -> None);
+                total_karma = (try json |> member "total_karma" |> to_int with _ -> 0);
+                created_utc = (try json |> member "created_utc" |> to_float with _ -> 0.0);
+              } in
+              on_success user
+            with e ->
+              on_error (Printf.sprintf "Failed to parse user info: %s" (Printexc.to_string e))
+          else
+            on_error (Printf.sprintf "Get user info failed (%d): %s" response.status response.body))
+        on_error
+    
+    (** Revoke access token
+        
+        @param client_id Reddit App ID
+        @param client_secret Reddit App Secret
+        @param token The token to revoke (access or refresh)
+        @param token_type_hint "access_token" or "refresh_token"
+        @param on_success Continuation called on successful revocation
+        @param on_error Continuation receiving error message
+    *)
+    let revoke_token ~client_id ~client_secret ~token ?(token_type_hint="access_token") on_success on_error =
+      let url = "https://www.reddit.com/api/v1/revoke_token" in
+      let body = Printf.sprintf
+        "token=%s&token_type_hint=%s"
+        (Uri.pct_encode token)
+        token_type_hint
+      in
+      let headers = [
+        ("Content-Type", "application/x-www-form-urlencoded");
+        ("Authorization", make_basic_auth ~client_id ~client_secret);
+      ] in
+      
+      Http.post ~headers ~body url
+        (fun response ->
+          (* Reddit returns 204 No Content on success *)
+          if response.status >= 200 && response.status < 300 then
+            on_success ()
+          else
+            on_error (Printf.sprintf "Token revocation failed (%d): %s" response.status response.body))
+        on_error
+  end
+end
+
+(** {1 Configuration Interface} *)
+
+module type CONFIG = sig
+  module Http : HTTP_CLIENT
+  
+  val get_env : string -> string option
+  val get_credentials : account_id:string -> (credentials -> unit) -> (string -> unit) -> unit
+  val update_credentials : account_id:string -> credentials:credentials -> (unit -> unit) -> (string -> unit) -> unit
+  val encrypt : string -> (string -> unit) -> (string -> unit) -> unit
+  val decrypt : string -> (string -> unit) -> (string -> unit) -> unit
+  val update_health_status : account_id:string -> status:string -> error_message:string option -> (unit -> unit) -> (string -> unit) -> unit
+end
+
+(** {1 Main Provider Functor} *)
+
+module Make (Config : CONFIG) = struct
+  let api_base = "https://oauth.reddit.com"
+  
+  (** Required User-Agent for Reddit API *)
+  let user_agent = "ocaml:social-reddit-v1:v0.1.0"
+  
+  (** {1 Validation Functions} *)
+  
+  (** Validate a post title *)
+  let validate_title title =
+    let errors = ref [] in
+    let len = String.length title in
+    if len = 0 then
+      errors := Error_types.Text_empty :: !errors
+    else if len > max_title_length then
+      errors := Error_types.Text_too_long { length = len; max = max_title_length } :: !errors;
+    if !errors = [] then Ok ()
+    else Error (List.rev !errors)
+  
+  (** Validate a post body (for self-posts) *)
+  let validate_body body =
+    let errors = ref [] in
+    let len = String.length body in
+    if len > max_body_length then
+      errors := Error_types.Text_too_long { length = len; max = max_body_length } :: !errors;
+    if !errors = [] then Ok ()
+    else Error (List.rev !errors)
+  
+  (** Validate a complete post *)
+  let validate_post ~title ?body ?url ?(media_count=0) () =
+    let errors = ref [] in
+    
+    (* Title is always required *)
+    (match validate_title title with
+     | Error errs -> errors := !errors @ errs
+     | Ok () -> ());
+    
+    (* Body validation for self-posts *)
+    (match body with
+     | Some b -> 
+         (match validate_body b with
+          | Error errs -> errors := !errors @ errs
+          | Ok () -> ())
+     | None -> ());
+    
+    (* URL validation for link posts *)
+    (match url with
+     | Some u when String.length u > 0 ->
+         (* Basic URL validation *)
+         if not (String.sub u 0 (min 4 (String.length u)) = "http") then
+           errors := Error_types.Invalid_url u :: !errors
+     | _ -> ());
+    
+    (* Gallery validation *)
+    if media_count > max_gallery_images then
+      errors := Error_types.Too_many_media { count = media_count; max = max_gallery_images } :: !errors;
+    
+    if !errors = [] then Ok ()
+    else Error (List.rev !errors)
+  
+  (** Validate media file for Reddit *)
+  let validate_media ~(media : Platform_types.post_media) =
+    match media.Platform_types.media_type with
+    | Platform_types.Image ->
+        if media.file_size_bytes > max_image_size_bytes then
+          Error [Error_types.Media_too_large { 
+            size_bytes = media.file_size_bytes; 
+            max_bytes = max_image_size_bytes 
+          }]
+        else
+          Ok ()
+    | Platform_types.Video ->
+        if media.file_size_bytes > max_video_size_bytes then
+          Error [Error_types.Media_too_large { 
+            size_bytes = media.file_size_bytes; 
+            max_bytes = max_video_size_bytes 
+          }]
+        else
+          (match media.duration_seconds with
+           | Some d when d > float_of_int max_video_duration_seconds ->
+               Error [Error_types.Video_too_long { 
+                 duration_seconds = d; 
+                 max_seconds = max_video_duration_seconds 
+               }]
+           | _ -> Ok ())
+    | Platform_types.Gif ->
+        if media.file_size_bytes > max_image_size_bytes then
+          Error [Error_types.Media_too_large { 
+            size_bytes = media.file_size_bytes; 
+            max_bytes = max_image_size_bytes 
+          }]
+        else
+          Ok ()
+  
+  (** {1 Error Handling} *)
+  
+  (** Parse Reddit API error response *)
+  let parse_api_error ~status_code ~response_body =
+    try
+      let json = Yojson.Basic.from_string response_body in
+      let open Yojson.Basic.Util in
+      
+      (* Check for JSON errors format *)
+      let json_errors = 
+        try json |> member "json" |> member "errors" |> to_list
+        with _ -> []
+      in
+      
+      if List.length json_errors > 0 then
+        let first_error = List.hd json_errors |> to_list in
+        let error_code = List.nth first_error 0 |> to_string in
+        let error_msg = List.nth first_error 1 |> to_string in
+        
+        (* Map Reddit error codes to SDK error types *)
+        match error_code with
+        | "RATELIMIT" ->
+            (* Parse "try again in X minutes/seconds" - handles both singular and plural *)
+            let retry_after = 
+              if String.length error_msg > 0 then
+                try 
+                  let regex = Str.regexp {|in \([0-9]+\) \(minute\|second\|millisecond\)|} in
+                  let _ = Str.search_forward regex error_msg 0 in
+                  let num = int_of_string (Str.matched_group 1 error_msg) in
+                  let unit_str = Str.matched_group 2 error_msg in
+                  Some (if unit_str = "minute" then num * 60 
+                        else if unit_str = "millisecond" then 1  (* round up to 1 second *)
+                        else num)
+                with Not_found -> None
+                   | _ -> None
+              else None
+            in
+            Error_types.Rate_limited { 
+              retry_after_seconds = retry_after;
+              limit = None;
+              remaining = Some 0;
+              reset_at = None;
+            }
+        | "USER_REQUIRED" | "INVALID_TOKEN" ->
+            Error_types.Auth_error Error_types.Token_invalid
+        | "SUBREDDIT_NOTALLOWED" | "SUBREDDIT_NOEXIST" ->
+            Error_types.Auth_error (Error_types.Insufficient_permissions ["subreddit_access"])
+        | "NO_SELFS" ->
+            Error_types.Api_error {
+              status_code;
+              message = "This subreddit doesn't allow text posts";
+              platform = Platform_types.Reddit;
+              raw_response = Some response_body;
+              request_id = None;
+            }
+        | "NO_LINKS" ->
+            Error_types.Api_error {
+              status_code;
+              message = "This subreddit doesn't allow link posts";
+              platform = Platform_types.Reddit;
+              raw_response = Some response_body;
+              request_id = None;
+            }
+        | "BAD_SR_NAME" ->
+            Error_types.Resource_not_found ("subreddit: " ^ error_msg)
+        | "ALREADY_SUB" ->
+            Error_types.Duplicate_content
+        | _ ->
+            Error_types.Api_error {
+              status_code;
+              message = error_msg;
+              platform = Platform_types.Reddit;
+              raw_response = Some response_body;
+              request_id = None;
+            }
+      else
+        (* Check for simple error format *)
+        let error_msg = 
+          try json |> member "message" |> to_string
+          with _ -> 
+            try json |> member "error" |> to_string
+            with _ -> response_body
+        in
+        
+        if status_code = 401 then
+          Error_types.Auth_error Error_types.Token_invalid
+        else if status_code = 403 then
+          Error_types.Auth_error (Error_types.Insufficient_permissions [])
+        else if status_code = 429 then
+          Error_types.Rate_limited { 
+            retry_after_seconds = Some 60;
+            limit = None;
+            remaining = Some 0;
+            reset_at = None;
+          }
+        else
+          Error_types.Api_error {
+            status_code;
+            message = error_msg;
+            platform = Platform_types.Reddit;
+            raw_response = Some response_body;
+            request_id = None;
+          }
+    with _ ->
+      Error_types.Api_error {
+        status_code;
+        message = response_body;
+        platform = Platform_types.Reddit;
+        raw_response = Some response_body;
+        request_id = None;
+      }
+  
+  (** {1 Token Management} *)
+  
+  (** Check if token needs refresh *)
+  let token_needs_refresh creds =
+    match creds.expires_at with
+    | None -> false  (* No expiry info, assume valid *)
+    | Some expires_at_str ->
+        try
+          match Ptime.of_rfc3339 expires_at_str with
+          | Ok (exp_time, _, _) ->
+              let now = Ptime_clock.now () in
+              let buffer = Ptime.Span.of_int_s OAuth.Metadata.refresh_buffer_seconds in
+              (match Ptime.sub_span exp_time buffer with
+               | Some threshold -> Ptime.is_earlier now ~than:threshold |> not
+               | None -> true)
+          | Error _ -> false
+        with _ -> false
+  
+  (** Ensure we have a valid access token, refreshing if necessary *)
+  let ensure_valid_token ~account_id on_success on_error =
+    Config.get_credentials ~account_id
+      (fun creds ->
+        if token_needs_refresh creds then
+          match creds.refresh_token with
+          | Some refresh_tok ->
+              let client_id = Config.get_env "REDDIT_CLIENT_ID" |> Option.value ~default:"" in
+              let client_secret = Config.get_env "REDDIT_CLIENT_SECRET" |> Option.value ~default:"" in
+              if client_id = "" || client_secret = "" then
+                on_error (Error_types.Auth_error Error_types.Missing_credentials)
+              else
+                let module OAuthHttp = OAuth.Make(Config.Http) in
+                OAuthHttp.refresh_token ~client_id ~client_secret ~refresh_token:refresh_tok
+                  (fun new_creds ->
+                    Config.update_credentials ~account_id ~credentials:new_creds
+                      (fun () ->
+                        Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
+                          (fun () -> on_success new_creds.access_token)
+                          (fun _ -> on_success new_creds.access_token))
+                      (fun err ->
+                        Config.update_health_status ~account_id ~status:"refresh_failed" ~error_message:(Some err)
+                          (fun () -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err)))
+                          (fun _ -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err)))))
+                  (fun err ->
+                    Config.update_health_status ~account_id ~status:"refresh_failed" ~error_message:(Some err)
+                      (fun () -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err)))
+                      (fun _ -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+          | None ->
+              on_error (Error_types.Auth_error Error_types.Token_expired)
+        else
+          Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
+            (fun () -> on_success creds.access_token)
+            (fun _ -> on_success creds.access_token))
+      (fun err -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err)))
+  
+  (** {1 API Functions} *)
+  
+  (** Get moderated subreddits for the authenticated user *)
+  let get_moderated_subreddits ~account_id on_result =
+    ensure_valid_token ~account_id
+      (fun access_token ->
+        let url = api_base ^ "/subreddits/mine/moderator?limit=100" in
+        let headers = [
+          ("Authorization", "Bearer " ^ access_token);
+          ("User-Agent", user_agent);
+        ] in
+        
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let open Yojson.Basic.Util in
+                let json = Yojson.Basic.from_string response.body in
+                let children = json |> member "data" |> member "children" |> to_list in
+                let subreddits = List.map (fun child ->
+                  let data = child |> member "data" in
+                  {
+                    id = data |> member "id" |> to_string;
+                    name = data |> member "display_name" |> to_string;
+                    display_name = data |> member "display_name" |> to_string;
+                    subscribers = (try data |> member "subscribers" |> to_int with _ -> 0);
+                    over18 = (try data |> member "over18" |> to_bool with _ -> false);
+                    user_is_moderator = true;
+                    submission_type = (try Some (data |> member "submission_type" |> to_string) with _ -> None);
+                    flair_enabled = (try data |> member "link_flair_enabled" |> to_bool with _ -> false);
+                  }
+                ) children in
+                on_result (Error_types.Success subreddits)
+              with e ->
+                on_result (Error_types.Failure (Error_types.Internal_error (Printf.sprintf "Failed to parse subreddits: %s" (Printexc.to_string e))))
+            else
+              on_result (Error_types.Failure (parse_api_error ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+      (fun err -> on_result (Error_types.Failure err))
+  
+  (** Get available flairs for a subreddit *)
+  let get_subreddit_flairs ~account_id ~subreddit on_result =
+    ensure_valid_token ~account_id
+      (fun access_token ->
+        let url = Printf.sprintf "%s/r/%s/api/link_flair_v2" api_base subreddit in
+        let headers = [
+          ("Authorization", "Bearer " ^ access_token);
+          ("User-Agent", user_agent);
+        ] in
+        
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let open Yojson.Basic.Util in
+                let json = Yojson.Basic.from_string response.body in
+                let flair_list = to_list json in
+                let flairs = List.map (fun f ->
+                  {
+                    flair_id = f |> member "id" |> to_string;
+                    flair_text = (try f |> member "text" |> to_string with _ -> "");
+                    flair_text_editable = (try f |> member "text_editable" |> to_bool with _ -> false);
+                    flair_css_class = (try Some (f |> member "css_class" |> to_string) with _ -> None);
+                    background_color = (try Some (f |> member "background_color" |> to_string) with _ -> None);
+                    text_color = (try Some (f |> member "text_color" |> to_string) with _ -> None);
+                  }
+                ) flair_list in
+                on_result (Error_types.Success flairs)
+              with e ->
+                on_result (Error_types.Failure (Error_types.Internal_error (Printf.sprintf "Failed to parse flairs: %s" (Printexc.to_string e))))
+            else
+              on_result (Error_types.Failure (parse_api_error ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+      (fun err -> on_result (Error_types.Failure err))
+
+  (** Check if a subreddit requires flair for posts *)
+  let check_flair_required ~account_id ~subreddit on_result =
+    ensure_valid_token ~account_id
+      (fun access_token ->
+        let url = Printf.sprintf "%s/api/v1/%s/post_requirements" api_base subreddit in
+        let headers = [
+          ("Authorization", "Bearer " ^ access_token);
+          ("User-Agent", user_agent);
+        ] in
+        
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let open Yojson.Basic.Util in
+                let json = Yojson.Basic.from_string response.body in
+                let flair_required = 
+                  try json |> member "is_flair_required" |> to_bool
+                  with _ -> false
+                in
+                on_result (Error_types.Success flair_required)
+              with e ->
+                on_result (Error_types.Failure (Error_types.Internal_error (Printf.sprintf "Failed to parse post requirements: %s" (Printexc.to_string e))))
+            else if response.status = 404 then
+              (* Post requirements endpoint may not exist for all subreddits *)
+              on_result (Error_types.Success false)
+            else
+              on_result (Error_types.Failure (parse_api_error ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+      (fun err -> on_result (Error_types.Failure err))
+  
+  (** Submit a self-post (text post) to a subreddit *)
+  let submit_self_post ~account_id ~subreddit ~title ?body 
+      ?flair_id ?flair_text ?(nsfw=false) ?(spoiler=false) () on_result =
+    (* Validate *)
+    match validate_post ~title ?body () with
+    | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        ensure_valid_token ~account_id
+          (fun access_token ->
+            let url = api_base ^ "/api/submit" in
+            
+            (* Build form data *)
+            let form_params = [
+              ("api_type", "json");
+              ("kind", "self");
+              ("sr", subreddit);
+              ("title", title);
+              ("text", Option.value ~default:"" body);
+              ("nsfw", string_of_bool nsfw);
+              ("spoiler", string_of_bool spoiler);
+            ] in
+            
+            (* Add optional flair *)
+            let form_params = match flair_id with
+              | Some id -> ("flair_id", id) :: form_params
+              | None -> form_params
+            in
+            let form_params = match flair_text with
+              | Some text -> ("flair_text", text) :: form_params
+              | None -> form_params
+            in
+            
+            let body = List.map (fun (k, v) ->
+              Printf.sprintf "%s=%s" k (Uri.pct_encode v)
+            ) form_params |> String.concat "&" in
+            
+            let headers = [
+              ("Authorization", "Bearer " ^ access_token);
+              ("User-Agent", user_agent);
+              ("Content-Type", "application/x-www-form-urlencoded");
+            ] in
+            
+            Config.Http.post ~headers ~body url
+              (fun response ->
+                if response.status >= 200 && response.status < 300 then
+                  try
+                    let open Yojson.Basic.Util in
+                    let json = Yojson.Basic.from_string response.body in
+                    
+                    (* Check for errors in the JSON response *)
+                    let errors = 
+                      try json |> member "json" |> member "errors" |> to_list
+                      with _ -> []
+                    in
+                    
+                    if List.length errors > 0 then
+                      on_result (Error_types.Failure (parse_api_error ~status_code:200 ~response_body:response.body))
+                    else
+                      let data = json |> member "json" |> member "data" in
+                      let post : submitted_post = {
+                        id = data |> member "id" |> to_string;
+                        full_id = data |> member "name" |> to_string;
+                        url = data |> member "url" |> to_string;
+                        subreddit;
+                      } in
+                      on_result (Error_types.Success post.id)
+                  with e ->
+                    on_result (Error_types.Failure (Error_types.Internal_error (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))))
+                else
+                  on_result (Error_types.Failure (parse_api_error ~status_code:response.status ~response_body:response.body)))
+              (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+          (fun err -> on_result (Error_types.Failure err))
+  
+  (** Submit a link post to a subreddit *)
+  let submit_link_post ~account_id ~subreddit ~title ~url:link_url 
+      ?flair_id ?flair_text ?(nsfw=false) ?(spoiler=false) ?(resubmit=false) () on_result =
+    (* Validate *)
+    match validate_post ~title ~url:link_url () with
+    | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        ensure_valid_token ~account_id
+          (fun access_token ->
+            let api_url = api_base ^ "/api/submit" in
+            
+            (* Build form data *)
+            let form_params = [
+              ("api_type", "json");
+              ("kind", "link");
+              ("sr", subreddit);
+              ("title", title);
+              ("url", link_url);
+              ("nsfw", string_of_bool nsfw);
+              ("spoiler", string_of_bool spoiler);
+              ("resubmit", string_of_bool resubmit);
+            ] in
+            
+            (* Add optional flair *)
+            let form_params = match flair_id with
+              | Some id -> ("flair_id", id) :: form_params
+              | None -> form_params
+            in
+            let form_params = match flair_text with
+              | Some text -> ("flair_text", text) :: form_params
+              | None -> form_params
+            in
+            
+            let body = List.map (fun (k, v) ->
+              Printf.sprintf "%s=%s" k (Uri.pct_encode v)
+            ) form_params |> String.concat "&" in
+            
+            let headers = [
+              ("Authorization", "Bearer " ^ access_token);
+              ("User-Agent", user_agent);
+              ("Content-Type", "application/x-www-form-urlencoded");
+            ] in
+            
+            Config.Http.post ~headers ~body api_url
+              (fun response ->
+                if response.status >= 200 && response.status < 300 then
+                  try
+                    let open Yojson.Basic.Util in
+                    let json = Yojson.Basic.from_string response.body in
+                    
+                    let errors = 
+                      try json |> member "json" |> member "errors" |> to_list
+                      with _ -> []
+                    in
+                    
+                    if List.length errors > 0 then
+                      on_result (Error_types.Failure (parse_api_error ~status_code:200 ~response_body:response.body))
+                    else
+                      let data = json |> member "json" |> member "data" in
+                      let post : submitted_post = {
+                        id = data |> member "id" |> to_string;
+                        full_id = data |> member "name" |> to_string;
+                        url = data |> member "url" |> to_string;
+                        subreddit;
+                      } in
+                      on_result (Error_types.Success post.id)
+                  with e ->
+                    on_result (Error_types.Failure (Error_types.Internal_error (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))))
+                else
+                  on_result (Error_types.Failure (parse_api_error ~status_code:response.status ~response_body:response.body)))
+              (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+          (fun err -> on_result (Error_types.Failure err))
+  
+  (** Get media upload lease from Reddit (for image/video posts) *)
+  let get_media_upload_lease ~account_id ~filename ~mimetype on_result =
+    ensure_valid_token ~account_id
+      (fun access_token ->
+        let url = api_base ^ "/api/media/asset.json" in
+        
+        let form_params = [
+          ("filepath", filename);
+          ("mimetype", mimetype);
+        ] in
+        
+        let body = List.map (fun (k, v) ->
+          Printf.sprintf "%s=%s" k (Uri.pct_encode v)
+        ) form_params |> String.concat "&" in
+        
+        let headers = [
+          ("Authorization", "Bearer " ^ access_token);
+          ("User-Agent", user_agent);
+          ("Content-Type", "application/x-www-form-urlencoded");
+        ] in
+        
+        Config.Http.post ~headers ~body url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let open Yojson.Basic.Util in
+                let json = Yojson.Basic.from_string response.body in
+                let args = json |> member "args" in
+                let upload : media_upload = {
+                  asset_id = args |> member "asset" |> member "asset_id" |> to_string;
+                  websocket_url = (try Some (args |> member "asset" |> member "websocket_url" |> to_string) with _ -> None);
+                  upload_url = args |> member "action" |> to_string;
+                } in
+                on_result (Error_types.Success upload)
+              with e ->
+                on_result (Error_types.Failure (Error_types.Internal_error (Printf.sprintf "Failed to parse media lease: %s" (Printexc.to_string e))))
+            else
+              on_result (Error_types.Failure (parse_api_error ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+      (fun err -> on_result (Error_types.Failure err))
+  
+  (** Upload media to Reddit's S3 bucket *)
+  let upload_media_to_s3 ~upload_url ~upload_fields ~media_content ~mimetype on_result =
+    (* Build multipart form with upload fields + file *)
+    let field_parts = List.map (fun (name, value) ->
+      { name; filename = None; content_type = None; content = value }
+    ) upload_fields in
+    
+    let file_part = {
+      name = "file";
+      filename = Some "media";
+      content_type = Some mimetype;
+      content = media_content;
+    } in
+    
+    let parts = field_parts @ [file_part] in
+    
+    Config.Http.post_multipart ~headers:[] ~parts upload_url
+      (fun response ->
+        if response.status >= 200 && response.status < 300 then
+          on_result (Error_types.Success ())
+        else
+          on_result (Error_types.Failure (Error_types.Internal_error (Printf.sprintf "S3 upload failed (%d): %s" response.status response.body))))
+      (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err)))
+  
+  (** Submit an image post to a subreddit *)
+  let submit_image_post ~account_id ~subreddit ~title ~image_url
+      ?flair_id ?flair_text ?(nsfw=false) ?(spoiler=false) () on_result =
+    (* Validate *)
+    match validate_post ~title ~media_count:1 () with
+    | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        ensure_valid_token ~account_id
+          (fun access_token ->
+            let api_url = api_base ^ "/api/submit" in
+            
+            (* Build form data - using image URL directly *)
+            let form_params = [
+              ("api_type", "json");
+              ("kind", "image");
+              ("sr", subreddit);
+              ("title", title);
+              ("url", image_url);
+              ("nsfw", string_of_bool nsfw);
+              ("spoiler", string_of_bool spoiler);
+            ] in
+            
+            (* Add optional flair *)
+            let form_params = match flair_id with
+              | Some id -> ("flair_id", id) :: form_params
+              | None -> form_params
+            in
+            let form_params = match flair_text with
+              | Some text -> ("flair_text", text) :: form_params
+              | None -> form_params
+            in
+            
+            let body = List.map (fun (k, v) ->
+              Printf.sprintf "%s=%s" k (Uri.pct_encode v)
+            ) form_params |> String.concat "&" in
+            
+            let headers = [
+              ("Authorization", "Bearer " ^ access_token);
+              ("User-Agent", user_agent);
+              ("Content-Type", "application/x-www-form-urlencoded");
+            ] in
+            
+            Config.Http.post ~headers ~body api_url
+              (fun response ->
+                if response.status >= 200 && response.status < 300 then
+                  try
+                    let open Yojson.Basic.Util in
+                    let json = Yojson.Basic.from_string response.body in
+                    
+                    let errors = 
+                      try json |> member "json" |> member "errors" |> to_list
+                      with _ -> []
+                    in
+                    
+                    if List.length errors > 0 then
+                      on_result (Error_types.Failure (parse_api_error ~status_code:200 ~response_body:response.body))
+                    else
+                      let data = json |> member "json" |> member "data" in
+                      let post_id = data |> member "id" |> to_string in
+                      on_result (Error_types.Success post_id)
+                  with e ->
+                    on_result (Error_types.Failure (Error_types.Internal_error (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))))
+                else
+                  on_result (Error_types.Failure (parse_api_error ~status_code:response.status ~response_body:response.body)))
+              (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+          (fun err -> on_result (Error_types.Failure err))
+  
+  (** Crosspost from another subreddit *)
+  let submit_crosspost ~account_id ~subreddit ~title ~original_post_id
+      ?flair_id ?flair_text ?(nsfw=false) ?(spoiler=false) () on_result =
+    (* Validate title *)
+    match validate_title title with
+    | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        ensure_valid_token ~account_id
+          (fun access_token ->
+            let api_url = api_base ^ "/api/submit" in
+            
+            (* Ensure original_post_id has t3_ prefix *)
+            let crosspost_fullname = 
+              if String.length original_post_id > 3 && String.sub original_post_id 0 3 = "t3_" then
+                original_post_id
+              else
+                "t3_" ^ original_post_id
+            in
+            
+            (* Build form data *)
+            let form_params = [
+              ("api_type", "json");
+              ("kind", "crosspost");
+              ("sr", subreddit);
+              ("title", title);
+              ("crosspost_fullname", crosspost_fullname);
+              ("nsfw", string_of_bool nsfw);
+              ("spoiler", string_of_bool spoiler);
+            ] in
+            
+            (* Add optional flair *)
+            let form_params = match flair_id with
+              | Some id -> ("flair_id", id) :: form_params
+              | None -> form_params
+            in
+            let form_params = match flair_text with
+              | Some text -> ("flair_text", text) :: form_params
+              | None -> form_params
+            in
+            
+            let body = List.map (fun (k, v) ->
+              Printf.sprintf "%s=%s" k (Uri.pct_encode v)
+            ) form_params |> String.concat "&" in
+            
+            let headers = [
+              ("Authorization", "Bearer " ^ access_token);
+              ("User-Agent", user_agent);
+              ("Content-Type", "application/x-www-form-urlencoded");
+            ] in
+            
+            Config.Http.post ~headers ~body api_url
+              (fun response ->
+                if response.status >= 200 && response.status < 300 then
+                  try
+                    let open Yojson.Basic.Util in
+                    let json = Yojson.Basic.from_string response.body in
+                    
+                    let errors = 
+                      try json |> member "json" |> member "errors" |> to_list
+                      with _ -> []
+                    in
+                    
+                    if List.length errors > 0 then
+                      on_result (Error_types.Failure (parse_api_error ~status_code:200 ~response_body:response.body))
+                    else
+                      let data = json |> member "json" |> member "data" in
+                      let post_id = data |> member "id" |> to_string in
+                      on_result (Error_types.Success post_id)
+                  with e ->
+                    on_result (Error_types.Failure (Error_types.Internal_error (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))))
+                else
+                  on_result (Error_types.Failure (parse_api_error ~status_code:response.status ~response_body:response.body)))
+              (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+          (fun err -> on_result (Error_types.Failure err))
+  
+  (** Unified post_single function matching other platform APIs
+      
+      This function automatically determines the post type based on parameters:
+      - If body is provided without url/media: self-post
+      - If url is provided without media: link post  
+      - If media_urls is provided: image post (first image)
+      
+      @param account_id Account identifier
+      @param subreddit Subreddit to post to (without r/ prefix)
+      @param title Post title (required, max 300 chars)
+      @param body Optional post body for self-posts
+      @param url Optional URL for link posts
+      @param media_urls Optional list of media URLs for image posts
+      @param flair_id Optional flair template ID
+      @param flair_text Optional flair text
+      @param nsfw Mark post as NSFW
+      @param spoiler Mark post as spoiler
+  *)
+  let post_single ~account_id ~subreddit ~title ?body ?url ?(media_urls=[]) 
+      ?flair_id ?flair_text ?(nsfw=false) ?(spoiler=false) () on_result =
+    let media_count = List.length media_urls in
+    
+    (* Determine post type based on parameters *)
+    if media_count > 0 then
+      (* Image post *)
+      let image_url = List.hd media_urls in
+      submit_image_post ~account_id ~subreddit ~title ~image_url
+        ?flair_id ?flair_text ~nsfw ~spoiler () on_result
+    else match url with
+    | Some link_url when String.length link_url > 0 ->
+        (* Link post *)
+        submit_link_post ~account_id ~subreddit ~title ~url:link_url
+          ?flair_id ?flair_text ~nsfw ~spoiler () on_result
+    | _ ->
+        (* Self-post *)
+        submit_self_post ~account_id ~subreddit ~title ?body
+          ?flair_id ?flair_text ~nsfw ~spoiler () on_result
+  
+  (** Delete a post *)
+  let delete_post ~account_id ~post_id on_result =
+    ensure_valid_token ~account_id
+      (fun access_token ->
+        let url = api_base ^ "/api/del" in
+        
+        (* Ensure post_id has t3_ prefix *)
+        let full_id = 
+          if String.length post_id > 3 && String.sub post_id 0 3 = "t3_" then
+            post_id
+          else
+            "t3_" ^ post_id
+        in
+        
+        let body = Printf.sprintf "id=%s" (Uri.pct_encode full_id) in
+        
+        let headers = [
+          ("Authorization", "Bearer " ^ access_token);
+          ("User-Agent", user_agent);
+          ("Content-Type", "application/x-www-form-urlencoded");
+        ] in
+        
+        Config.Http.post ~headers ~body url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              on_result (Error_types.Success ())
+            else
+              on_result (Error_types.Failure (parse_api_error ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+      (fun err -> on_result (Error_types.Failure err))
+  
+  (** {1 OAuth Convenience Functions} *)
+  
+  (** Generate OAuth authorization URL *)
+  let get_oauth_url ~redirect_uri ~state on_success on_error =
+    let client_id = Config.get_env "REDDIT_CLIENT_ID" |> Option.value ~default:"" in
+    
+    if client_id = "" then
+      on_error "Reddit client ID not configured"
+    else
+      let url = OAuth.get_authorization_url ~client_id ~redirect_uri ~state 
+        ~scopes:OAuth.Scopes.moderation ~duration:"permanent" () in
+      on_success url
+  
+  (** Exchange OAuth code for access token and fetch initial data *)
+  let exchange_code ~code ~redirect_uri on_success on_error =
+    let client_id = Config.get_env "REDDIT_CLIENT_ID" |> Option.value ~default:"" in
+    let client_secret = Config.get_env "REDDIT_CLIENT_SECRET" |> Option.value ~default:"" in
+    
+    if client_id = "" || client_secret = "" then
+      on_error "Reddit OAuth credentials not configured"
+    else
+      let module OAuthHttp = OAuth.Make(Config.Http) in
+      OAuthHttp.exchange_code ~client_id ~client_secret ~redirect_uri ~code
+        on_success
+        on_error
+  
+  (** Get user info with the current credentials *)
+  let get_user_info ~account_id on_result =
+    ensure_valid_token ~account_id
+      (fun access_token ->
+        let module OAuthHttp = OAuth.Make(Config.Http) in
+        OAuthHttp.get_user_info ~access_token
+          (fun user -> on_result (Error_types.Success user))
+          (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+      (fun err -> on_result (Error_types.Failure err))
+  
+  (** {1 Content Validation Helper} *)
+  
+  (** Validate content (title and optional body) *)
+  let validate_content ~title ?body () =
+    match validate_post ~title ?body () with
+    | Ok () -> Ok ()
+    | Error errs -> Error (String.concat "; " (List.map Error_types.validation_error_to_string errs))
+end

@@ -17,21 +17,21 @@
 open Social_core
 
 (** OAuth 2.0 module for Instagram Graph API
-    
+
     Instagram uses Facebook's OAuth 2.0 infrastructure with some key differences:
-    
+
     Token types:
     - Short-lived user tokens: ~1-2 hours (from Facebook code exchange)
-    - Long-lived user tokens: ~60 days (via ig_exchange_token grant)
-    
+    - Long-lived user tokens: ~60 days (via fb_exchange_token grant on Facebook Graph API)
+
     Token refresh:
     - Long-lived tokens can be refreshed using ig_refresh_token grant
     - Must refresh before expiration (within 60 days)
     - Cannot refresh short-lived tokens directly
-    
+
     IMPORTANT: Instagram Business/Creator accounts ONLY.
     Personal Instagram accounts cannot use the Graph API.
-    
+
     Required environment variables (or pass directly to functions):
     - FACEBOOK_APP_ID: App ID from Facebook Developer Portal
     - FACEBOOK_APP_SECRET: App Secret (same app as Facebook)
@@ -209,22 +209,25 @@ module OAuth = struct
         (fun err -> on_result (Error (Error_types.Internal_error err)))
     
     (** Exchange short-lived token for long-lived token (60 days)
-        
+
         IMPORTANT: Always call this after exchange_code to get a usable token.
-        Uses the ig_exchange_token grant type on the Instagram Graph API endpoint.
-        
+        Uses the fb_exchange_token grant type on the Facebook Graph API endpoint.
+        This is for Instagram Graph API tokens obtained via Facebook Login.
+
+        @param client_id Facebook App ID
         @param client_secret Facebook App Secret
         @param short_lived_token The short-lived token from exchange_code
         @param on_result Continuation receiving api_result with long-lived credentials
     *)
-    let exchange_for_long_lived_token ~client_secret ~short_lived_token on_result =
+    let exchange_for_long_lived_token ~client_id ~client_secret ~short_lived_token on_result =
       let params = [
-        ("grant_type", ["ig_exchange_token"]);
+        ("grant_type", ["fb_exchange_token"]);
+        ("client_id", [client_id]);
         ("client_secret", [client_secret]);
-        ("access_token", [short_lived_token]);
+        ("fb_exchange_token", [short_lived_token]);
       ] in
       let query = Uri.encoded_of_query params in
-      let url = Printf.sprintf "%s?%s" Metadata.instagram_token_endpoint query in
+      let url = Printf.sprintf "%s?%s" Metadata.token_endpoint query in
       
       Http.get url
         (fun response ->
@@ -1458,21 +1461,27 @@ module Make (Config : CONFIG) = struct
         on_error
     )
   
-  (** Exchange short-lived token for long-lived token (60 days) *)
+  (** Exchange short-lived token for long-lived token (60 days)
+
+      Uses the fb_exchange_token grant type on the Facebook Graph API endpoint.
+      This is for Instagram Graph API tokens obtained via Facebook Login.
+  *)
   and exchange_for_long_lived_token ~short_lived_token on_success on_error =
+    let client_id = Config.get_env "FACEBOOK_APP_ID" |> Option.value ~default:"" in
     let client_secret = Config.get_env "FACEBOOK_APP_SECRET" |> Option.value ~default:"" in
-    
-    if client_secret = "" then
-      on_error "Facebook App Secret not configured"
+
+    if client_id = "" || client_secret = "" then
+      on_error "Facebook OAuth credentials not configured"
     else (
       let params = [
-        ("grant_type", ["ig_exchange_token"]);
+        ("grant_type", ["fb_exchange_token"]);
+        ("client_id", [client_id]);
         ("client_secret", [client_secret]);
-        ("access_token", [short_lived_token]);
+        ("fb_exchange_token", [short_lived_token]);
       ] in
-      
+
       let query = Uri.encoded_of_query params in
-      let url = Printf.sprintf "https://graph.instagram.com/access_token?%s" query in
+      let url = Printf.sprintf "%s/oauth/access_token?%s" graph_api_base query in
       
       Config.Http.get ~headers:[] url
         (fun response ->

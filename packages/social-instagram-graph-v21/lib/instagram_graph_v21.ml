@@ -669,20 +669,17 @@ module Make (Config : CONFIG) = struct
   let refresh_token ~access_token on_success on_error =
     let params = [
       ("grant_type", ["ig_refresh_token"]);
+      ("access_token", [access_token]);
     ] @
     (match compute_app_secret_proof ~access_token with
      | Some proof -> [("appsecret_proof", [proof])]
      | None -> [])
     in
-    
+
     let query = Uri.encoded_of_query params in
     let url = Printf.sprintf "https://graph.instagram.com/refresh_access_token?%s" query in
-    
-    let headers = [
-      ("Authorization", Printf.sprintf "Bearer %s" access_token);
-    ] in
-    
-    Config.Http.get ~headers url
+
+    Config.Http.get url
       (fun response ->
         update_rate_limits response;
         if response.status >= 200 && response.status < 300 then

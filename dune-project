@@ -97,8 +97,7 @@
   (social-core (= :version))
   yojson
   uri
-  ptime
-  digestif))
+  ptime))
 
 (package
  (name social-instagram-graph-v21)
@@ -164,3 +163,16 @@
   uri
   base64
   ptime))
+
+(package
+ (name social-threads-v1)
+ (synopsis "Threads API v1 client")
+ (description "Threads API v1 client with OAuth, read operations, and publish support for text and single-media thread posts.")
+ (depends
+  (ocaml (>= 4.14))
+  (dune (>= 3.0))
+  (social-core (= :version))
+  yojson
+  uri
+  ptime
+  digestif))

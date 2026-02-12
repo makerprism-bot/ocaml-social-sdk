@@ -1,0 +1,8 @@
+(test
+ (name test_threads)
+ (libraries
+  social-threads-v1
+  social-core
+  str
+  ptime
+  ptime.clock.os))

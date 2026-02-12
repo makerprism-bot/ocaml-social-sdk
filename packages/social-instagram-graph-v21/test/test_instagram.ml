@@ -10,6 +10,12 @@ let string_contains s substr =
     true
   with Not_found -> false
 
+let query_param url key =
+  let params = Uri.query (Uri.of_string url) in
+  match List.assoc_opt key params with
+  | Some (v :: _) -> Some v
+  | _ -> None
+
 (** Helper to handle outcome type in tests *)
 let handle_outcome on_success on_error outcome =
   match outcome with
@@ -149,6 +155,7 @@ module Mock_config = struct
 end
 
 module Instagram = Make(Mock_config)
+module OAuth_client = OAuth.Make(Mock_http)
 
 (** Test: OAuth URL generation *)
 let test_oauth_url () =
@@ -165,6 +172,105 @@ let test_oauth_url () =
       assert (string_contains url "instagram_content_publish");
       print_endline "✓ OAuth URL generation")
     (fun err -> failwith ("OAuth URL failed: " ^ err))
+
+(** Test: OAuth account discovery query params are encoded *)
+let test_oauth_accounts_query_encoding () =
+  Mock_config.reset ();
+  Mock_http.set_response { status = 200; body = {|{"data": []}|}; headers = [] };
+
+  OAuth_client.get_instagram_accounts
+    ~user_access_token:"tok+en/=="
+    (handle_result
+      (fun _accounts ->
+        let requests = !Mock_http.requests in
+        let has_roundtrip_token = List.exists (fun (_, url, _, _) ->
+          query_param url "access_token" = Some "tok+en/=="
+        ) requests in
+        assert has_roundtrip_token;
+        print_endline "✓ OAuth accounts query encoding")
+      (fun err -> failwith ("OAuth accounts query encoding failed: " ^ err)))
+
+(** Test: OAuth debug token query params are encoded *)
+let test_oauth_debug_query_encoding () =
+  Mock_config.reset ();
+  Mock_http.set_response { status = 200; body = {|{"data": {"is_valid": true}}|}; headers = [] };
+
+  OAuth_client.debug_token
+    ~access_token:"input+token/=="
+    ~app_token:"app+token/=="
+    (handle_result
+      (fun _json ->
+        let requests = !Mock_http.requests in
+        let has_roundtrip_input = List.exists (fun (_, url, _, _) ->
+          query_param url "input_token" = Some "input+token/=="
+        ) requests in
+        let has_roundtrip_app = List.exists (fun (_, url, _, _) ->
+          query_param url "access_token" = Some "app+token/=="
+        ) requests in
+        assert has_roundtrip_input;
+        assert has_roundtrip_app;
+        print_endline "✓ OAuth debug query encoding")
+      (fun err -> failwith ("OAuth debug query encoding failed: " ^ err)))
+
+(** Test: OAuth account discovery parsing is resilient to partial page data *)
+let test_oauth_accounts_parsing_resilience () =
+  Mock_config.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{
+      "data": [
+        {"id":"p1","name":"Page One","instagram_business_account":{"id":"ig1","username":"acct1"}},
+        {"id":"p2","name":"Page Two","instagram_business_account":{"id":"ig2"}},
+        {"id":"p3","name":"Page Three","instagram_business_account":null},
+        {"id":"p4","instagram_business_account":{"id":"ig4","username":"acct4"}}
+      ]
+    }|};
+    headers = [];
+  };
+
+  OAuth_client.get_instagram_accounts
+    ~user_access_token:"token"
+    (handle_result
+      (fun (accounts : OAuth_client.instagram_account_info list) ->
+        assert (List.length accounts = 2);
+        let second = List.nth accounts 1 in
+        assert (second.ig_username = "unknown");
+        print_endline "✓ OAuth accounts parsing resilience")
+      (fun err -> failwith ("OAuth accounts parsing resilience failed: " ^ err)))
+
+(** Test: OAuth account discovery can include appsecret_proof *)
+let test_oauth_accounts_appsecret_proof () =
+  Mock_config.reset ();
+  Mock_http.set_response { status = 200; body = {|{"data": []}|}; headers = [] };
+
+  OAuth_client.get_instagram_accounts
+    ~app_secret:"app_secret_123"
+    ~user_access_token:"token_123"
+    (handle_result
+      (fun _accounts ->
+        let requests = !Mock_http.requests in
+        let has_proof = List.exists (fun (_, url, _, _) ->
+          match query_param url "appsecret_proof" with
+          | Some p -> String.length p = 64
+          | None -> false
+        ) requests in
+        assert has_proof;
+        print_endline "✓ OAuth accounts appsecret_proof")
+      (fun err -> failwith ("OAuth accounts appsecret_proof failed: " ^ err)))
+
+(** Test: Rate-limit parser tolerates numeric formats and uses max component *)
+let test_rate_limit_parsing () =
+  let headers = [
+    ("X-App-Usage", "{\"call_count\":5,\"total_cputime\":24.9,\"total_time\":12}");
+  ] in
+  match Instagram.parse_rate_limit_header headers with
+  | Some info ->
+      assert (info.call_count = 5);
+      assert (info.total_cputime = 24);
+      assert (info.total_time = 12);
+      assert (info.percentage_used = 24.0);
+      print_endline "✓ Rate limit parsing"
+  | None -> failwith "Rate limit parsing should succeed"
 
 (** Test: Token exchange *)
 let test_token_exchange () =
@@ -199,6 +305,89 @@ let test_token_exchange () =
       assert (creds.expires_at <> None);
       print_endline "✓ Token exchange")
     (fun err -> failwith ("Token exchange failed: " ^ err))
+
+(** Test: OAuth exchange returns structured auth error on 190 *)
+let test_oauth_exchange_structured_error () =
+  Mock_config.reset ();
+  Mock_http.set_response {
+    status = 400;
+    body = {|{"error":{"code":190,"message":"Invalid OAuth 2.0 Access Token"}}|};
+    headers = [];
+  };
+
+  OAuth_client.exchange_code
+    ~client_id:"client"
+    ~client_secret:"secret"
+    ~redirect_uri:"https://example.com/cb"
+    ~code:"bad_code"
+    (function
+      | Ok _ -> failwith "Expected structured OAuth auth error"
+      | Error (Error_types.Auth_error Error_types.Token_expired) ->
+          print_endline "✓ OAuth exchange structured auth error"
+      | Error _ -> failwith "Expected Token_expired from OAuth exchange")
+
+(** Test: OAuth helper surfaces network errors as structured network errors *)
+let test_oauth_network_error_mapping () =
+  Mock_config.reset ();
+  OAuth_client.exchange_code
+    ~client_id:"client"
+    ~client_secret:"secret"
+    ~redirect_uri:"https://example.com/cb"
+    ~code:"any"
+    (function
+      | Ok _ -> failwith "Expected network error"
+      | Error (Error_types.Network_error (Error_types.Connection_failed _)) ->
+          print_endline "✓ OAuth network error mapping"
+      | Error _ -> failwith "Expected structured network error")
+
+(** Test: Refresh token uses appsecret_proof and normalizes token_type *)
+let test_refresh_token_flow () =
+  Mock_config.reset ();
+  Mock_config.set_env "FACEBOOK_APP_SECRET" "test_secret";
+
+  let refresh_response = {|{
+    "access_token": "refreshed_token_123",
+    "token_type": "bearer",
+    "expires_in": 5184000
+  }|} in
+  Mock_http.set_response { status = 200; body = refresh_response; headers = [] };
+
+  Instagram.refresh_token
+    ~access_token:"old_token_123"
+    (fun creds ->
+      assert (creds.access_token = "refreshed_token_123");
+      assert (creds.token_type = "Bearer");
+      let requests = !Mock_http.requests in
+      let has_appsecret_proof = List.exists (fun (_, url, _, _) ->
+        string_contains url "appsecret_proof="
+      ) requests in
+      assert has_appsecret_proof;
+      print_endline "✓ Refresh token flow")
+    (fun err -> failwith ("Refresh token failed: " ^ err))
+
+(** Test: OAuth refresh helper supports optional appsecret_proof *)
+let test_oauth_refresh_appsecret_proof () =
+  Mock_config.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"access_token":"tok_new","expires_in":5184000}|};
+    headers = [];
+  };
+
+  OAuth_client.refresh_token
+    ~app_secret:"app_secret_abc"
+    ~access_token:"tok_old"
+    (handle_result
+      (fun _creds ->
+        let requests = !Mock_http.requests in
+        let has_proof = List.exists (fun (_, url, _, _) ->
+          match query_param url "appsecret_proof" with
+          | Some p -> String.length p = 64
+          | None -> false
+        ) requests in
+        assert has_proof;
+        print_endline "✓ OAuth refresh appsecret_proof")
+      (fun err -> failwith ("OAuth refresh appsecret_proof failed: " ^ err)))
 
 (** Test: Create container *)
 let test_create_container () =
@@ -332,6 +521,32 @@ let test_post_requires_media () =
       | Error_types.Failure _ -> print_endline "✓ Post requires media"
       | _ -> failwith "Should fail without media")
 
+(** Test: post_single rejects unsupported media extension *)
+let test_post_single_rejects_unsupported_media () =
+  Mock_config.reset ();
+  Instagram.post_single
+    ~account_id:"test_account"
+    ~text:"Unsupported media"
+    ~media_urls:["https://example.com/file.avi"]
+    (function
+      | Error_types.Failure (Error_types.Validation_error errs) ->
+          let has_format_error = List.exists (function
+            | Error_types.Media_unsupported_format _ -> true
+            | _ -> false
+          ) errs in
+          assert has_format_error;
+          let requests = !Mock_http.requests in
+          assert (requests = []);
+          print_endline "✓ post_single rejects unsupported media"
+      | _ -> failwith "Expected media format validation error")
+
+(** Test: validate_post reports Media_required error *)
+let test_validate_post_media_required () =
+  match Instagram.validate_post ~text:"Hello" ~media_count:0 () with
+  | Error errs when List.exists (function Error_types.Media_required -> true | _ -> false) errs ->
+      print_endline "✓ validate_post returns Media_required"
+  | _ -> failwith "Expected Media_required validation error"
+
 (** Test: Post with alt-text *)
 let test_post_with_alt_text () =
   Mock_config.reset ();
@@ -453,6 +668,79 @@ let test_reel_with_alt_text () =
         print_endline "✓ Reel with alt-text")
       (fun err -> failwith ("Reel with alt-text failed: " ^ err)))
 
+(** Test: post_reel rejects unsupported video format before API call *)
+let test_post_reel_rejects_invalid_format () =
+  Mock_config.reset ();
+  Instagram.post_reel
+    ~account_id:"test_account"
+    ~text:"Invalid reel"
+    ~video_url:"https://example.com/video.avi"
+    (function
+      | Error_types.Failure (Error_types.Validation_error errs) ->
+          let has_format_error = List.exists (function
+            | Error_types.Media_unsupported_format _ -> true
+            | _ -> false
+          ) errs in
+          assert has_format_error;
+          let requests = !Mock_http.requests in
+          assert (requests = []);
+          print_endline "✓ post_reel rejects invalid format"
+      | _ -> failwith "Expected reel format validation error")
+
+(** Test: post_reel rejects invalid URL before API call *)
+let test_post_reel_rejects_invalid_url () =
+  Mock_config.reset ();
+  Instagram.post_reel
+    ~account_id:"test_account"
+    ~text:"Invalid reel URL"
+    ~video_url:"not-a-url.mp4"
+    (function
+      | Error_types.Failure (Error_types.Validation_error errs) ->
+          let has_invalid_url = List.exists (function
+            | Error_types.Invalid_url _ -> true
+            | _ -> false
+          ) errs in
+          assert has_invalid_url;
+          let requests = !Mock_http.requests in
+          assert (requests = []);
+          print_endline "✓ post_reel rejects invalid URL"
+      | _ -> failwith "Expected reel URL validation error")
+
+(** Test: post_reel surfaces structured auth error from API *)
+let test_post_reel_structured_auth_error () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = None;
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_config.set_ig_user_id ~account_id:"test_account" ~ig_user_id:"ig_user_123";
+  Mock_http.set_response {
+    status = 400;
+    body = {|{"error":{"code":190,"message":"Invalid OAuth 2.0 Access Token"}}|};
+    headers = [];
+  };
+
+  Instagram.post_reel
+    ~account_id:"test_account"
+    ~text:"Reel should fail"
+    ~video_url:"https://example.com/video.mp4"
+    (function
+      | Error_types.Failure (Error_types.Auth_error Error_types.Token_expired) ->
+          print_endline "✓ post_reel structured auth error"
+      | _ -> failwith "Expected structured token-expired error for post_reel")
+
 (** Test: Post without alt-text *)
 let test_post_without_alt_text () =
   Mock_config.reset ();
@@ -569,6 +857,40 @@ let test_post_story_image () =
         print_endline "✓ Post image story (full flow)")
       (fun err -> failwith ("Post image story failed: " ^ err)))
 
+(** Test: post_story_image surfaces structured auth error from API *)
+let test_post_story_image_structured_auth_error () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = None;
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_config.set_ig_user_id ~account_id:"test_account" ~ig_user_id:"ig_123";
+  Mock_http.set_response {
+    status = 400;
+    body = {|{"error":{"code":190,"message":"Invalid OAuth 2.0 Access Token"}}|};
+    headers = [];
+  };
+
+  Instagram.post_story_image
+    ~account_id:"test_account"
+    ~image_url:"https://example.com/story.jpg"
+    (function
+      | Error_types.Failure (Error_types.Auth_error Error_types.Token_expired) ->
+          print_endline "✓ post_story_image structured auth error"
+      | _ -> failwith "Expected structured token-expired error for post_story_image")
+
 (** Test: Post video story (full flow) *)
 let test_post_story_video () =
   Mock_config.reset ();
@@ -677,6 +999,24 @@ let test_post_story_auto_video () =
         print_endline "✓ Post story with auto-detect (video)")
       (fun err -> failwith ("Post story auto-detect video failed: " ^ err)))
 
+(** Test: post_story rejects invalid media before API call *)
+let test_post_story_rejects_invalid_media () =
+  Mock_config.reset ();
+  Instagram.post_story
+    ~account_id:"test_account"
+    ~media_url:"https://example.com/story.gif"
+    (function
+      | Error_types.Failure (Error_types.Validation_error errs) ->
+          let has_format_error = List.exists (function
+            | Error_types.Media_unsupported_format _ -> true
+            | _ -> false
+          ) errs in
+          assert has_format_error;
+          let requests = !Mock_http.requests in
+          assert (requests = []);
+          print_endline "✓ post_story rejects invalid media"
+      | _ -> failwith "Expected story validation error")
+
 (** Test: Story validation - valid image URL *)
 let test_validate_story_valid_image () =
   match Instagram.validate_story ~media_url:"https://example.com/story.jpg" with
@@ -715,15 +1055,110 @@ let test_video_url_detection () =
   let mov_type = Instagram.detect_media_type "https://example.com/video.mov" in
   assert (mov_type = "VIDEO");
   
-  (* AVI should be detected as video *)
+  (* AVI should not be treated as supported video *)
   let avi_type = Instagram.detect_media_type "https://example.com/video.avi" in
-  assert (avi_type = "VIDEO");
+  assert (avi_type = "IMAGE");
   
   (* JPG should be detected as image *)
   let jpg_type = Instagram.detect_media_type "https://example.com/image.jpg" in
   assert (jpg_type = "IMAGE");
   
   print_endline "✓ Video URL detection"
+
+(** Test: Polling does not publish when status checks keep failing *)
+let test_polling_no_publish_on_status_error () =
+  Mock_config.reset ();
+
+  Mock_http.set_response { status = 500; body = {|{"error":{"message":"boom"}}|}; headers = [] };
+
+  Instagram.poll_container_status
+    ~container_id:"container_123"
+    ~access_token:"token_123"
+    ~ig_user_id:"ig_123"
+    ~attempt:1
+    ~max_attempts:1
+    (fun _ -> failwith "Polling should not publish on status-check failure")
+    (fun _err ->
+      let requests = !Mock_http.requests in
+      let attempted_publish = List.exists (fun (_, url, _, _) -> string_contains url "media_publish") requests in
+      assert (not attempted_publish);
+      print_endline "✓ Polling does not publish on status-check errors")
+
+(** Test: Story validation rejects GIF *)
+let test_validate_story_rejects_gif () =
+  match Instagram.validate_story ~media_url:"https://example.com/story.gif" with
+  | Error _ -> print_endline "✓ Story validation rejects GIF"
+  | Ok () -> failwith "GIF should be rejected"
+
+(** Test: OAuth API error mapping for token expiration *)
+let test_parse_api_error_token_expired () =
+  let err =
+    Instagram.parse_api_error
+      ~status_code:400
+      ~response_body:{|{"error":{"code":190,"message":"Invalid OAuth 2.0 Access Token"}}|}
+  in
+  match err with
+  | Error_types.Auth_error Error_types.Token_expired ->
+      print_endline "✓ OAuth API error mapping (token expired)"
+  | _ -> failwith "Expected Auth_error Token_expired"
+
+(** Test: OAuth API error mapping for insufficient permissions *)
+let test_parse_api_error_permissions () =
+  let err =
+    Instagram.parse_api_error
+      ~status_code:403
+      ~response_body:{|{"error":{"code":10,"message":"Missing permissions"}}|}
+  in
+  match err with
+  | Error_types.Auth_error (Error_types.Insufficient_permissions perms) when List.mem "instagram_content_publish" perms ->
+      print_endline "✓ OAuth API error mapping (permissions)"
+  | _ -> failwith "Expected Insufficient_permissions mapping"
+
+(** Test: OAuth API error mapping for rate limits *)
+let test_parse_api_error_rate_limited () =
+  let err =
+    Instagram.parse_api_error
+      ~status_code:429
+      ~response_body:{|{"error":{"code":613,"message":"Calls to this api have exceeded"}}|}
+  in
+  match err with
+  | Error_types.Rate_limited _ ->
+      print_endline "✓ OAuth API error mapping (rate limited)"
+  | _ -> failwith "Expected Rate_limited mapping"
+
+(** Test: User-friendly error response mapping for token expiration *)
+let test_parse_error_response_token_expired () =
+  let msg =
+    Instagram.parse_error_response
+      {|{"error":{"code":190,"message":"Invalid OAuth 2.0 Access Token"}}|}
+      400
+  in
+  if string_contains msg "reconnect" then
+    print_endline "✓ User-friendly OAuth error mapping"
+  else
+    failwith "Expected reconnect guidance for token expiration"
+
+(** Test: container creation returns structured auth error on API auth failure *)
+let test_create_container_structured_auth_error () =
+  Mock_config.reset ();
+  Mock_http.set_response {
+    status = 400;
+    body = {|{"error":{"code":190,"message":"Invalid OAuth 2.0 Access Token"}}|};
+    headers = [];
+  };
+
+  Instagram.create_image_container
+    ~ig_user_id:"ig_user_123"
+    ~access_token:"bad_token"
+    ~image_url:"https://example.com/image.jpg"
+    ~caption:"caption"
+    ~alt_text:None
+    ~is_carousel_item:false
+    (function
+      | Ok _ -> failwith "Expected auth error"
+      | Error (Error_types.Auth_error Error_types.Token_expired) ->
+          print_endline "✓ Structured auth error from container creation"
+      | Error _ -> failwith "Expected Token_expired auth error")
 
 (** Test: Video container creation parameters *)
 let test_video_container_creation () =
@@ -957,27 +1392,43 @@ let test_video_processing_error () =
 let () =
   print_endline "\n=== Instagram Provider Tests ===\n";
   test_oauth_url ();
+  test_oauth_accounts_query_encoding ();
+  test_oauth_debug_query_encoding ();
+  test_oauth_accounts_parsing_resilience ();
+  test_oauth_accounts_appsecret_proof ();
   test_token_exchange ();
+  test_oauth_exchange_structured_error ();
+  test_oauth_network_error_mapping ();
+  test_refresh_token_flow ();
+  test_oauth_refresh_appsecret_proof ();
+  test_rate_limit_parsing ();
   test_create_container ();
   test_publish_container ();
   test_check_status ();
   test_content_validation ();
   test_post_single ();
   test_post_requires_media ();
+  test_post_single_rejects_unsupported_media ();
+  test_validate_post_media_required ();
   
   print_endline "\n--- Alt-Text Tests ---";
   test_post_with_alt_text ();
   test_carousel_with_alt_texts ();
   test_reel_with_alt_text ();
+  test_post_reel_rejects_invalid_format ();
+  test_post_reel_rejects_invalid_url ();
+  test_post_reel_structured_auth_error ();
   test_post_without_alt_text ();
   
   print_endline "\n--- Stories Tests ---";
   test_create_story_image_container ();
   test_create_story_video_container ();
   test_post_story_image ();
+  test_post_story_image_structured_auth_error ();
   test_post_story_video ();
   test_post_story_auto_image ();
   test_post_story_auto_video ();
+  test_post_story_rejects_invalid_media ();
   test_validate_story_valid_image ();
   test_validate_story_valid_video ();
   test_validate_story_invalid_url ();
@@ -992,5 +1443,12 @@ let () =
   test_video_post_full_flow ();
   test_mixed_carousel ();
   test_video_processing_error ();
-  
-  print_endline "\n=== All 30 tests passed! ===\n"
+  test_polling_no_publish_on_status_error ();
+  test_validate_story_rejects_gif ();
+  test_parse_api_error_token_expired ();
+  test_parse_api_error_permissions ();
+  test_parse_api_error_rate_limited ();
+  test_parse_error_response_token_expired ();
+  test_create_container_structured_auth_error ();
+
+  print_endline "\n=== All tests passed! ===\n"

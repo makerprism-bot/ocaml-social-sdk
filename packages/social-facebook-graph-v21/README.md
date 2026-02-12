@@ -2,7 +2,7 @@
 
 OCaml library for Facebook Graph API v21 integration (Facebook Pages) with runtime-agnostic design.
 
-> **Warning:** This library was primarily built using LLMs and has not been tested. Expect breaking changes.
+> **Status:** This package has automated unit tests in this repository. Real Facebook app/page integration behavior should still be validated in your environment.
 
 ## Features
 
@@ -10,7 +10,7 @@ OCaml library for Facebook Graph API v21 integration (Facebook Pages) with runti
 - **OAuth 2.0 Authentication**: Full OAuth flow for Facebook Pages
 - **Page Posting**: Post text and images to Facebook Pages
 - **Photo Upload**: Multipart upload support for images
-- **Long-Lived Tokens**: 60-day page access tokens
+- **Long-Lived Tokens**: OAuth code exchange supports short-lived -> long-lived token flow
 - **Runtime Agnostic**: Works with Lwt, Eio, or synchronous runtimes via CPS
 
 ### Advanced Features
@@ -133,10 +133,20 @@ FACEBOOK_REDIRECT_URI=https://yourapp.com/callback
 
 ## Token Management
 
-- **Page access tokens** last 60 days
-- **No programmatic refresh** - users must re-authenticate
-- Tokens expire and require full OAuth flow again
+- **Long-lived user tokens** are exchanged from short-lived OAuth tokens
+- **No refresh token flow** - Facebook OAuth for Pages does not provide refresh tokens
+- **Page token recovery**: posting flows attempt one-time `/me/accounts` recovery on auth-like failures
+- **Recovery fallback token storage**: the provider stores the user token in `credentials.refresh_token` as an internal fallback source for later page-token recovery attempts
 - Use 24-hour buffer to warn users before expiry
+
+### Credential Lifecycle
+
+- **After OAuth onboarding** (`exchange_code_and_get_pages` + app persistence):
+  - `credentials.access_token`: selected Page access token used for posting
+  - `credentials.refresh_token`: selected long-lived user token (fallback source for future recovery)
+- **After successful posting recovery**:
+  - `credentials.access_token`: refreshed/recovered Page access token
+  - `credentials.refresh_token`: preserved user token used for `/me/accounts` fallback
 
 ## API Reference
 
@@ -146,7 +156,10 @@ FACEBOOK_REDIRECT_URI=https://yourapp.com/callback
 Generate OAuth authorization URL.
 
 #### `exchange_code`
-Exchange authorization code for page access token.
+Exchange authorization code for a long-lived user access token.
+
+#### `exchange_code_and_get_pages`
+Exchange code, get long-lived user token, and fetch managed Pages with Page access tokens.
 
 #### `post_single`
 Post to Facebook Page with optional images.
@@ -172,8 +185,25 @@ Facebook.post_reel ~account_id ~text:"Check out this video!"
 
 ### Generic API Methods
 
-#### `get ~path ~access_token ?fields`
+#### `get ~path ~access_token ?fields ?required_permissions`
 Make a GET request to any Graph API endpoint.
+
+You can pass `~required_permissions:[...]` to override default path-based permission mapping in typed permission errors.
+
+#### `post ~path ~access_token ~params ?required_permissions`
+Make a POST request to any Graph API endpoint.
+
+Supports optional `~required_permissions:[...]` override for typed permission errors.
+
+#### `delete ~path ~access_token ?required_permissions`
+Make a DELETE request to any Graph API endpoint.
+
+Supports optional `~required_permissions:[...]` override for typed permission errors.
+
+#### `batch_request ~requests ~access_token ?required_permissions`
+Execute up to 50 Graph API operations in one batch request.
+
+Supports optional `~required_permissions:[...]` override for typed permission errors.
 
 ```ocaml
 (* Get user info with specific fields *)

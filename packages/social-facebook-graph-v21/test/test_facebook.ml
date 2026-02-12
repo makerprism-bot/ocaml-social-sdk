@@ -164,12 +164,21 @@ let test_token_exchange () =
   Mock_config.set_env "FACEBOOK_APP_SECRET" "test_secret";
   
   let response_body = {|{
+    "access_token": "short_lived_access_token_123",
+    "token_type": "bearer",
+    "expires_in": 3600
+  }|} in
+
+  let long_lived_response_body = {|{
     "access_token": "new_access_token_123",
     "token_type": "bearer",
     "expires_in": 5184000
   }|} in
   
-  Mock_http.set_response { status = 200; body = response_body; headers = [] };
+  Mock_http.set_responses [
+    { status = 200; body = response_body; headers = [] };
+    { status = 200; body = long_lived_response_body; headers = [] };
+  ];
   
   Facebook.exchange_code 
     ~code:"test_code"
@@ -305,9 +314,34 @@ let test_rate_limit_parsing () =
               assert (info.call_count = 15);
               assert (info.total_cputime = 25);
               assert (info.total_time = 30);
+              assert (info.percentage_used = 30.0);
               print_endline "✓ Rate limit parsing"
           | [] -> failwith "Rate limit not captured")
       | Error e -> failwith ("Rate limit test failed: " ^ Error_types.error_to_string e))
+
+(** Test: Full OAuth onboarding to pages *)
+let test_exchange_code_and_get_pages () =
+  Mock_config.reset ();
+  Mock_config.set_env "FACEBOOK_APP_ID" "test_app_id";
+  Mock_config.set_env "FACEBOOK_APP_SECRET" "test_secret";
+
+  Mock_http.set_responses [
+    { status = 200; body = {|{"access_token":"short_token","token_type":"bearer","expires_in":3600}|}; headers = [] };
+    { status = 200; body = {|{"access_token":"long_token","token_type":"bearer","expires_in":5184000}|}; headers = [] };
+    { status = 200; body = {|{"data":[{"id":"123","name":"My Page","access_token":"page_token","category":"Brand"}]}|}; headers = [] };
+  ];
+
+  Facebook.exchange_code_and_get_pages
+    ~code:"test_code"
+    ~redirect_uri:"https://example.com/callback"
+    (fun (creds, pages) ->
+      assert (creds.access_token = "long_token");
+      assert (List.length pages = 1);
+      let p = List.hd pages in
+      assert (p.page_id = "123");
+      assert (p.page_access_token = "page_token");
+      print_endline "✓ Exchange code and get pages")
+    (fun err -> failwith ("Exchange code and get pages failed: " ^ err))
 
 (** Test: Field selection *)
 let test_field_selection () =
@@ -352,6 +386,185 @@ let test_error_code_parsing () =
           let err_str = Error_types.error_to_string e in
           assert (string_contains err_str "expired" || string_contains err_str "token");
           print_endline "✓ Error code parsing")
+
+(** Test: Invalid token without expiry subcode maps to token invalid *)
+let test_invalid_token_without_expiry_subcode () =
+  Mock_config.reset ();
+
+  let error_response = {|{
+    "error": {
+      "message": "Invalid OAuth access token",
+      "type": "OAuthException",
+      "code": 190,
+      "fbtrace_id": "ABC124"
+    }
+  }|} in
+
+  Mock_http.set_response { status = 400; body = error_response; headers = [] };
+
+  Facebook.get ~path:"me" ~access_token:"invalid_token"
+    (function
+      | Ok _response -> failwith "Should have failed with error"
+      | Error (Error_types.Auth_error Error_types.Token_invalid) ->
+          print_endline "✓ Invalid token mapping without expiry subcode"
+      | Error e ->
+          failwith ("Expected Token_invalid, got: " ^ Error_types.error_to_string e))
+
+(** Test: Token subcode 467 maps to token expired *)
+let test_token_subcode_467_maps_to_expired () =
+  Mock_config.reset ();
+
+  let error_response = {|{
+    "error": {
+      "message": "Invalid OAuth access token - Session has expired",
+      "type": "OAuthException",
+      "code": 190,
+      "error_subcode": 467,
+      "fbtrace_id": "ABC125"
+    }
+  }|} in
+
+  Mock_http.set_response { status = 400; body = error_response; headers = [] };
+
+  Facebook.get ~path:"me" ~access_token:"expired_token"
+    (function
+      | Ok _response -> failwith "Should have failed with expired token error"
+      | Error (Error_types.Auth_error Error_types.Token_expired) ->
+          print_endline "✓ Token subcode 467 maps to expired"
+      | Error e ->
+          failwith ("Expected Token_expired, got: " ^ Error_types.error_to_string e))
+
+(** Test: Permission denied returns provider-required scopes *)
+let test_permission_error_scopes () =
+  Mock_config.reset ();
+
+  let error_response = {|{
+    "error": {
+      "message": "(#200) Permissions error",
+      "type": "OAuthException",
+      "code": 200,
+      "fbtrace_id": "PERM123"
+    }
+  }|} in
+
+  Mock_http.set_response { status = 400; body = error_response; headers = [] };
+
+  Facebook.get ~path:"me" ~access_token:"token"
+    (function
+      | Ok _ -> failwith "Should have failed with permission error"
+      | Error (Error_types.Auth_error (Error_types.Insufficient_permissions scopes)) ->
+          assert (List.mem "pages_manage_posts" scopes);
+          assert (List.mem "pages_show_list" scopes);
+          assert (List.mem "pages_read_engagement" scopes);
+          print_endline "✓ Permission error includes provider-required scopes"
+      | Error e ->
+          failwith ("Expected insufficient_permissions error, got: " ^ Error_types.error_to_string e))
+
+(** Test: me/accounts permission error maps to pages_show_list scope *)
+let test_me_accounts_permission_scope () =
+  Mock_config.reset ();
+
+  let error_response = {|{
+    "error": {
+      "message": "(#200) Permissions error",
+      "type": "OAuthException",
+      "code": 200,
+      "fbtrace_id": "PERM_ACCOUNTS"
+    }
+  }|} in
+
+  Mock_http.set_response { status = 400; body = error_response; headers = [] };
+
+  Facebook.get ~path:"me/accounts" ~access_token:"token"
+    (function
+      | Ok _ -> failwith "Should have failed with permission error"
+      | Error (Error_types.Auth_error (Error_types.Insufficient_permissions scopes)) ->
+          assert (scopes = ["pages_show_list"]);
+          print_endline "✓ me/accounts permission scope mapping"
+      | Error e ->
+          failwith ("Expected insufficient_permissions error, got: " ^ Error_types.error_to_string e))
+
+(** Test: Generic GET supports explicit required_permissions override *)
+let test_get_required_permissions_override () =
+  Mock_config.reset ();
+
+  let error_response = {|{
+    "error": {
+      "message": "(#200) Permissions error",
+      "type": "OAuthException",
+      "code": 200,
+      "fbtrace_id": "PERM_OVERRIDE"
+    }
+  }|} in
+
+  Mock_http.set_response { status = 400; body = error_response; headers = [] };
+
+  Facebook.get
+    ~path:"me/accounts"
+    ~access_token:"token"
+    ~required_permissions:["custom_scope"]
+    (function
+      | Ok _ -> failwith "Should have failed with permission error"
+      | Error (Error_types.Auth_error (Error_types.Insufficient_permissions scopes)) ->
+          assert (scopes = ["custom_scope"]);
+          print_endline "✓ GET required_permissions override"
+      | Error e ->
+          failwith ("Expected insufficient_permissions error, got: " ^ Error_types.error_to_string e))
+
+(** Test: Generic POST supports explicit required_permissions override *)
+let test_post_required_permissions_override () =
+  Mock_config.reset ();
+
+  let error_response = {|{
+    "error": {
+      "message": "(#200) Permissions error",
+      "type": "OAuthException",
+      "code": 200,
+      "fbtrace_id": "PERM_OVERRIDE_POST"
+    }
+  }|} in
+
+  Mock_http.set_response { status = 400; body = error_response; headers = [] };
+
+  Facebook.post
+    ~path:"me/feed"
+    ~access_token:"token"
+    ~params:[("message", ["hello"])]
+    ~required_permissions:["custom_post_scope"]
+    (function
+      | Ok _ -> failwith "Should have failed with permission error"
+      | Error (Error_types.Auth_error (Error_types.Insufficient_permissions scopes)) ->
+          assert (scopes = ["custom_post_scope"]);
+          print_endline "✓ POST required_permissions override"
+      | Error e ->
+          failwith ("Expected insufficient_permissions error, got: " ^ Error_types.error_to_string e))
+
+(** Test: Generic DELETE supports explicit required_permissions override *)
+let test_delete_required_permissions_override () =
+  Mock_config.reset ();
+
+  let error_response = {|{
+    "error": {
+      "message": "(#200) Permissions error",
+      "type": "OAuthException",
+      "code": 200,
+      "fbtrace_id": "PERM_OVERRIDE_DELETE"
+    }
+  }|} in
+
+  Mock_http.set_response { status = 400; body = error_response; headers = [] };
+
+  Facebook.delete
+    ~path:"12345"
+    ~access_token:"token"
+    ~required_permissions:["custom_delete_scope"]
+    (function
+      | Ok _ -> failwith "Should have failed with permission error"
+      | Error (Error_types.Auth_error (Error_types.Insufficient_permissions scopes)) ->
+          assert (scopes = ["custom_delete_scope"]);
+          print_endline "✓ DELETE required_permissions override"
+      | Error e ->
+          failwith ("Expected insufficient_permissions error, got: " ^ Error_types.error_to_string e))
 
 (** Test: Pagination *)
 let test_pagination () =
@@ -418,6 +631,38 @@ let test_batch_requests () =
               print_endline "✓ Batch requests"
           | _ -> failwith "Unexpected batch response")
       | Error e -> failwith ("Batch test failed: " ^ Error_types.error_to_string e))
+
+(** Test: Batch request supports explicit required_permissions override *)
+let test_batch_required_permissions_override () =
+  Mock_config.reset ();
+
+  let error_response = {|{
+    "error": {
+      "message": "(#200) Permissions error",
+      "type": "OAuthException",
+      "code": 200,
+      "fbtrace_id": "PERM_OVERRIDE_BATCH"
+    }
+  }|} in
+
+  Mock_http.set_response { status = 400; body = error_response; headers = [] };
+
+  let open Facebook in
+  let requests = [
+    { method_ = `GET; relative_url = "me"; body = None; name = None };
+  ] in
+
+  Facebook.batch_request
+    ~requests
+    ~access_token:"test_token"
+    ~required_permissions:["custom_batch_scope"]
+    (function
+      | Ok _ -> failwith "Should have failed with permission error"
+      | Error (Error_types.Auth_error (Error_types.Insufficient_permissions scopes)) ->
+          assert (scopes = ["custom_batch_scope"]);
+          print_endline "✓ BATCH required_permissions override"
+      | Error e ->
+          failwith ("Expected insufficient_permissions error, got: " ^ Error_types.error_to_string e))
 
 (** Test: App secret proof *)
 let test_app_secret_proof () =
@@ -519,13 +764,22 @@ let test_long_lived_token () =
   Mock_config.set_env "FACEBOOK_APP_ID" "test_app_id";
   Mock_config.set_env "FACEBOOK_APP_SECRET" "test_secret";
   
+  let short_response_body = {|{
+    "access_token": "short_lived_token_123",
+    "token_type": "bearer",
+    "expires_in": 3600
+  }|} in
+
   let response_body = {|{
     "access_token": "long_lived_token_123",
     "token_type": "bearer",
     "expires_in": 5184000
   }|} in
   
-  Mock_http.set_response { status = 200; body = response_body; headers = [] };
+  Mock_http.set_responses [
+    { status = 200; body = short_response_body; headers = [] };
+    { status = 200; body = response_body; headers = [] };
+  ];
   
   Facebook.exchange_code 
     ~code:"test_code"
@@ -753,6 +1007,331 @@ let test_post_with_multiple_alt_texts () =
         print_endline "✓ Post with multiple images and alt-texts")
       (fun err -> failwith ("Post with multiple alt-texts failed: " ^ err)))
 
+(** Test: Multi-photo uses indexed attached_media payload *)
+let test_post_with_indexed_attached_media_payload () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = None;
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_config._set_page_id ~account_id:"test_account" ~page_id:"page123";
+
+  Mock_http.set_responses [
+    { status = 200; body = "image1_data"; headers = [] };
+    { status = 200; body = {|{"id": "photo1"}|}; headers = [] };
+    { status = 200; body = "image2_data"; headers = [] };
+    { status = 200; body = {|{"id": "photo2"}|}; headers = [] };
+    { status = 200; body = {|{"id": "post456"}|}; headers = [] };
+  ];
+
+  Facebook.post_single
+    ~account_id:"test_account"
+    ~text:"Multiple photos payload test"
+    ~media_urls:["https://example.com/img1.jpg"; "https://example.com/img2.jpg"]
+    ~alt_texts:[Some "First image"; Some "Second image"]
+    (handle_outcome
+      (fun _post_id ->
+        let reqs = !Mock_http.requests in
+        let feed_request =
+          List.find_opt (fun (m, u, _, _) -> m = "POST" && string_contains u "/feed") reqs
+        in
+        (match feed_request with
+        | Some (_, _, _, body) ->
+            assert (string_contains body "attached_media%5B0%5D");
+            assert (string_contains body "attached_media%5B1%5D");
+            print_endline "✓ Multi-photo uses indexed attached_media payload"
+        | None -> failwith "Feed request not found"))
+      (fun err -> failwith ("Post payload test failed: " ^ err)))
+
+(** Test: Recovers page token from user token on post failure *)
+let test_post_recovers_page_token_from_user_token () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "user_token_initial";
+    refresh_token = None;
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  let permission_error = {|{
+    "error": {
+      "message": "(#200) Permissions error",
+      "type": "OAuthException",
+      "code": 200,
+      "fbtrace_id": "TRACE_PERM"
+    }
+  }|} in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_config._set_page_id ~account_id:"test_account" ~page_id:"page123";
+
+  Mock_http.set_responses [
+    { status = 200; body = "image_data_attempt1"; headers = [] };
+    { status = 400; body = permission_error; headers = [] };
+    { status = 200; body = {|{"data":[{"id":"page123","name":"My Page","access_token":"resolved_page_token","category":"Brand"}]}|}; headers = [] };
+    { status = 200; body = "image_data_attempt2"; headers = [] };
+    { status = 200; body = {|{"id":"photo_after_recovery"}|}; headers = [] };
+    { status = 200; body = {|{"id":"post_after_recovery"}|}; headers = [] };
+  ];
+
+  Facebook.post_single
+    ~account_id:"test_account"
+    ~text:"Recover token and post"
+    ~media_urls:["https://example.com/recover.jpg"]
+    (handle_outcome
+      (fun post_id ->
+        assert (post_id = "post_after_recovery");
+        let reqs = !Mock_http.requests in
+        let used_resolved_token =
+          List.exists (fun (_m, _u, headers, _body) ->
+            List.exists (fun (k, v) ->
+              k = "Authorization" && string_contains v "resolved_page_token"
+            ) headers
+          ) reqs
+        in
+        assert used_resolved_token;
+        (match Mock_config.get_health_status "test_account" with
+        | Some (_, "token_recovered", Some msg) ->
+            assert (string_contains msg "Recovered Page access token")
+        | Some (_, status, _) ->
+            failwith ("Expected token_recovered health status, got: " ^ status)
+        | None ->
+            failwith "Expected health status update for token recovery");
+        (match List.assoc_opt "test_account" !Mock_config.credentials_store with
+        | Some updated_creds ->
+            assert (updated_creds.access_token = "resolved_page_token");
+            assert (updated_creds.refresh_token = Some "user_token_initial")
+        | None -> failwith "Expected updated credentials after token recovery");
+        print_endline "✓ Post recovers page token from user token")
+      (fun err -> failwith ("Token recovery post failed: " ^ err)))
+
+(** Test: Recovery falls back to stored user token when current token fails *)
+let test_post_recovery_uses_stored_user_token_fallback () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "stale_page_token";
+    refresh_token = Some "stored_user_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  let permission_error = {|{
+    "error": {
+      "message": "(#200) Permissions error",
+      "type": "OAuthException",
+      "code": 200,
+      "fbtrace_id": "TRACE_FALLBACK"
+    }
+  }|} in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_config._set_page_id ~account_id:"test_account" ~page_id:"page123";
+
+  Mock_http.set_responses [
+    { status = 200; body = "image_data_attempt1"; headers = [] };
+    { status = 400; body = permission_error; headers = [] };
+    { status = 400; body = permission_error; headers = [] };
+    { status = 200; body = {|{"data":[{"id":"page123","name":"My Page","access_token":"resolved_page_token_from_backup","category":"Brand"}]}|}; headers = [] };
+    { status = 200; body = "image_data_attempt2"; headers = [] };
+    { status = 200; body = {|{"id":"photo_after_fallback"}|}; headers = [] };
+    { status = 200; body = {|{"id":"post_after_fallback"}|}; headers = [] };
+  ];
+
+  Facebook.post_single
+    ~account_id:"test_account"
+    ~text:"Recover with fallback user token"
+    ~media_urls:["https://example.com/recover-fallback.jpg"]
+    (handle_outcome
+      (fun post_id ->
+        assert (post_id = "post_after_fallback");
+        let reqs = !Mock_http.requests in
+        let me_accounts_requests =
+          List.filter (fun (m, u, _, _) -> m = "GET" && string_contains u "/me/accounts") reqs
+        in
+        assert (List.length me_accounts_requests = 2);
+        let used_stored_user_token =
+          List.exists (fun (_m, u, _, _) -> string_contains u "stored_user_token") me_accounts_requests
+        in
+        assert used_stored_user_token;
+        (match List.assoc_opt "test_account" !Mock_config.credentials_store with
+        | Some updated_creds ->
+            assert (updated_creds.access_token = "resolved_page_token_from_backup");
+            assert (updated_creds.refresh_token = Some "stored_user_token")
+        | None -> failwith "Expected updated credentials after fallback recovery");
+        print_endline "✓ Recovery uses stored user token fallback")
+      (fun err -> failwith ("Fallback recovery test failed: " ^ err)))
+
+(** Test: Recovery does not fallback to other tokens on rate limiting *)
+let test_post_recovery_stops_on_rate_limit () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "stale_page_token";
+    refresh_token = Some "stored_user_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  let permission_error = {|{
+    "error": {
+      "message": "(#200) Permissions error",
+      "type": "OAuthException",
+      "code": 200,
+      "fbtrace_id": "TRACE_RATE_STOP_1"
+    }
+  }|} in
+
+  let rate_limit_error = {|{
+    "error": {
+      "message": "(#80001) There have been too many calls to this Page account",
+      "type": "OAuthException",
+      "code": 80001,
+      "fbtrace_id": "TRACE_RATE_STOP_2"
+    }
+  }|} in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_config._set_page_id ~account_id:"test_account" ~page_id:"page123";
+
+  Mock_http.set_responses [
+    { status = 200; body = "image_data_attempt1"; headers = [] };
+    { status = 400; body = permission_error; headers = [] };
+    { status = 400; body = rate_limit_error; headers = [] };
+  ];
+
+  Facebook.post_single
+    ~account_id:"test_account"
+    ~text:"Recovery should stop on rate limit"
+    ~media_urls:["https://example.com/recover-stop.jpg"]
+    (handle_outcome
+      (fun _ -> failwith "Expected post failure")
+      (fun _err ->
+        let me_accounts_requests =
+          List.filter (fun (m, u, _, _) -> m = "GET" && string_contains u "/me/accounts") !Mock_http.requests
+        in
+        assert (List.length me_accounts_requests = 1);
+        (match Mock_config.get_health_status "test_account" with
+        | Some (_, "token_recovery_failed", Some msg) ->
+            assert (string_contains msg "Stopped token recovery")
+        | _ -> failwith "Expected token_recovery_failed stop status");
+        print_endline "✓ Recovery stops on rate limit without fallback"))
+
+(** Test: Cleans up uploaded photos if feed publish fails *)
+let test_post_cleans_up_uploaded_photos_on_publish_failure () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "page_token_initial";
+    refresh_token = None;
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  let publish_error = {|{
+    "error": {
+      "message": "(#100) Invalid parameter",
+      "type": "OAuthException",
+      "code": 100,
+      "fbtrace_id": "TRACE_PUBLISH_FAIL"
+    }
+  }|} in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_config._set_page_id ~account_id:"test_account" ~page_id:"page123";
+
+  Mock_http.set_responses [
+    { status = 200; body = "image1_data"; headers = [] };
+    { status = 200; body = {|{"id":"photo_to_cleanup_1"}|}; headers = [] };
+    { status = 200; body = "image2_data"; headers = [] };
+    { status = 200; body = {|{"id":"photo_to_cleanup_2"}|}; headers = [] };
+    { status = 400; body = publish_error; headers = [] };
+    { status = 200; body = {|{"success":true}|}; headers = [] };
+    { status = 200; body = {|{"success":true}|}; headers = [] };
+  ];
+
+  Facebook.post_single
+    ~account_id:"test_account"
+    ~text:"Should fail and cleanup"
+    ~media_urls:["https://example.com/c1.jpg"; "https://example.com/c2.jpg"]
+    (handle_outcome
+      (fun _ -> failwith "Expected publish failure")
+      (fun _err ->
+        let reqs = !Mock_http.requests in
+        let deleted_photo1 =
+          List.exists (fun (m, u, _, _) -> m = "DELETE" && string_contains u "/photo_to_cleanup_1") reqs
+        in
+        let deleted_photo2 =
+          List.exists (fun (m, u, _, _) -> m = "DELETE" && string_contains u "/photo_to_cleanup_2") reqs
+        in
+        assert deleted_photo1;
+        assert deleted_photo2;
+        print_endline "✓ Cleans up uploaded photos on publish failure"))
+
+(** Test: Rate-limit error code mapping for Pages/BUC *)
+let test_rate_limit_error_code_80001 () =
+  Mock_config.reset ();
+
+  let error_response = {|{
+    "error": {
+      "message": "(#80001) There have been too many calls to this Page account",
+      "type": "OAuthException",
+      "code": 80001,
+      "fbtrace_id": "TRACE123"
+    }
+  }|} in
+
+  Mock_http.set_response { status = 400; body = error_response; headers = [] };
+
+  Facebook.get ~path:"me" ~access_token:"test_token"
+    (function
+      | Ok _ -> failwith "Should have been rate limited"
+      | Error e ->
+          (match e with
+          | Error_types.Rate_limited _ -> print_endline "✓ Rate-limit error code 80001 mapping"
+          | _ -> failwith ("Expected rate-limited error, got: " ^ Error_types.error_to_string e)))
+
 (** Test: Post without alt-text *)
 let test_post_without_alt_text () =
   Mock_config.reset ();
@@ -976,6 +1555,118 @@ let test_post_story_video () =
         print_endline "✓ Post video story (high-level)")
       (fun err -> failwith ("Post video story failed: " ^ err)))
 
+(** Test: Post video story recovers on auth error during upload phase *)
+let test_post_story_video_recovers_on_upload_auth_error () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "user_token_story";
+    refresh_token = None;
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  let permission_error = {|{
+    "error": {
+      "message": "(#200) Permissions error",
+      "type": "OAuthException",
+      "code": 200,
+      "fbtrace_id": "STORY_UP_AUTH"
+    }
+  }|} in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_config._set_page_id ~account_id:"test_account" ~page_id:"page_story_123";
+
+  Mock_http.set_responses [
+    { status = 200; body = "video_data_1"; headers = [] };
+    { status = 200; body = {|{"video_id":"story_vid_1","upload_url":"https://upload.facebook.com/story-up-1"}|}; headers = [] };
+    { status = 400; body = permission_error; headers = [] };
+    { status = 200; body = {|{"data":[{"id":"page_story_123","name":"Story Page","access_token":"story_resolved_page_token","category":"Brand"}]}|}; headers = [] };
+    { status = 200; body = "video_data_2"; headers = [] };
+    { status = 200; body = {|{"video_id":"story_vid_2","upload_url":"https://upload.facebook.com/story-up-2"}|}; headers = [] };
+    { status = 200; body = {|{"success":true}|}; headers = [] };
+    { status = 200; body = {|{"success":true,"post_id":"story_post_recovered"}|}; headers = [] };
+  ];
+
+  Facebook.post_story_video
+    ~account_id:"test_account"
+    ~video_url:"https://example.com/story-recover.mp4"
+    (handle_outcome
+      (fun story_id ->
+        assert (story_id = "story_post_recovered");
+        let used_resolved_token =
+          List.exists (fun (_m, _u, headers, _body) ->
+            List.exists (fun (k, v) -> k = "Authorization" && string_contains v "story_resolved_page_token") headers
+          ) !Mock_http.requests
+        in
+        assert used_resolved_token;
+        (match List.assoc_opt "test_account" !Mock_config.credentials_store with
+        | Some updated_creds ->
+            assert (updated_creds.access_token = "story_resolved_page_token");
+            assert (updated_creds.refresh_token = Some "user_token_story")
+        | None -> failwith "Expected updated credentials after story recovery");
+        print_endline "✓ Post video story recovers on upload auth error")
+      (fun err -> failwith ("Story upload auth recovery failed: " ^ err)))
+
+(** Test: Post video story does not recover on upload rate-limit errors *)
+let test_post_story_video_no_recovery_on_upload_rate_limit () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "user_token_story_rl";
+    refresh_token = Some "stored_user_token_story_rl";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  let rate_limit_error = {|{
+    "error": {
+      "message": "(#80001) There have been too many calls to this Page account",
+      "type": "OAuthException",
+      "code": 80001,
+      "fbtrace_id": "STORY_UP_RL"
+    }
+  }|} in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_config._set_page_id ~account_id:"test_account" ~page_id:"page_story_123";
+
+  Mock_http.set_responses [
+    { status = 200; body = "video_data_1"; headers = [] };
+    { status = 200; body = {|{"video_id":"story_vid_1","upload_url":"https://upload.facebook.com/story-up-1"}|}; headers = [] };
+    { status = 400; body = rate_limit_error; headers = [] };
+  ];
+
+  Facebook.post_story_video
+    ~account_id:"test_account"
+    ~video_url:"https://example.com/story-rate-limit.mp4"
+    (fun outcome ->
+      match outcome with
+      | Error_types.Failure (Error_types.Rate_limited _) ->
+          let me_accounts_requests =
+            List.filter (fun (m, u, _, _) -> m = "GET" && string_contains u "/me/accounts") !Mock_http.requests
+          in
+          assert (List.length me_accounts_requests = 0);
+          print_endline "✓ Post video story skips recovery on upload rate-limit"
+      | Error_types.Failure e ->
+          failwith ("Expected rate-limited error, got: " ^ Error_types.error_to_string e)
+      | _ -> failwith "Expected story failure on upload rate-limit")
+
 (** Test: Post story with auto-detect (image) *)
 let test_post_story_auto_image () =
   Mock_config.reset ();
@@ -1153,6 +1844,221 @@ let test_post_reel () =
         print_endline "✓ Post reel (high-level)")
       (fun err -> failwith ("Post reel failed: " ^ err)))
 
+(** Test: Post reel does not attempt token recovery on non-auth errors *)
+let test_post_reel_no_recovery_on_non_auth_error () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = None;
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_config._set_page_id ~account_id:"test_account" ~page_id:"page_123";
+
+  (* Only one response: video download succeeds, then init request fails due to missing mock response
+     and should NOT trigger token recovery (/me/accounts). *)
+  Mock_http.set_responses [
+    { status = 200; body = "video_data"; headers = [] };
+  ];
+
+  Facebook.post_reel
+    ~account_id:"test_account"
+    ~text:"Reel should fail without recovery"
+    ~video_url:"https://example.com/reel.mp4"
+    (fun outcome ->
+      match outcome with
+      | Error_types.Failure _ ->
+          let requested_recovery =
+            List.exists (fun (m, u, _, _) ->
+              m = "GET" && string_contains u "/me/accounts"
+            ) !Mock_http.requests
+          in
+          assert (not requested_recovery);
+          print_endline "✓ Post reel skips recovery on non-auth errors"
+      | _ -> failwith "Expected reel failure")
+
+(** Test: Post reel recovers token on auth error *)
+let test_post_reel_recovers_on_auth_error () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "user_token_for_reel";
+    refresh_token = None;
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  let permission_error = {|{
+    "error": {
+      "message": "(#200) Permissions error",
+      "type": "OAuthException",
+      "code": 200,
+      "fbtrace_id": "REEL_PERM"
+    }
+  }|} in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_config._set_page_id ~account_id:"test_account" ~page_id:"page_123";
+
+  Mock_http.set_responses [
+    { status = 200; body = "video_data_attempt1"; headers = [] };
+    { status = 400; body = permission_error; headers = [] };
+    { status = 200; body = {|{"data":[{"id":"page_123","name":"My Page","access_token":"resolved_reel_page_token","category":"Brand"}]}|}; headers = [] };
+    { status = 200; body = "video_data_attempt2"; headers = [] };
+    { status = 200; body = {|{"video_id": "vid_recovered", "upload_url": "https://upload.facebook.com/v1"}|}; headers = [] };
+    { status = 200; body = {|{"success": true}|}; headers = [] };
+    { status = 200; body = {|{"success": true}|}; headers = [] };
+  ];
+
+  Facebook.post_reel
+    ~account_id:"test_account"
+    ~text:"Reel recovers on auth error"
+    ~video_url:"https://example.com/reel.mp4"
+    (handle_outcome
+      (fun video_id ->
+        assert (video_id = "vid_recovered");
+        let used_resolved_token =
+          List.exists (fun (_m, _u, headers, _body) ->
+            List.exists (fun (k, v) ->
+              k = "Authorization" && string_contains v "resolved_reel_page_token"
+            ) headers
+          ) !Mock_http.requests
+        in
+        assert used_resolved_token;
+        print_endline "✓ Post reel recovers on auth errors")
+      (fun err -> failwith ("Expected reel recovery success, got: " ^ err)))
+
+(** Test: Post reel recovers on auth error during upload phase *)
+let test_post_reel_recovers_on_upload_auth_error () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "user_token_reel_upload";
+    refresh_token = None;
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  let permission_error = {|{
+    "error": {
+      "message": "(#200) Permissions error",
+      "type": "OAuthException",
+      "code": 200,
+      "fbtrace_id": "REEL_UP_AUTH"
+    }
+  }|} in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_config._set_page_id ~account_id:"test_account" ~page_id:"page_123";
+
+  Mock_http.set_responses [
+    { status = 200; body = "video_data_1"; headers = [] };
+    { status = 200; body = {|{"video_id": "vid_up_1", "upload_url": "https://upload.facebook.com/reel-up-1"}|}; headers = [] };
+    { status = 400; body = permission_error; headers = [] };
+    { status = 200; body = {|{"data":[{"id":"page_123","name":"My Page","access_token":"resolved_reel_upload_token","category":"Brand"}]}|}; headers = [] };
+    { status = 200; body = "video_data_2"; headers = [] };
+    { status = 200; body = {|{"video_id": "vid_up_2", "upload_url": "https://upload.facebook.com/reel-up-2"}|}; headers = [] };
+    { status = 200; body = {|{"success": true}|}; headers = [] };
+    { status = 200; body = {|{"success": true}|}; headers = [] };
+  ];
+
+  Facebook.post_reel
+    ~account_id:"test_account"
+    ~text:"Reel upload auth recovery"
+    ~video_url:"https://example.com/reel-upload-recover.mp4"
+    (handle_outcome
+      (fun video_id ->
+        assert (video_id = "vid_up_2");
+        let used_resolved_token =
+          List.exists (fun (_m, _u, headers, _body) ->
+            List.exists (fun (k, v) -> k = "Authorization" && string_contains v "resolved_reel_upload_token") headers
+          ) !Mock_http.requests
+        in
+        assert used_resolved_token;
+        (match List.assoc_opt "test_account" !Mock_config.credentials_store with
+        | Some updated_creds ->
+            assert (updated_creds.access_token = "resolved_reel_upload_token");
+            assert (updated_creds.refresh_token = Some "user_token_reel_upload")
+        | None -> failwith "Expected updated credentials after reel upload recovery");
+        print_endline "✓ Post reel recovers on upload auth error")
+      (fun err -> failwith ("Reel upload auth recovery failed: " ^ err)))
+
+(** Test: Post reel does not recover on upload rate-limit errors *)
+let test_post_reel_no_recovery_on_upload_rate_limit () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "user_token_reel_rl";
+    refresh_token = Some "stored_user_token_reel_rl";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  let rate_limit_error = {|{
+    "error": {
+      "message": "(#80001) There have been too many calls to this Page account",
+      "type": "OAuthException",
+      "code": 80001,
+      "fbtrace_id": "REEL_UP_RL"
+    }
+  }|} in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_config._set_page_id ~account_id:"test_account" ~page_id:"page_123";
+
+  Mock_http.set_responses [
+    { status = 200; body = "video_data_1"; headers = [] };
+    { status = 200; body = {|{"video_id": "vid_up_1", "upload_url": "https://upload.facebook.com/reel-up-1"}|}; headers = [] };
+    { status = 400; body = rate_limit_error; headers = [] };
+  ];
+
+  Facebook.post_reel
+    ~account_id:"test_account"
+    ~text:"Reel upload rate-limit"
+    ~video_url:"https://example.com/reel-upload-rate-limit.mp4"
+    (fun outcome ->
+      match outcome with
+      | Error_types.Failure (Error_types.Rate_limited _) ->
+          let me_accounts_requests =
+            List.filter (fun (m, u, _, _) -> m = "GET" && string_contains u "/me/accounts") !Mock_http.requests
+          in
+          assert (List.length me_accounts_requests = 0);
+          print_endline "✓ Post reel skips recovery on upload rate-limit"
+      | Error_types.Failure e ->
+          failwith ("Expected rate-limited error, got: " ^ Error_types.error_to_string e)
+      | _ -> failwith "Expected reel failure on upload rate-limit")
+
 (** Test: Video reel validation - caption too long *)
 let test_reel_caption_validation () =
   Mock_config.reset ();
@@ -1219,6 +2125,7 @@ let () =
   test_redirect_uri_validation ();
   test_token_exchange ();
   test_token_exchange_errors ();
+  test_exchange_code_and_get_pages ();
   test_long_lived_token ();
   test_page_vs_user_token ();
   test_token_expiry_detection ();
@@ -1232,8 +2139,16 @@ let () =
   test_rate_limit_parsing ();
   test_field_selection ();
   test_error_code_parsing ();
+  test_invalid_token_without_expiry_subcode ();
+  test_token_subcode_467_maps_to_expired ();
+  test_permission_error_scopes ();
+  test_me_accounts_permission_scope ();
+  test_get_required_permissions_override ();
+  test_post_required_permissions_override ();
+  test_delete_required_permissions_override ();
   test_pagination ();
   test_batch_requests ();
+  test_batch_required_permissions_override ();
   test_app_secret_proof ();
   test_authorization_header ();
   
@@ -1241,6 +2156,11 @@ let () =
   test_upload_photo_with_alt_text ();
   test_post_with_alt_text ();
   test_post_with_multiple_alt_texts ();
+  test_post_with_indexed_attached_media_payload ();
+  test_post_recovers_page_token_from_user_token ();
+  test_post_recovery_uses_stored_user_token_fallback ();
+  test_post_recovery_stops_on_rate_limit ();
+  test_post_cleans_up_uploaded_photos_on_publish_failure ();
   test_post_without_alt_text ();
   test_alt_text_special_characters ();
   test_partial_alt_texts ();
@@ -1250,6 +2170,8 @@ let () =
   test_upload_video_story ();
   test_post_story_photo ();
   test_post_story_video ();
+  test_post_story_video_recovers_on_upload_auth_error ();
+  test_post_story_video_no_recovery_on_upload_rate_limit ();
   test_post_story_auto_image ();
   test_post_story_auto_video ();
   test_validate_story_valid_image ();
@@ -1260,8 +2182,12 @@ let () =
   print_endline "\n--- Video Reel Tests ---";
   test_upload_video_reel ();
   test_post_reel ();
+  test_post_reel_no_recovery_on_non_auth_error ();
+  test_post_reel_recovers_on_auth_error ();
+  test_post_reel_recovers_on_upload_auth_error ();
+  test_post_reel_no_recovery_on_upload_rate_limit ();
   test_reel_caption_validation ();
   test_video_media_validation ();
+  test_rate_limit_error_code_80001 ();
   
-  print_endline "\n=== All 42 tests passed! ===\n"
-
+  print_endline "\n=== All 63 tests passed! ===\n"

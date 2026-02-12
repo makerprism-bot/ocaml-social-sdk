@@ -361,6 +361,7 @@ end
 (** Make functor to create Facebook provider with given configuration *)
 module Make (Config : CONFIG) = struct
   let graph_api_base = "https://graph.facebook.com/v21.0"
+  module OAuth_http = OAuth.Make(Config.Http)
   
   (** {1 Platform Constants} *)
   
@@ -461,7 +462,7 @@ module Make (Config : CONFIG) = struct
   let parse_error_code code =
     match code with
     | 190 -> Invalid_token
-    | 4 | 17 | 32 | 613 -> Rate_limit_exceeded
+    | 4 | 17 | 32 | 613 | 80000 | 80001 | 80002 | 80003 | 80004 | 80005 | 80006 | 80008 | 80009 | 80014 -> Rate_limit_exceeded
     | 200 | 299 | 10 -> Permission_denied
     | 100 -> Invalid_parameter
     | 2 | 368 -> Temporarily_unavailable
@@ -504,11 +505,41 @@ module Make (Config : CONFIG) = struct
     with _ -> None
   
   (** Parse API error response and return structured Error_types.error *)
-  let parse_api_error ~status_code ~response_body =
+  let contains_substring s sub =
+    try
+      ignore (Str.search_forward (Str.regexp_string sub) s 0);
+      true
+    with Not_found -> false
+
+  let provider_required_permissions = [
+    "pages_read_engagement";
+    "pages_manage_posts";
+    "pages_show_list";
+    "publish_video";
+  ]
+
+  let permissions_for_path path =
+    let p = String.lowercase_ascii path in
+    if contains_substring p "me/accounts" then
+      ["pages_show_list"]
+    else if contains_substring p "video_reels" || contains_substring p "video_stories" then
+      ["pages_manage_posts"; "publish_video"]
+    else if contains_substring p "photo_stories" || contains_substring p "photos" || contains_substring p "feed" then
+      ["pages_manage_posts"]
+    else
+      provider_required_permissions
+
+  let parse_api_error_with_permissions ~required_permissions ~status_code ~response_body =
     match parse_facebook_error response_body with
     | Some fb_err ->
         (match fb_err.code with
-        | Invalid_token -> Error_types.Auth_error Error_types.Token_expired
+        | Invalid_token ->
+            let auth_error =
+              match fb_err.subcode with
+              | Some 463 | Some 467 -> Error_types.Token_expired
+              | _ -> Error_types.Token_invalid
+            in
+            Error_types.Auth_error auth_error
         | Rate_limit_exceeded ->
             Error_types.Rate_limited { 
               retry_after_seconds = fb_err.retry_after_seconds;
@@ -517,7 +548,7 @@ module Make (Config : CONFIG) = struct
               reset_at = None;
             }
         | Permission_denied -> 
-            Error_types.Auth_error (Error_types.Insufficient_permissions ["pages_manage_posts"])
+            Error_types.Auth_error (Error_types.Insufficient_permissions required_permissions)
         | Duplicate_post ->
             Error_types.Duplicate_content
         | _ ->
@@ -536,11 +567,27 @@ module Make (Config : CONFIG) = struct
           raw_response = Some response_body;
           request_id = None;
         }
+
+  let parse_api_error ~status_code ~response_body =
+    parse_api_error_with_permissions
+      ~required_permissions:provider_required_permissions
+      ~status_code
+      ~response_body
   
   (** {1 Rate Limiting} *)
   
   (** Parse X-App-Usage header *)
   let parse_rate_limit_header headers =
+    let parse_usage_number json field =
+      try json |> Yojson.Basic.Util.member field |> Yojson.Basic.Util.to_int
+      with _ ->
+        try
+          json
+          |> Yojson.Basic.Util.member field
+          |> Yojson.Basic.Util.to_float
+          |> int_of_float
+        with _ -> 0
+    in
     try
       let usage_header = 
         List.find_opt (fun (k, _) -> 
@@ -550,12 +597,11 @@ module Make (Config : CONFIG) = struct
       match usage_header with
       | Some (_, value) ->
           let json = Yojson.Basic.from_string value in
-          let open Yojson.Basic.Util in
-          let call_count = json |> member "call_count" |> to_int in
-          let total_cputime = json |> member "total_cputime" |> to_int in
-          let total_time = json |> member "total_time" |> to_int in
+          let call_count = parse_usage_number json "call_count" in
+          let total_cputime = parse_usage_number json "total_cputime" in
+          let total_time = parse_usage_number json "total_time" in
           (* Facebook uses percentage-based limits *)
-          let percentage_used = float_of_int call_count in
+          let percentage_used = float_of_int (max call_count (max total_cputime total_time)) in
           Some {
             call_count;
             total_cputime;
@@ -642,7 +688,10 @@ module Make (Config : CONFIG) = struct
         if response.status >= 200 && response.status < 300 then
           on_result (Ok response)
         else
-          on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+          on_result (Error (parse_api_error_with_permissions
+            ~required_permissions:(permissions_for_path path)
+            ~status_code:response.status
+            ~response_body:response.body)))
       (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** {1 Token Management} *)
@@ -680,6 +729,136 @@ module Make (Config : CONFIG) = struct
             (fun () -> on_success creds.access_token)
             (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
       (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
+
+  let is_recoverable_posting_auth_error = function
+    | Error_types.Auth_error (Error_types.Insufficient_permissions _ | Error_types.Token_invalid | Error_types.Token_expired) -> true
+    | _ -> false
+
+  let should_try_next_recovery_token = function
+    | Error_types.Auth_error (Error_types.Insufficient_permissions _ | Error_types.Token_invalid | Error_types.Token_expired) -> true
+    | _ -> false
+
+  let recover_page_access_token ~account_id ~current_access_token on_success on_error =
+    Config.get_page_id ~account_id
+      (fun page_id ->
+        let report_recovery_status status message cont =
+          Config.update_health_status ~account_id ~status ~error_message:(Some message)
+            cont
+            (fun _ -> cont ())
+        in
+        let dedupe_non_empty tokens =
+          let rec loop seen = function
+            | [] -> List.rev seen
+            | t :: rest when t = "" || List.mem t seen -> loop seen rest
+            | t :: rest -> loop (t :: seen) rest
+          in
+          loop [] tokens
+        in
+        let fetch_pages_with_user_token ~user_token on_success_fetch on_error_fetch =
+          let params = [
+            ("fields", ["id,access_token"]);
+            ("access_token", [user_token]);
+          ] @
+          (match compute_app_secret_proof ~access_token:user_token with
+           | Some proof -> [("appsecret_proof", [proof])]
+           | None -> []) in
+          let url = Printf.sprintf "%s/me/accounts?%s" graph_api_base (Uri.encoded_of_query params) in
+          Config.Http.get url
+            (fun response ->
+              if response.status >= 200 && response.status < 300 then
+                try
+                  let json = Yojson.Basic.from_string response.body in
+                  let open Yojson.Basic.Util in
+                  let pages = json |> member "data" |> to_list in
+                  let maybe_page =
+                    List.find_opt (fun page ->
+                      try page |> member "id" |> to_string = page_id
+                      with _ -> false
+                    ) pages
+                  in
+                  match maybe_page with
+                  | Some page ->
+                      let page_access_token = page |> member "access_token" |> to_string in
+                      if page_access_token = "" then
+                        on_error_fetch (Error_types.Auth_error (Error_types.Insufficient_permissions ["pages_show_list"; "pages_manage_posts"]))
+                      else
+                        on_success_fetch (user_token, page_access_token)
+                  | None ->
+                      on_error_fetch (Error_types.Auth_error (Error_types.Insufficient_permissions ["pages_show_list"; "pages_manage_posts"]))
+                with _ ->
+                  on_error_fetch (Error_types.Auth_error Error_types.Token_invalid)
+              else
+                on_error_fetch (parse_api_error_with_permissions
+                  ~required_permissions:["pages_show_list"]
+                  ~status_code:response.status
+                  ~response_body:response.body))
+            (fun _ -> on_error_fetch (Error_types.Auth_error Error_types.Token_invalid))
+        in
+        let rec try_candidate_tokens ~stored_creds ~last_error = function
+          | [] ->
+              let final_error =
+                match last_error with
+                | Some e -> e
+                | None -> Error_types.Auth_error Error_types.Token_invalid
+              in
+              report_recovery_status "token_recovery_failed"
+                "Failed to recover Page token from /me/accounts for configured page_id"
+                (fun () -> on_error final_error)
+          | candidate_user_token :: rest ->
+              fetch_pages_with_user_token ~user_token:candidate_user_token
+                (fun (user_token_used, page_access_token) ->
+                  let complete_success () =
+                    report_recovery_status "token_recovered"
+                      "Recovered Page access token from /me/accounts after posting auth failure"
+                      (fun () -> on_success page_id page_access_token)
+                  in
+                  match stored_creds with
+                  | Some creds ->
+                      let preserved_user_token =
+                        if user_token_used = page_access_token then creds.refresh_token
+                        else Some user_token_used
+                      in
+                      let updated_credentials = {
+                        creds with
+                        access_token = page_access_token;
+                        refresh_token = preserved_user_token;
+                        token_type = "Bearer";
+                      } in
+                      Config.update_credentials ~account_id ~credentials:updated_credentials
+                        complete_success
+                        (fun _ -> complete_success ())
+                  | None ->
+                      complete_success ())
+                (fun err ->
+                  if should_try_next_recovery_token err then
+                    try_candidate_tokens ~stored_creds ~last_error:(Some err) rest
+                  else
+                    let stop_reason =
+                      "Stopped token recovery due to non-auth failure: " ^
+                      Error_types.error_to_string err
+                    in
+                    report_recovery_status "token_recovery_failed"
+                      stop_reason
+                      (fun () -> on_error err))
+        in
+        Config.get_credentials ~account_id
+          (fun creds ->
+            let candidate_user_tokens =
+              dedupe_non_empty (current_access_token :: (match creds.refresh_token with Some t -> [t] | None -> []))
+            in
+            try_candidate_tokens ~stored_creds:(Some creds) ~last_error:None candidate_user_tokens)
+          (fun _ ->
+            let candidate_user_tokens = dedupe_non_empty [current_access_token] in
+            try_candidate_tokens ~stored_creds:None ~last_error:None candidate_user_tokens))
+      (fun err -> on_error (Error_types.Internal_error err))
+
+  let with_posting_page_context ~account_id on_success on_error =
+    ensure_valid_token ~account_id
+      (fun access_token ->
+        Config.get_page_id ~account_id
+          (fun page_id -> on_success page_id access_token)
+          (fun err -> on_error (Error_types.Internal_error err)))
+      on_error
   
   (** Upload photo to Facebook Page with optional alt text *)
   let upload_photo ~page_id ~page_access_token ~image_url ~alt_text ?(validate_before_upload=false) on_result =
@@ -768,7 +947,10 @@ module Make (Config : CONFIG) = struct
                     with e ->
                       on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse photo response: %s" (Printexc.to_string e))))
                   else
-                    on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+                    on_result (Error (parse_api_error_with_permissions
+                      ~required_permissions:["pages_manage_posts"]
+                      ~status_code:response.status
+                      ~response_body:response.body)))
                 (fun err -> on_result (Error (Error_types.Internal_error err))))
         else
           on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to download image from %s (%d)" image_url image_response.status))))
@@ -783,7 +965,7 @@ module Make (Config : CONFIG) = struct
       
       @see <https://developers.facebook.com/docs/video-api/guides/reels-publishing>
   *)
-  let upload_video_reel ~page_id ~page_access_token ~video_url ~description on_success on_error =
+  let upload_video_reel_typed ~page_id ~page_access_token ~video_url ~description on_success on_error =
     (* Download video first *)
     Config.Http.get ~headers:[] video_url
       (fun video_response ->
@@ -858,32 +1040,38 @@ module Make (Config : CONFIG) = struct
                                 if success then
                                   on_success video_id
                                 else
-                                  on_error "Facebook Reel upload failed: success=false"
+                                  on_error (Error_types.Internal_error "Facebook Reel upload failed: success=false")
                               with _e ->
                                 (* If we can't parse but got 2xx, consider it a success *)
                                 on_success video_id
                             else
-                              match parse_facebook_error finish_response.body with
-                              | Some err ->
-                                  on_error (Printf.sprintf "Reel finish failed (%s): %s" err.error_type err.message)
-                              | None ->
-                                  on_error (Printf.sprintf "Reel finish failed (%d): %s" finish_response.status finish_response.body))
-                          on_error
+                              on_error (parse_api_error_with_permissions
+                                ~required_permissions:["pages_manage_posts"; "publish_video"]
+                                ~status_code:finish_response.status
+                                ~response_body:finish_response.body))
+                          (fun err -> on_error (Error_types.Internal_error err))
                       else
-                        on_error (Printf.sprintf "Video upload failed (%d): %s" upload_response.status upload_response.body))
-                    on_error
+                        on_error (parse_api_error_with_permissions
+                          ~required_permissions:["pages_manage_posts"; "publish_video"]
+                          ~status_code:upload_response.status
+                          ~response_body:upload_response.body))
+                    (fun err -> on_error (Error_types.Internal_error err))
                 with e ->
-                  on_error (Printf.sprintf "Failed to parse init response: %s" (Printexc.to_string e))
+                  on_error (Error_types.Internal_error (Printf.sprintf "Failed to parse init response: %s" (Printexc.to_string e)))
               else
-                match parse_facebook_error init_response.body with
-                | Some err ->
-                    on_error (Printf.sprintf "Reel init failed (%s): %s" err.error_type err.message)
-                | None ->
-                    on_error (Printf.sprintf "Reel init failed (%d): %s" init_response.status init_response.body))
-            on_error
+                on_error (parse_api_error_with_permissions
+                  ~required_permissions:["pages_manage_posts"; "publish_video"]
+                  ~status_code:init_response.status
+                  ~response_body:init_response.body))
+            (fun err -> on_error (Error_types.Internal_error err))
         else
-          on_error (Printf.sprintf "Failed to download video from %s (%d)" video_url video_response.status))
-      on_error
+          on_error (Error_types.Internal_error (Printf.sprintf "Failed to download video from %s (%d)" video_url video_response.status)))
+      (fun err -> on_error (Error_types.Internal_error err))
+
+  let upload_video_reel ~page_id ~page_access_token ~video_url ~description on_success on_error =
+    upload_video_reel_typed ~page_id ~page_access_token ~video_url ~description
+      on_success
+      (fun err -> on_error (Error_types.error_to_string err))
   
   (** Post Reel (short-form video) to Facebook Page *)
   let post_reel ~account_id ~text ~video_url on_result =
@@ -891,14 +1079,21 @@ module Make (Config : CONFIG) = struct
     match validate_post ~text ~media_count:1 () with
     | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
     | Ok () ->
-        ensure_valid_token ~account_id
-          (fun page_access_token ->
-            Config.get_page_id ~account_id
-              (fun page_id ->
-                upload_video_reel ~page_id ~page_access_token ~video_url ~description:text
-                  (fun video_id -> on_result (Error_types.Success video_id))
-                  (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
-              (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+        with_posting_page_context ~account_id
+          (fun page_id page_access_token ->
+            let rec attempt_post ~can_recover token =
+              upload_video_reel_typed ~page_id ~page_access_token:token ~video_url ~description:text
+                (fun video_id -> on_result (Error_types.Success video_id))
+                (fun parsed ->
+                  if can_recover && is_recoverable_posting_auth_error parsed then
+                    recover_page_access_token ~account_id ~current_access_token:token
+                      (fun _resolved_page_id resolved_page_token ->
+                        attempt_post ~can_recover:false resolved_page_token)
+                      (fun _ -> on_result (Error_types.Failure parsed))
+                  else
+                    on_result (Error_types.Failure parsed))
+            in
+            attempt_post ~can_recover:true page_access_token)
           (fun err -> on_result (Error_types.Failure err))
   
   (** {1 Facebook Page Stories} *)
@@ -969,7 +1164,10 @@ module Make (Config : CONFIG) = struct
                 with e ->
                   on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse photo story response: %s" (Printexc.to_string e))))
               else
-                on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+                on_result (Error (parse_api_error_with_permissions
+                  ~required_permissions:["pages_manage_posts"]
+                  ~status_code:response.status
+                  ~response_body:response.body)))
             (fun err -> on_result (Error (Error_types.Internal_error err)))
         else
           on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to download image from %s (%d)" image_url image_response.status))))
@@ -1076,15 +1274,24 @@ module Make (Config : CONFIG) = struct
                                 (* If we can't parse but got 2xx, consider it a success *)
                                 on_result (Ok video_id)
                             else
-                              on_result (Error (parse_api_error ~status_code:finish_response.status ~response_body:finish_response.body)))
+                              on_result (Error (parse_api_error_with_permissions
+                                ~required_permissions:["pages_manage_posts"; "publish_video"]
+                                ~status_code:finish_response.status
+                                ~response_body:finish_response.body)))
                           (fun err -> on_result (Error (Error_types.Internal_error err)))
                       else
-                        on_result (Error (Error_types.Internal_error (Printf.sprintf "Video story upload failed (%d): %s" upload_response.status upload_response.body))))
+                        on_result (Error (parse_api_error_with_permissions
+                          ~required_permissions:["pages_manage_posts"; "publish_video"]
+                          ~status_code:upload_response.status
+                          ~response_body:upload_response.body)))
                     (fun err -> on_result (Error (Error_types.Internal_error err)))
                 with e ->
                   on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse video story init response: %s" (Printexc.to_string e))))
               else
-                on_result (Error (parse_api_error ~status_code:init_response.status ~response_body:init_response.body)))
+                on_result (Error (parse_api_error_with_permissions
+                  ~required_permissions:["pages_manage_posts"; "publish_video"]
+                  ~status_code:init_response.status
+                  ~response_body:init_response.body)))
             (fun err -> on_result (Error (Error_types.Internal_error err)))
         else
           on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to download video from %s (%d)" video_url video_response.status))))
@@ -1097,15 +1304,20 @@ module Make (Config : CONFIG) = struct
       @param on_result Continuation receiving outcome with story ID
   *)
   let post_story_photo ~account_id ~image_url on_result =
-    ensure_valid_token ~account_id
-      (fun page_access_token ->
-        Config.get_page_id ~account_id
-          (fun page_id ->
-            upload_photo_story ~page_id ~page_access_token ~image_url
-              (function
-                | Ok story_id -> on_result (Error_types.Success story_id)
-                | Error e -> on_result (Error_types.Failure e)))
-          (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+    with_posting_page_context ~account_id
+      (fun page_id page_access_token ->
+        let rec attempt_post can_recover token =
+          upload_photo_story ~page_id ~page_access_token:token ~image_url
+            (function
+              | Ok story_id -> on_result (Error_types.Success story_id)
+              | Error e when can_recover && is_recoverable_posting_auth_error e ->
+                  recover_page_access_token ~account_id ~current_access_token:token
+                    (fun _resolved_page_id resolved_page_token ->
+                      attempt_post false resolved_page_token)
+                    (fun _ -> on_result (Error_types.Failure e))
+              | Error e -> on_result (Error_types.Failure e))
+        in
+        attempt_post true page_access_token)
       (fun err -> on_result (Error_types.Failure err))
   
   (** Post video story to Facebook Page (high-level)
@@ -1115,15 +1327,20 @@ module Make (Config : CONFIG) = struct
       @param on_result Continuation receiving outcome with story ID
   *)
   let post_story_video ~account_id ~video_url on_result =
-    ensure_valid_token ~account_id
-      (fun page_access_token ->
-        Config.get_page_id ~account_id
-          (fun page_id ->
-            upload_video_story ~page_id ~page_access_token ~video_url
-              (function
-                | Ok story_id -> on_result (Error_types.Success story_id)
-                | Error e -> on_result (Error_types.Failure e)))
-          (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+    with_posting_page_context ~account_id
+      (fun page_id page_access_token ->
+        let rec attempt_post can_recover token =
+          upload_video_story ~page_id ~page_access_token:token ~video_url
+            (function
+              | Ok story_id -> on_result (Error_types.Success story_id)
+              | Error e when can_recover && is_recoverable_posting_auth_error e ->
+                  recover_page_access_token ~account_id ~current_access_token:token
+                    (fun _resolved_page_id resolved_page_token ->
+                      attempt_post false resolved_page_token)
+                    (fun _ -> on_result (Error_types.Failure e))
+              | Error e -> on_result (Error_types.Failure e))
+        in
+        attempt_post true page_access_token)
       (fun err -> on_result (Error_types.Failure err))
   
   (** Detect media type from URL extension *)
@@ -1189,20 +1406,42 @@ module Make (Config : CONFIG) = struct
         match validate_media ~media_urls with
         | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
         | Ok () ->
-            ensure_valid_token ~account_id
-              (fun page_access_token ->
-                Config.get_page_id ~account_id
-                  (fun page_id ->
+            with_posting_page_context ~account_id
+              (fun page_id page_access_token ->
+                  let rec attempt_post can_recover token =
+                    let cleanup_uploaded_photos photo_ids on_done =
+                      let rec loop = function
+                        | [] -> on_done ()
+                        | photo_id :: rest ->
+                            let proof_params =
+                              match compute_app_secret_proof ~access_token:token with
+                              | Some proof -> [ ("appsecret_proof", [ proof ]) ]
+                              | None -> []
+                            in
+                            let base_url = Printf.sprintf "%s/%s" graph_api_base photo_id in
+                            let delete_url =
+                              if List.length proof_params > 0 then
+                                base_url ^ "?" ^ Uri.encoded_of_query proof_params
+                              else
+                                base_url
+                            in
+                            let headers = [ ("Authorization", Printf.sprintf "Bearer %s" token) ] in
+                            Config.Http.delete ~headers delete_url
+                              (fun _ -> loop rest)
+                              (fun _ -> loop rest)
+                      in
+                      loop photo_ids
+                    in
                     (* Upload all photos first *)
                     let rec upload_all_photos urls_with_alt acc on_complete =
                       match urls_with_alt with
                       | [] -> on_complete (Ok (List.rev acc))
                       | (url, alt_text) :: rest ->
-                          upload_photo ~page_id ~page_access_token ~image_url:url ~alt_text
+                          upload_photo ~page_id ~page_access_token:token ~image_url:url ~alt_text
                             ~validate_before_upload:validate_media_before_upload
                             (function
                               | Ok photo_id -> upload_all_photos rest (photo_id :: acc) on_complete
-                              | Error e -> on_complete (Error e))
+                              | Error e -> on_complete (Error (e, List.rev acc)))
                     in
                     
                     (* Pair URLs with alt text - use None if alt text list is shorter *)
@@ -1213,24 +1452,33 @@ module Make (Config : CONFIG) = struct
                     
                     upload_all_photos urls_with_alt [] 
                       (function
-                      | Error e -> on_result (Error_types.Failure e)
+                      | Error (e, uploaded_photo_ids) ->
+                        cleanup_uploaded_photos uploaded_photo_ids (fun () ->
+                          if can_recover && is_recoverable_posting_auth_error e then
+                            recover_page_access_token ~account_id ~current_access_token:token
+                              (fun _resolved_page_id resolved_page_token ->
+                                attempt_post false resolved_page_token)
+                              (fun _ -> on_result (Error_types.Failure e))
+                          else
+                            on_result (Error_types.Failure e))
                       | Ok photo_ids ->
                         (* Create Facebook Page post *)
                         let url = Printf.sprintf "%s/%s/feed" graph_api_base page_id in
+                        let attached_media_params =
+                          List.mapi (fun i photo_id ->
+                            (Printf.sprintf "attached_media[%d]" i, [
+                              Yojson.Basic.to_string (`Assoc [("media_fbid", `String photo_id)])
+                            ])
+                          ) photo_ids
+                        in
                         
                         let params = 
                           [
                             ("message", [text]);
                           ] @
-                          (if List.length photo_ids > 0 then
-                            [("attached_media", [
-                              Yojson.Basic.to_string (`List (List.map (fun photo_id ->
-                                `Assoc [("media_fbid", `String photo_id)]
-                              ) photo_ids))
-                            ])]
-                          else []) @
+                          attached_media_params @
                           (* Add app secret proof *)
-                          (match compute_app_secret_proof ~access_token:page_access_token with
+                          (match compute_app_secret_proof ~access_token:token with
                            | Some proof -> [("appsecret_proof", [proof])]
                            | None -> [])
                         in
@@ -1238,7 +1486,7 @@ module Make (Config : CONFIG) = struct
                         let body = Uri.encoded_of_query params in
                         let headers = [
                           ("Content-Type", "application/x-www-form-urlencoded");
-                          ("Authorization", Printf.sprintf "Bearer %s" page_access_token);
+                          ("Authorization", Printf.sprintf "Bearer %s" token);
                         ] in
                         
                         Config.Http.post ~headers ~body url
@@ -1254,10 +1502,26 @@ module Make (Config : CONFIG) = struct
                                 (* Post succeeded but couldn't parse ID *)
                                 on_result (Error_types.Success "unknown")
                             else
-                              on_result (Error_types.Failure 
-                                (parse_api_error ~status_code:response.status ~response_body:response.body)))
-                          (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err)))))
-                  (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+                              let parsed_error =
+                                parse_api_error_with_permissions
+                                  ~required_permissions:["pages_manage_posts"]
+                                  ~status_code:response.status
+                                  ~response_body:response.body
+                              in
+                              cleanup_uploaded_photos photo_ids (fun () ->
+                                if can_recover && is_recoverable_posting_auth_error parsed_error then
+                                  recover_page_access_token ~account_id ~current_access_token:token
+                                    (fun _resolved_page_id resolved_page_token ->
+                                      attempt_post false resolved_page_token)
+                                    (fun _ -> on_result (Error_types.Failure parsed_error))
+                                else
+                                  on_result (Error_types.Failure parsed_error)))
+                          (fun err ->
+                            let parsed_error = Error_types.Internal_error err in
+                            cleanup_uploaded_photos photo_ids (fun () ->
+                              on_result (Error_types.Failure parsed_error))))
+                  in
+                  attempt_post true page_access_token)
               (fun err -> on_result (Error_types.Failure err))
   
   (** Post thread (Facebook doesn't support threads, posts only first item with warning)
@@ -1345,49 +1609,63 @@ module Make (Config : CONFIG) = struct
     
     if client_id = "" || client_secret = "" then
       on_error "Facebook OAuth credentials not configured"
-    else (
-      let params = [
-        ("client_id", [client_id]);
-        ("client_secret", [client_secret]);
-        ("redirect_uri", [redirect_uri]);
-        ("code", [code]);
-      ] in
-      
-      let query = Uri.encoded_of_query params in
-      let url = Printf.sprintf "%s/oauth/access_token?%s" graph_api_base query in
-      
-      Config.Http.get ~headers:[] url
-        (fun response ->
-          update_rate_limits response;
-          if response.status >= 200 && response.status < 300 then
-            try
-              let json = Yojson.Basic.from_string response.body in
-              let open Yojson.Basic.Util in
-              let access_token = json |> member "access_token" |> to_string in
-              let expires_in = json |> member "expires_in" |> to_int in
-              let expires_at = 
-                let now = Ptime_clock.now () in
-                match Ptime.add_span now (Ptime.Span.of_int_s expires_in) with
-                | Some exp -> Ptime.to_rfc3339 exp
-                | None -> Ptime.to_rfc3339 now
-              in
-              let credentials = {
-                access_token;
-                refresh_token = None;  (* Facebook doesn't use refresh tokens *)
-                expires_at = Some expires_at;
-                token_type = "Bearer";
-              } in
-              on_success credentials
-            with e ->
-              on_error (Printf.sprintf "Failed to parse token response: %s" (Printexc.to_string e))
-          else
-            match parse_facebook_error response.body with
-            | Some err ->
-                on_error (Printf.sprintf "Token exchange failed (%s): %s" err.error_type err.message)
-            | None ->
-                on_error (Printf.sprintf "Token exchange failed (%d): %s" response.status response.body))
+    else
+      let normalize_token_type creds =
+        let token_type =
+          if String.lowercase_ascii creds.token_type = "bearer" then "Bearer"
+          else creds.token_type
+        in
+        { creds with token_type }
+      in
+      OAuth_http.exchange_code ~client_id ~client_secret ~redirect_uri ~code
+        (fun short_lived_creds ->
+          OAuth_http.exchange_for_long_lived_token
+            ~client_id
+            ~client_secret
+            ~short_lived_token:short_lived_creds.access_token
+            (fun long_lived_creds -> on_success (normalize_token_type long_lived_creds))
+            (fun err ->
+              on_error (Printf.sprintf
+                "Failed to exchange for long-lived token: %s" err)))
         on_error
-    )
+
+  (** Exchange OAuth code and return pages with Page access tokens.
+
+      This helper performs the full server-side onboarding flow:
+      1) Exchange code for short-lived user token
+      2) Exchange for long-lived user token
+      3) Retrieve managed pages via /me/accounts
+  *)
+  let exchange_code_and_get_pages ~code ~redirect_uri on_success on_error =
+    let client_id = Config.get_env "FACEBOOK_APP_ID" |> Option.value ~default:"" in
+    let client_secret = Config.get_env "FACEBOOK_APP_SECRET" |> Option.value ~default:"" in
+    if client_id = "" || client_secret = "" then
+      on_error "Facebook OAuth credentials not configured"
+    else
+      let normalize_token_type creds =
+        let token_type =
+          if String.lowercase_ascii creds.token_type = "bearer" then "Bearer"
+          else creds.token_type
+        in
+        { creds with token_type }
+      in
+      OAuth_http.exchange_code ~client_id ~client_secret ~redirect_uri ~code
+        (fun short_lived_creds ->
+          let continue_with_user_creds user_creds =
+            let user_creds = normalize_token_type user_creds in
+            OAuth_http.get_user_pages ~user_access_token:user_creds.access_token
+              (fun pages -> on_success (user_creds, pages))
+              on_error
+          in
+          OAuth_http.exchange_for_long_lived_token
+            ~client_id
+            ~client_secret
+            ~short_lived_token:short_lived_creds.access_token
+            continue_with_user_creds
+            (fun err ->
+              on_error (Printf.sprintf
+                "Failed to exchange for long-lived token before page discovery: %s" err)))
+        on_error
   
   (** Validate content length *)
   let validate_content ~text =
@@ -1402,8 +1680,16 @@ module Make (Config : CONFIG) = struct
   (** {1 Generic API Methods} *)
   
   (** Generic GET request to any Graph API endpoint *)
-  let get ~path ~access_token ?fields on_result =
-    get_paginated ~path ~access_token ?fields ?cursor:None on_result
+  let get ~path ~access_token ?fields ?required_permissions on_result =
+    get_paginated ~path ~access_token ?fields ?cursor:None
+      (function
+        | Ok response -> on_result (Ok response)
+        | Error (Error_types.Auth_error (Error_types.Insufficient_permissions _)) ->
+            (match required_permissions with
+             | Some perms ->
+                 on_result (Error (Error_types.Auth_error (Error_types.Insufficient_permissions perms)))
+             | None -> on_result (Error (Error_types.Auth_error (Error_types.Insufficient_permissions (permissions_for_path path)))))
+        | Error e -> on_result (Error e))
   
   (** Get a page of results from a collection endpoint *)
   let get_page ~path ~access_token ?fields ?cursor (parse_data : Yojson.Basic.t -> 'a list) on_result =
@@ -1430,7 +1716,7 @@ module Make (Config : CONFIG) = struct
     get_page ~path ~access_token ?fields ~cursor parse_data on_result
   
   (** Generic POST request to any Graph API endpoint *)
-  let post ~path ~access_token ~params on_result =
+  let post ~path ~access_token ~params ?required_permissions on_result =
     let url = Printf.sprintf "%s/%s" graph_api_base path in
     
     let all_params = params @
@@ -1451,11 +1737,19 @@ module Make (Config : CONFIG) = struct
         if response.status >= 200 && response.status < 300 then
           on_result (Ok response)
         else
-          on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+          let required_permissions =
+            match required_permissions with
+            | Some p -> p
+            | None -> permissions_for_path path
+          in
+          on_result (Error (parse_api_error_with_permissions
+            ~required_permissions
+            ~status_code:response.status
+            ~response_body:response.body)))
       (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** Generic DELETE request to any Graph API endpoint *)
-  let delete ~path ~access_token on_result =
+  let delete ~path ~access_token ?required_permissions on_result =
     let proof_params = match compute_app_secret_proof ~access_token with
       | Some proof -> [("appsecret_proof", [proof])]
       | None -> []
@@ -1478,7 +1772,15 @@ module Make (Config : CONFIG) = struct
         if response.status >= 200 && response.status < 300 then
           on_result (Ok response)
         else
-          on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+          let required_permissions =
+            match required_permissions with
+            | Some p -> p
+            | None -> permissions_for_path path
+          in
+          on_result (Error (parse_api_error_with_permissions
+            ~required_permissions
+            ~status_code:response.status
+            ~response_body:response.body)))
       (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** {1 Batch Requests} *)
@@ -1499,7 +1801,7 @@ module Make (Config : CONFIG) = struct
   }
   
   (** Execute batch requests (up to 50 per batch) *)
-  let batch_request ~requests ~access_token on_result =
+  let batch_request ~requests ~access_token ?required_permissions on_result =
     if List.length requests = 0 then
       on_result (Error (Error_types.Internal_error "Batch request list cannot be empty"))
     else if List.length requests > 50 then
@@ -1569,6 +1871,14 @@ module Make (Config : CONFIG) = struct
             with e ->
               on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse batch response: %s" (Printexc.to_string e))))
           else
-            on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+            let required_permissions =
+              match required_permissions with
+              | Some p -> p
+              | None -> provider_required_permissions
+            in
+            on_result (Error (parse_api_error_with_permissions
+              ~required_permissions
+              ~status_code:response.status
+              ~response_body:response.body)))
         (fun err -> on_result (Error (Error_types.Internal_error err)))
 end

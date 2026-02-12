@@ -11,10 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Authentication
 - OAuth 2.0 authentication flow
-- Token refresh support
+- OAuth short-lived -> long-lived exchange support
 - 60-day token expiry tracking
 - App Secret Proof (HMAC-SHA256 signing)
 - Authorization header token transmission
+- Page token recovery from `/me/accounts` for posting retries
 
 #### Page Operations
 - Facebook Page posting (text + images)
@@ -35,6 +36,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Typed error codes (Invalid_token, Rate_limit_exceeded, Permission_denied, etc.)
 - Structured error responses with retry recommendations
 - Facebook trace IDs for debugging
+- Expanded Facebook/BUC rate limit code mapping (e.g. `80001`, `80002`)
+
+#### Posting Reliability
+- Indexed `attached_media[n]` payload for multi-photo feed posts
+- Best-effort cleanup of uploaded unpublished photos when feed publish fails
 
 #### Batch Requests
 - Combine up to 50 API calls in single request

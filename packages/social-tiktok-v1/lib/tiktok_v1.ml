@@ -139,17 +139,23 @@ module OAuth = struct
         @param on_success Continuation receiving credentials
         @param on_error Continuation receiving error message
     *)
-    let exchange_code ~client_key ~client_secret ~redirect_uri ~code on_success on_error =
+    let exchange_code ?code_verifier ~client_key ~client_secret ~redirect_uri ~code on_success on_error =
       let headers = [
         ("Content-Type", "application/x-www-form-urlencoded");
       ] in
-      let body = Uri.encoded_of_query [
+      let base_query = [
         ("client_key", [client_key]);
         ("client_secret", [client_secret]);
         ("code", [code]);
         ("grant_type", ["authorization_code"]);
         ("redirect_uri", [redirect_uri]);
       ] in
+      let full_query =
+        match code_verifier with
+        | Some cv when cv <> "" -> base_query @ [ ("code_verifier", [cv]) ]
+        | _ -> base_query
+      in
+      let body = Uri.encoded_of_query full_query in
       
       Http.post ~headers ~body Metadata.token_endpoint
         (fun response ->
@@ -345,6 +351,7 @@ let auth_base_url = "https://www.tiktok.com/v2/auth/authorize"
 let max_video_duration_sec = 600  (* 10 minutes, varies by user *)
 let min_video_duration_sec = 3
 let max_video_size_bytes = 50 * 1024 * 1024  (* 50MB default, TikTok allows up to 4GB *)
+let default_upload_chunk_size_bytes = 10 * 1024 * 1024  (* 10MB *)
 let max_caption_length = 2200
 let supported_formats = ["mp4"; "webm"; "mov"]
 let min_resolution = 360
@@ -401,34 +408,108 @@ let parse_creator_info json =
   let open Yojson.Basic.Util in
   try
     let data = json |> member "data" in
-    let parse_privacy_levels arr =
-      arr |> to_list |> List.map (fun p -> privacy_level_of_string (to_string p))
+    let privacy_level_of_string_opt = function
+      | "PUBLIC_TO_EVERYONE" -> Some PublicToEveryone
+      | "MUTUAL_FOLLOW_FRIENDS" -> Some MutualFollowFriends
+      | "SELF_ONLY" -> Some SelfOnly
+      | _ -> None
+    in
+    let read_string_field field default =
+      try
+        let value = data |> member field in
+        if value = `Null then default else to_string value
+      with _ -> default
+    in
+    let read_bool_field field default =
+      try
+        let value = data |> member field in
+        if value = `Null then default else to_bool value
+      with _ -> default
+    in
+    let read_int_field field default =
+      try
+        let value = data |> member field in
+        if value = `Null then default else to_int value
+      with _ -> default
+    in
+    let parse_privacy_levels field =
+      try
+        let arr = data |> member field in
+        let parsed =
+          arr
+          |> to_list
+          |> List.filter_map (fun p -> privacy_level_of_string_opt (to_string p))
+        in
+        if parsed = [] then [SelfOnly] else parsed
+      with _ -> [SelfOnly]
     in
     Ok {
-      creator_avatar_url = data |> member "creator_avatar_url" |> to_string;
-      creator_username = data |> member "creator_username" |> to_string;
-      creator_nickname = data |> member "creator_nickname" |> to_string;
-      privacy_level_options = data |> member "privacy_level_options" |> parse_privacy_levels;
-      comment_disabled = data |> member "comment_disabled" |> to_bool;
-      duet_disabled = data |> member "duet_disabled" |> to_bool;
-      stitch_disabled = data |> member "stitch_disabled" |> to_bool;
-      max_video_post_duration_sec = data |> member "max_video_post_duration_sec" |> to_int;
+      creator_avatar_url = read_string_field "creator_avatar_url" "";
+      creator_username = read_string_field "creator_username" "";
+      creator_nickname = read_string_field "creator_nickname" "";
+      privacy_level_options = parse_privacy_levels "privacy_level_options";
+      comment_disabled = read_bool_field "comment_disabled" false;
+      duet_disabled = read_bool_field "duet_disabled" false;
+      stitch_disabled = read_bool_field "stitch_disabled" false;
+      max_video_post_duration_sec = read_int_field "max_video_post_duration_sec" max_video_duration_sec;
     }
   with e ->
     Error (Printf.sprintf "Failed to parse creator info: %s" (Printexc.to_string e))
 
 let parse_publish_status json =
   let open Yojson.Basic.Util in
+  let get_first_published_id data =
+    let extract_id value =
+      match value with
+      | `String s -> Some s
+      | `Assoc _ -> (try Some (value |> member "id" |> to_string) with _ -> None)
+      | `List (`String s :: _) -> Some s
+      | `List (first :: _) -> (try Some (first |> member "id" |> to_string) with _ -> None)
+      | _ -> None
+    in
+    let rec try_fields = function
+      | [] -> None
+      | field :: rest ->
+          let value = data |> member field in
+          if value = `Null then try_fields rest
+          else
+            match extract_id value with
+            | Some id -> Some id
+            | None -> try_fields rest
+    in
+    try_fields [
+      "publicaly_available_post_id";
+      "publicly_available_post_id";
+      "public_available_post_id";
+      "video_id";
+      "post_id";
+    ]
+  in
+  let get_failure_message data =
+    let from_field field =
+      try
+        let value = data |> member field in
+        if value = `Null then None else Some (to_string value)
+      with _ -> None
+    in
+    match from_field "fail_reason" with
+    | Some msg -> msg
+    | None ->
+        (match from_field "error_message" with
+         | Some msg -> msg
+         | None -> "TikTok publish failed")
+  in
   try
     let data = json |> member "data" in
     let status = data |> member "status" |> to_string in
     match status with
     | "PROCESSING_DOWNLOAD" | "PROCESSING_UPLOAD" -> Processing
-    | "PUBLISH_COMPLETE" -> 
-        let video_id = data |> member "publicaly_available_post_id" |> to_list |> List.hd |> member "id" |> to_string in
-        Published video_id
+    | "PUBLISH_COMPLETE" ->
+        (match get_first_published_id data with
+         | Some video_id -> Published video_id
+         | None -> Failed { error_code = "PARSE_ERROR"; error_message = "PUBLISH_COMPLETE without post ID" })
     | "FAILED" ->
-        let fail_reason = data |> member "fail_reason" |> to_string in
+        let fail_reason = get_failure_message data in
         Failed { error_code = "UPLOAD_FAILED"; error_message = fail_reason }
     | _ -> Processing
   with e ->
@@ -478,17 +559,29 @@ module Make (Config : CONFIG) = struct
     if text_len > max_caption_length then
       errors := Error_types.Text_too_long { length = text_len; max = max_caption_length } :: !errors;
     
-    (* TikTok requires exactly one video - text-only posts not allowed *)
+    (* TikTok requires exactly one video per post *)
     if media_count < 1 then
       errors := Error_types.Media_required :: !errors;
+    if media_count > 1 then
+      errors := Error_types.Too_many_media { count = media_count; max = 1 } :: !errors;
     
     if !errors = [] then Ok ()
     else Error (List.rev !errors)
   
   (** Validate thread content *)
   let validate_thread ~texts ~media_counts () =
-    if List.length texts = 0 then
+    let text_count = List.length texts in
+    let media_count = List.length media_counts in
+    if text_count = 0 then
       Error [Error_types.Thread_empty]
+    else if text_count <> media_count then
+      let mismatch_error =
+        if media_count < text_count then Error_types.Media_required else Error_types.Text_empty
+      in
+      Error [Error_types.Thread_post_invalid {
+        index = min text_count media_count;
+        errors = [mismatch_error];
+      }]
     else
       let errors = ref [] in
       List.iteri (fun i text ->
@@ -503,48 +596,120 @@ module Make (Config : CONFIG) = struct
       ) texts;
       if !errors = [] then Ok ()
       else Error (List.rev !errors)
+
+  let is_valid_http_url url =
+    try
+      let uri = Uri.of_string url in
+      match Uri.scheme uri, Uri.host uri with
+      | Some scheme, Some host when host <> "" ->
+          let normalized = String.lowercase_ascii scheme in
+          normalized = "http" || normalized = "https"
+      | _ -> false
+    with _ -> false
   
   (** Parse API error response and return structured Error_types.error *)
-  let parse_api_error ~status_code ~response_body =
-    try
-      let json = Yojson.Basic.from_string response_body in
-      let open Yojson.Basic.Util in
-      let error_msg = 
-        try 
-          let error = json |> member "error" in
-          let code = try error |> member "code" |> to_string with _ -> "" in
-          let msg = try error |> member "message" |> to_string with _ -> response_body in
-          if code <> "" then Printf.sprintf "%s: %s" code msg else msg
-        with _ -> response_body
+  let parse_api_error ~status_code ~response_body ?(response_headers=[]) ?(required_scopes=["video.publish"]) () =
+    let lowercase s = String.lowercase_ascii s in
+    let find_header name =
+      let target = lowercase name in
+      let rec loop = function
+        | [] -> None
+        | (k, v) :: rest ->
+            if lowercase k = target then Some v else loop rest
       in
-      
-      (* Map common TikTok errors *)
-      if status_code = 401 then
-        Error_types.Auth_error Error_types.Token_invalid
-      else if status_code = 403 then
-        Error_types.Auth_error (Error_types.Insufficient_permissions ["video.publish"])
-      else if status_code = 429 then
-        Error_types.Rate_limited { 
-          retry_after_seconds = Some 60;
-          limit = None;
-          remaining = Some 0;
-          reset_at = None;
-        }
+      loop response_headers
+    in
+    let request_id =
+      match find_header "x-tt-logid" with
+      | Some v -> Some v
+      | None ->
+          (match find_header "x-request-id" with
+           | Some v -> Some v
+           | None -> find_header "x-tt-trace-id")
+    in
+    let retry_after_seconds =
+      match find_header "retry-after" with
+      | Some s -> (match int_of_string_opt s with Some n -> Some n | None -> Some 60)
+      | None -> Some 60
+    in
+    let parsed_code, parsed_msg =
+      try
+        let json = Yojson.Basic.from_string response_body in
+        let open Yojson.Basic.Util in
+        let value_to_string = function
+          | `String s -> Some s
+          | `Int i -> Some (string_of_int i)
+          | `Float f -> Some (string_of_float f)
+          | _ -> None
+        in
+        let read_string_field obj field =
+          try
+            let value = obj |> member field in
+            if value = `Null then None else value_to_string value
+          with _ -> None
+        in
+        let error_obj = json |> member "error" in
+        let code =
+          match read_string_field error_obj "code" with
+          | Some v -> Some v
+          | None ->
+              (match read_string_field json "code" with
+               | Some v -> Some v
+               | None -> read_string_field json "error_code")
+        in
+        let msg =
+          match read_string_field error_obj "message" with
+          | Some v -> Some v
+          | None ->
+              (match read_string_field json "message" with
+               | Some v -> Some v
+               | None -> read_string_field json "error_message")
+        in
+        (code, msg)
+      with _ ->
+        (None, None)
+    in
+    let error_msg =
+      match parsed_code, parsed_msg with
+      | Some c, Some m -> Printf.sprintf "%s: %s" c m
+      | Some c, None -> c
+      | None, Some m -> m
+      | None, None -> response_body
+    in
+    let has_substring haystack needle =
+      let h_len = String.length haystack in
+      let n_len = String.length needle in
+      let rec loop i =
+        if i + n_len > h_len then false
+        else if String.sub haystack i n_len = needle then true
+        else loop (i + 1)
+      in
+      if n_len = 0 then true else loop 0
+    in
+    let lower_error_signals = String.lowercase_ascii error_msg in
+    if status_code = 401 then
+      if has_substring lower_error_signals "expired" || has_substring lower_error_signals "expire" then
+        Error_types.Auth_error Error_types.Token_expired
       else
-        Error_types.Api_error {
-          status_code;
-          message = error_msg;
-          platform = Platform_types.TikTok;
-          raw_response = Some response_body;
-          request_id = None;
-        }
-    with _ ->
+        Error_types.Auth_error Error_types.Token_invalid
+    else if status_code = 403 then
+      Error_types.Auth_error (Error_types.Insufficient_permissions required_scopes)
+    else if status_code = 404 then
+      Error_types.Resource_not_found (if error_msg = "" then "TikTok resource" else error_msg)
+    else if status_code = 429 then
+      Error_types.Rate_limited {
+        retry_after_seconds;
+        limit = None;
+        remaining = Some 0;
+        reset_at = None;
+      }
+    else
       Error_types.Api_error {
         status_code;
-        message = response_body;
+        message = error_msg;
         platform = Platform_types.TikTok;
         raw_response = Some response_body;
-        request_id = None;
+        request_id;
       }
   
   (** Check if token is expired or expiring soon *)
@@ -588,8 +753,14 @@ module Make (Config : CONFIG) = struct
               let json = Yojson.Basic.from_string response.body in
               let open Yojson.Basic.Util in
               let new_access = json |> member "access_token" |> to_string in
-              let new_refresh = json |> member "refresh_token" |> to_string in
-              let expires_in = json |> member "expires_in" |> to_int in
+              let new_refresh =
+                try json |> member "refresh_token" |> to_string
+                with _ -> refresh_token
+              in
+              let expires_in =
+                try json |> member "expires_in" |> to_int
+                with _ -> 86400
+              in
               let expires_at = 
                 let now = Ptime_clock.now () in
                 match Ptime.add_span now (Ptime.Span.of_int_s expires_in) with
@@ -653,16 +824,29 @@ module Make (Config : CONFIG) = struct
         Config.Http.post ~headers ~body:"{}" creator_info_url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              match parse_creator_info (Yojson.Basic.from_string response.body) with
-              | Ok info -> on_result (Ok info)
-              | Error e -> on_result (Error (Error_types.Internal_error e))
+              (try
+                 match parse_creator_info (Yojson.Basic.from_string response.body) with
+                 | Ok info -> on_result (Ok info)
+                 | Error e -> on_result (Error (Error_types.Internal_error e))
+               with e ->
+                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse creator info response: %s" (Printexc.to_string e)))))
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body ~response_headers:response.headers ~required_scopes:["user.info.basic"] ())))
           (fun err -> on_result (Error (Error_types.Internal_error err))))
       (fun err -> on_result (Error err))
   
   (** Initialize video upload and get upload URL *)
-  let init_video_upload ~account_id ~post_info ~video_size on_result =
+  let init_video_upload ~account_id ~post_info ~video_size ?chunk_size ?total_chunk_count on_result =
+    let resolved_chunk_size =
+      match chunk_size with
+      | Some cs when cs > 0 -> cs
+      | _ -> video_size
+    in
+    let resolved_total_chunk_count =
+      match total_chunk_count with
+      | Some c when c > 0 -> c
+      | _ -> 1
+    in
     ensure_valid_token ~account_id
       (fun access_token ->
         let headers = [
@@ -674,8 +858,8 @@ module Make (Config : CONFIG) = struct
           ("source_info", `Assoc [
             ("source", `String "FILE_UPLOAD");
             ("video_size", `Int video_size);
-            ("chunk_size", `Int video_size);  (* Single chunk upload *)
-            ("total_chunk_count", `Int 1);
+            ("chunk_size", `Int resolved_chunk_size);
+            ("total_chunk_count", `Int resolved_total_chunk_count);
           ]);
         ] |> Yojson.Basic.to_string in
         
@@ -692,26 +876,88 @@ module Make (Config : CONFIG) = struct
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse init response: %s" (Printexc.to_string e))))
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body ~response_headers:response.headers ~required_scopes:["video.publish"] ())))
           (fun err -> on_result (Error (Error_types.Internal_error err))))
       (fun err -> on_result (Error err))
   
   (** Upload video content to the upload URL *)
-  let upload_video_chunk ~upload_url ~video_content on_result =
-    let video_size = String.length video_content in
-    let headers = [
-      ("Content-Type", "video/mp4");
-      ("Content-Length", string_of_int video_size);
-      ("Content-Range", Printf.sprintf "bytes 0-%d/%d" (video_size - 1) video_size);
-    ] in
-    
-    Config.Http.put ~headers ~body:video_content upload_url
-      (fun response ->
-        if response.status >= 200 && response.status < 300 then
+  let upload_video_chunk
+      ~upload_url
+      ~video_content
+      ?(content_type="video/mp4")
+      ?(start_byte=0)
+      ?end_byte
+      ?total_size
+      on_result =
+    let chunk_size = String.length video_content in
+    if chunk_size = 0 then
+      on_result (Error (Error_types.Validation_error [Error_types.Media_required]))
+    else if start_byte < 0 then
+      on_result (Error (Error_types.Internal_error "Invalid upload range: start_byte < 0"))
+    else
+    let resolved_total_size =
+      match total_size with
+      | Some s when s > 0 -> s
+      | _ -> chunk_size
+    in
+    let resolved_end_byte_result =
+      match end_byte with
+      | Some e when e < start_byte -> Error "Invalid upload range: end_byte < start_byte"
+      | Some e -> Ok e
+      | None -> Ok (start_byte + chunk_size - 1)
+    in
+    match resolved_end_byte_result with
+    | Error msg -> on_result (Error (Error_types.Internal_error msg))
+    | Ok resolved_end_byte ->
+        let expected_chunk_size = (resolved_end_byte - start_byte) + 1 in
+        if expected_chunk_size <> chunk_size then
+          on_result (Error (Error_types.Internal_error "Invalid upload range: content length does not match byte range"))
+        else if start_byte >= resolved_total_size || resolved_end_byte >= resolved_total_size then
+          on_result (Error (Error_types.Internal_error "Invalid upload range: byte range exceeds total size"))
+        else
+          let headers = [
+            ("Content-Type", content_type);
+            ("Content-Length", string_of_int chunk_size);
+            ("Content-Range", Printf.sprintf "bytes %d-%d/%d" start_byte resolved_end_byte resolved_total_size);
+          ] in
+
+          Config.Http.put ~headers ~body:video_content upload_url
+            (fun response ->
+              if response.status >= 200 && response.status < 300 then
+                on_result (Ok ())
+              else
+                on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body ~response_headers:response.headers ~required_scopes:["video.upload"] ())))
+            (fun err -> on_result (Error (Error_types.Internal_error err)))
+
+  let upload_video_in_chunks ~upload_url ~video_content ?(content_type="video/mp4") ~chunk_size on_result =
+    let total_size = String.length video_content in
+    let resolved_chunk_size =
+      if chunk_size <= 0 then total_size else chunk_size
+    in
+    if total_size = 0 then
+      on_result (Error (Error_types.Validation_error [Error_types.Media_required]))
+    else
+      let total_chunks = (total_size + resolved_chunk_size - 1) / resolved_chunk_size in
+      let rec loop chunk_index start_byte =
+        if chunk_index >= total_chunks then
           on_result (Ok ())
         else
-          on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
-      (fun err -> on_result (Error (Error_types.Internal_error err)))
+          let remaining = total_size - start_byte in
+          let current_chunk_size = min resolved_chunk_size remaining in
+          let current_end_byte = start_byte + current_chunk_size - 1 in
+          let chunk_data = String.sub video_content start_byte current_chunk_size in
+          upload_video_chunk
+            ~upload_url
+            ~video_content:chunk_data
+            ~content_type
+            ~start_byte
+            ~end_byte:current_end_byte
+            ~total_size
+            (function
+              | Ok () -> loop (chunk_index + 1) (current_end_byte + 1)
+              | Error e -> on_result (Error e))
+      in
+      loop 0 0
   
   (** Check publish status *)
   let check_publish_status ~account_id ~publish_id on_result =
@@ -728,12 +974,59 @@ module Make (Config : CONFIG) = struct
         Config.Http.post ~headers ~body status_fetch_url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              let status = parse_publish_status (Yojson.Basic.from_string response.body) in
-              on_result (Ok status)
+              (try
+                 let status = parse_publish_status (Yojson.Basic.from_string response.body) in
+                 on_result (Ok status)
+               with e ->
+                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse publish status response: %s" (Printexc.to_string e)))))
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body ~response_headers:response.headers ~required_scopes:["video.publish"] ())))
           (fun err -> on_result (Error (Error_types.Internal_error err))))
       (fun err -> on_result (Error err))
+
+  let validate_post_info_against_creator ~post_info ~creator_info =
+    let privacy_allowed =
+      List.exists (fun p -> p = post_info.privacy_level) creator_info.privacy_level_options
+    in
+    if not privacy_allowed then
+      Error (Error_types.Content_policy_violation
+               (Printf.sprintf "Privacy level %s not allowed for this creator"
+                  (string_of_privacy_level post_info.privacy_level)))
+    else if creator_info.comment_disabled && not post_info.disable_comment then
+      Error (Error_types.Content_policy_violation
+               "Comments are disabled for this creator; post must disable comments")
+    else if creator_info.duet_disabled && not post_info.disable_duet then
+      Error (Error_types.Content_policy_violation
+               "Duet is disabled for this creator; post must disable duet")
+    else if creator_info.stitch_disabled && not post_info.disable_stitch then
+      Error (Error_types.Content_policy_violation
+               "Stitch is disabled for this creator; post must disable stitch")
+    else
+      Ok ()
+
+  (** Poll publish status until terminal state or timeout.
+
+      Note: this helper retries immediately without sleeping. Callers that need
+      timed backoff should orchestrate delays externally between attempts.
+  *)
+  let wait_for_publish ~account_id ~publish_id ?(max_attempts=30) ?(on_processing=(fun ~attempt:_ ~max_attempts:_ -> ())) on_result =
+    if max_attempts <= 0 then
+      on_result (Error (Error_types.Internal_error "max_attempts must be > 0"))
+    else
+      let rec loop attempt =
+        check_publish_status ~account_id ~publish_id
+          (function
+            | Error e -> on_result (Error e)
+            | Ok Processing ->
+                on_processing ~attempt ~max_attempts;
+                if attempt >= max_attempts then
+                  on_result (Error (Error_types.Internal_error "Publish status polling timed out"))
+                else
+                  loop (attempt + 1)
+            | Ok (Published _ as status) -> on_result (Ok status)
+            | Ok (Failed _ as status) -> on_result (Ok status))
+      in
+      loop 1
   
   (** Post a video to TikTok (high-level function)
       
@@ -745,17 +1038,19 @@ module Make (Config : CONFIG) = struct
       Note: TikTok video publishing is asynchronous. After this returns,
       you should poll check_publish_status until the video is published.
   *)
-  let post_video ~account_id ~caption ~video_content 
+  let post_video ~account_id ~caption ~video_content
+      ?(content_type="video/mp4")
+      ?(upload_chunk_size_bytes=default_upload_chunk_size_bytes)
       ?(privacy_level=SelfOnly) 
       ?(disable_duet=false) 
       ?(disable_comment=false) 
       ?(disable_stitch=false)
       ?video_cover_timestamp_ms
       on_result =
-    (* Validate caption *)
-    match validate_caption caption with
-    | Error e -> on_result (Error (Error_types.Internal_error e))
-    | Ok () ->
+    let caption_len = String.length caption in
+    if caption_len > max_caption_length then
+      on_result (Error (Error_types.Validation_error [Error_types.Text_too_long { length = caption_len; max = max_caption_length }]))
+    else
         let post_info = make_post_info 
           ~title:caption 
           ~privacy_level 
@@ -766,15 +1061,35 @@ module Make (Config : CONFIG) = struct
           ()
         in
         let video_size = String.length video_content in
-        
-        init_video_upload ~account_id ~post_info ~video_size
-          (function
-            | Ok (publish_id, upload_url) ->
-                upload_video_chunk ~upload_url ~video_content
-                  (function
-                    | Ok () -> on_result (Ok publish_id)
-                    | Error e -> on_result (Error e))
-            | Error e -> on_result (Error e))
+
+        if video_size = 0 then
+          on_result (Error (Error_types.Validation_error [Error_types.Media_required]))
+        else
+          get_creator_info ~account_id
+            (function
+              | Error e -> on_result (Error e)
+              | Ok creator_info ->
+                  (match validate_post_info_against_creator ~post_info ~creator_info with
+                   | Error e -> on_result (Error e)
+                   | Ok () ->
+                       let effective_chunk_size =
+                         let requested = if upload_chunk_size_bytes <= 0 then video_size else upload_chunk_size_bytes in
+                         min requested video_size
+                       in
+                       let total_chunk_count = (video_size + effective_chunk_size - 1) / effective_chunk_size in
+                       init_video_upload
+                         ~account_id
+                         ~post_info
+                         ~video_size
+                         ~chunk_size:effective_chunk_size
+                         ~total_chunk_count
+                         (function
+                           | Ok (publish_id, upload_url) ->
+                               upload_video_in_chunks ~upload_url ~video_content ~content_type ~chunk_size:effective_chunk_size
+                                 (function
+                                   | Ok () -> on_result (Ok publish_id)
+                                   | Error e -> on_result (Error e))
+                           | Error e -> on_result (Error e))))
   
   (** Post a video from URL (downloads and uploads)
       
@@ -794,14 +1109,41 @@ module Make (Config : CONFIG) = struct
       ?(disable_comment=false) 
       ?(disable_stitch=false)
       ?video_cover_timestamp_ms
+      ?(upload_chunk_size_bytes=default_upload_chunk_size_bytes)
       ?(validate_before_upload=false)
       on_result =
+    if not (is_valid_http_url video_url) then
+      on_result (Error (Error_types.Validation_error [Error_types.Invalid_url video_url]))
+    else
     (* Download video *)
     Config.Http.get video_url
       (fun response ->
         if response.status >= 200 && response.status < 300 then
           let video_size = String.length response.body in
-          
+          let content_type =
+            let rec find = function
+              | [] -> "video/mp4"
+              | (k, v) :: rest ->
+                  if String.lowercase_ascii k = "content-type" then v else find rest
+            in
+            find response.headers
+          in
+          let normalized_content_type =
+            content_type
+            |> String.split_on_char ';'
+            |> List.hd
+            |> String.trim
+            |> String.lowercase_ascii
+          in
+          let effective_content_type =
+            if normalized_content_type = "" then "video/mp4" else normalized_content_type
+          in
+          let content_type_error =
+              match effective_content_type with
+              | "video/mp4" | "video/webm" | "video/quicktime" | "video/x-quicktime" | "video/mov" -> None
+              | other -> Some (Error_types.Media_unsupported_format other)
+          in
+
           (* Validate if requested - only size check since we don't parse video *)
           let validation_error =
             if validate_before_upload && video_size > max_video_size_bytes then
@@ -809,6 +1151,8 @@ module Make (Config : CONFIG) = struct
                 size_bytes = video_size; 
                 max_bytes = max_video_size_bytes 
               })
+            else if content_type_error <> None then
+              content_type_error
             else
               None
           in
@@ -818,12 +1162,17 @@ module Make (Config : CONFIG) = struct
               on_result (Error (Error_types.Validation_error [err]))
           | None ->
               post_video ~account_id ~caption ~video_content:response.body
+                ~content_type:effective_content_type
+                ~upload_chunk_size_bytes
                 ~privacy_level ~disable_duet ~disable_comment ~disable_stitch
                 ?video_cover_timestamp_ms
                 on_result)
         else
-          on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to download video (%d)" response.status))))
-      (fun err -> on_result (Error (Error_types.Internal_error err)))
+          if response.status = 404 then
+            on_result (Error (Error_types.Resource_not_found video_url))
+          else
+            on_result (Error (Error_types.Network_error (Error_types.Connection_failed (Printf.sprintf "Failed to download video (%d)" response.status)))))
+      (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
   
   (** Post single video (matches other provider signatures)
       
@@ -838,11 +1187,14 @@ module Make (Config : CONFIG) = struct
     | Ok () ->
         (* Validation ensures media_urls is non-empty *)
         let video_url = List.hd media_urls in
-        post_video_from_url ~account_id ~caption:text ~video_url
-          ~validate_before_upload:validate_media_before_upload
-          (function
-            | Ok publish_id -> on_result (Error_types.Success publish_id)
-            | Error err -> on_result (Error_types.Failure err))
+        if not (is_valid_http_url video_url) then
+          on_result (Error_types.Failure (Error_types.Validation_error [Error_types.Invalid_url video_url]))
+        else
+          post_video_from_url ~account_id ~caption:text ~video_url
+            ~validate_before_upload:validate_media_before_upload
+            (function
+              | Ok publish_id -> on_result (Error_types.Success publish_id)
+              | Error err -> on_result (Error_types.Failure err))
   
   (** Post thread (TikTok doesn't support threads, posts videos separately) *)
   let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_result =
@@ -851,6 +1203,19 @@ module Make (Config : CONFIG) = struct
     match validate_thread ~texts ~media_counts () with
     | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
     | Ok () ->
+        let url_validation_errors = ref [] in
+        List.iteri (fun i urls ->
+          match urls with
+          | first_url :: _ when not (is_valid_http_url first_url) ->
+              url_validation_errors := Error_types.Thread_post_invalid {
+                index = i;
+                errors = [Error_types.Invalid_url first_url]
+              } :: !url_validation_errors
+          | _ -> ()
+        ) media_urls_per_post;
+        if !url_validation_errors <> [] then
+          on_result (Error_types.Failure (Error_types.Validation_error (List.rev !url_validation_errors)))
+        else
         let total_requested = List.length texts in
         (* Validation ensures each post has at least one video URL *)
         let rec post_all acc post_index texts media =
@@ -885,7 +1250,7 @@ module Make (Config : CONFIG) = struct
         post_all [] 0 texts media_urls_per_post
   
   (** Exchange authorization code for access token *)
-  let exchange_code ~code ~redirect_uri on_result =
+  let exchange_code ?code_verifier ~code ~redirect_uri on_result =
     let client_key = Config.get_env "TIKTOK_CLIENT_KEY" |> Option.value ~default:"" in
     let client_secret = Config.get_env "TIKTOK_CLIENT_SECRET" |> Option.value ~default:"" in
     
@@ -895,13 +1260,19 @@ module Make (Config : CONFIG) = struct
       let headers = [
         ("Content-Type", "application/x-www-form-urlencoded");
       ] in
-      let body = Uri.encoded_of_query [
+      let base_query = [
         ("client_key", [client_key]);
         ("client_secret", [client_secret]);
         ("code", [code]);
         ("grant_type", ["authorization_code"]);
         ("redirect_uri", [redirect_uri]);
       ] in
+      let full_query =
+        match code_verifier with
+        | Some cv when cv <> "" -> base_query @ [ ("code_verifier", [cv]) ]
+        | _ -> base_query
+      in
+      let body = Uri.encoded_of_query full_query in
       
       Config.Http.post ~headers ~body token_url
         (fun response ->
@@ -910,8 +1281,14 @@ module Make (Config : CONFIG) = struct
               let json = Yojson.Basic.from_string response.body in
               let open Yojson.Basic.Util in
               let access_token = json |> member "access_token" |> to_string in
-              let refresh_token = json |> member "refresh_token" |> to_string in
-              let expires_in = json |> member "expires_in" |> to_int in
+              let refresh_token =
+                try Some (json |> member "refresh_token" |> to_string)
+                with _ -> None
+              in
+              let expires_in =
+                try json |> member "expires_in" |> to_int
+                with _ -> 86400
+              in
               let expires_at = 
                 let now = Ptime_clock.now () in
                 match Ptime.add_span now (Ptime.Span.of_int_s expires_in) with
@@ -920,7 +1297,7 @@ module Make (Config : CONFIG) = struct
               in
               let credentials = {
                 access_token;
-                refresh_token = Some refresh_token;
+                refresh_token;
                 expires_at = Some expires_at;
                 token_type = "Bearer";
               } in
@@ -928,19 +1305,30 @@ module Make (Config : CONFIG) = struct
             with e ->
               on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse token response: %s" (Printexc.to_string e))))
           else
-            on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+            on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body ~response_headers:response.headers ~required_scopes:["user.info.basic"; "video.publish"] ())))
         (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** Get OAuth URL *)
-  let get_oauth_url ~redirect_uri ~state ~code_verifier:_ on_result =
+  let get_oauth_url ~redirect_uri ~state ~code_verifier on_result =
     let client_key = Config.get_env "TIKTOK_CLIENT_KEY" |> Option.value ~default:"" in
-    let url = get_authorization_url
-      ~client_id:client_key
-      ~redirect_uri
-      ~scope:"user.info.basic,video.publish"
-      ~state
-    in
-    on_result (Ok url)
+    if client_key = "" then
+      on_result (Error (Error_types.Internal_error "TikTok OAuth client key not configured"))
+    else
+      let url = get_authorization_url
+        ~client_id:client_key
+        ~redirect_uri
+        ~scope:"user.info.basic,video.publish"
+        ~state
+      in
+      if code_verifier = "" then
+        on_result (Ok url)
+      else
+        let uri = Uri.of_string url in
+        let query = Uri.query uri @ [
+          ("code_challenge", [code_verifier]);
+          ("code_challenge_method", ["plain"]);
+        ] in
+        on_result (Ok (Uri.with_query uri query |> Uri.to_string))
   
   (** Validate content *)
   let validate_content ~text =

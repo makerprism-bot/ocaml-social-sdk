@@ -220,6 +220,22 @@ let generate_expected_code_challenge verifier =
   let raw_hash = Digestif.SHA256.to_raw_string hash in
   Base64.encode_exn ~pad:false ~alphabet:Base64.uri_safe_alphabet raw_hash
 
+let rfc3339_in_seconds seconds =
+  let now = Ptime_clock.now () in
+  let target =
+    match Ptime.add_span now (Ptime.Span.of_int_s seconds) with
+    | Some t -> t
+    | None -> now
+  in
+  Ptime.to_rfc3339 target
+
+let get_scope_set_from_url url =
+  let uri = Uri.of_string url in
+  let scope_value = Uri.get_query_param uri "scope" |> Option.value ~default:"" in
+  scope_value
+  |> String.split_on_char ' '
+  |> List.filter (fun s -> String.length s > 0)
+
 (** Test: OAuth URL uses S256 code_challenge_method (NOT plain) *)
 let test_oauth_url_pkce () =
   let code_verifier = "test_verifier_abcdefghijklmnopqrstuvwxyz123456789012345678901234567890" in
@@ -242,14 +258,43 @@ let test_oauth_url_pkce () =
 (** Test: OAuth URL contains required scopes *)
 let test_oauth_scopes () =
   let url = Twitter.get_oauth_url ~state:"test_state" ~code_verifier:"test_verifier" in
-  
-  (* Twitter requires specific scopes *)
-  let url_lower = String.lowercase_ascii url in
-  let has_tweet_read = String.contains url_lower 't' in
-  let has_users = String.contains url_lower 'u' in
-  let has_offline = String.contains url_lower 'o' in
-  
-  assert (has_tweet_read && has_users && has_offline);
+
+  let scopes = get_scope_set_from_url url in
+  assert (List.mem "tweet.read" scopes);
+  assert (List.mem "tweet.write" scopes);
+  assert (List.mem "users.read" scopes);
+  assert (List.mem "offline.access" scopes);
+  assert (List.mem "media.write" scopes);
+
+  let post_video_scopes =
+    Social_twitter_v2.OAuth.Scopes.for_operations [Social_twitter_v2.OAuth.Scopes.Post_video]
+  in
+  assert (List.mem "media.write" post_video_scopes);
+
+  let post_media_scopes =
+    Social_twitter_v2.OAuth.Scopes.for_operations [Social_twitter_v2.OAuth.Scopes.Post_media]
+  in
+  assert (List.mem "media.write" post_media_scopes);
+
+  let post_text_scopes =
+    Social_twitter_v2.OAuth.Scopes.for_operations [Social_twitter_v2.OAuth.Scopes.Post_text]
+  in
+  assert (List.mem "tweet.write" post_text_scopes);
+  assert (not (List.mem "media.write" post_text_scopes));
+
+  let delete_post_scopes =
+    Social_twitter_v2.OAuth.Scopes.for_operations [Social_twitter_v2.OAuth.Scopes.Delete_post]
+  in
+  assert (List.mem "tweet.write" delete_post_scopes);
+  assert (not (List.mem "media.write" delete_post_scopes));
+
+  let read_only_scopes =
+    Social_twitter_v2.OAuth.Scopes.for_operations [Social_twitter_v2.OAuth.Scopes.Read_profile]
+  in
+  assert (List.mem "tweet.read" read_only_scopes);
+  assert (List.mem "users.read" read_only_scopes);
+  assert (not (List.mem "tweet.write" read_only_scopes));
+  assert (not (List.mem "media.write" read_only_scopes));
   
   print_endline "✓ OAuth scopes test passed"
 
@@ -265,6 +310,11 @@ let test_oauth_state () =
   assert (url1 <> url2);
   
   print_endline "✓ OAuth state parameter test passed"
+
+let test_oauth_state_verification_helper () =
+  assert (Twitter.verify_oauth_state ~expected_state:"state_abc_123" ~returned_state:"state_abc_123");
+  assert (not (Twitter.verify_oauth_state ~expected_state:"state_abc_123" ~returned_state:"state_other"));
+  print_endline "✓ OAuth state verification helper test passed"
 
 (** Test: Token exchange with refresh token *)
 let test_token_exchange_with_refresh () =
@@ -373,6 +423,1611 @@ let test_oauth_error_handling () =
   (* In our mock, this might succeed, but in real usage would fail *)
   
   print_endline "✓ OAuth error handling test executed"
+
+let test_token_refresh_buffer_boundary () =
+  assert (Twitter.is_token_expired_buffer ~buffer_seconds:1800 (Some (rfc3339_in_seconds 1900)) = false);
+  assert (Twitter.is_token_expired_buffer ~buffer_seconds:1800 (Some (rfc3339_in_seconds 1700)) = true);
+  assert (Twitter.is_token_expired_buffer ~buffer_seconds:1800 (Some (rfc3339_in_seconds 1800)) = true);
+  print_endline "✓ Token refresh buffer boundary test passed"
+
+let refresh_success_statuses = ref []
+let refresh_success_refresh_calls = ref 0
+
+module Mock_http_refresh_success : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ _url on_success _on_error =
+    on_success {
+      Social_core.status = 200;
+      headers = [("content-type", "application/json")];
+      body = {|{"data":{"id":"12345","text":"ok"}}|};
+    }
+
+  let post ?headers:_ ?body:_ url on_success _on_error =
+    if String.ends_with ~suffix:"/oauth2/token" url then begin
+      incr refresh_success_refresh_calls;
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"access_token":"refreshed_token","refresh_token":"refreshed_refresh","expires_in":7200,"token_type":"Bearer"}|};
+      }
+    end else
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"ok"}}|};
+      }
+
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = {|{"data":{"id":"media"}}|} }
+
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = {|{"data":{}}|} }
+
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = {|{"data":{"deleted":true}}|} }
+end
+
+module Mock_config_refresh_success = struct
+  module Http = Mock_http_refresh_success
+  let get_env = function
+    | "TWITTER_CLIENT_ID" -> Some "test_client_id"
+    | "TWITTER_CLIENT_SECRET" -> Some "test_client_secret"
+    | _ -> None
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "expired_access";
+      refresh_token = Some "good_refresh";
+      expires_at = Some (rfc3339_in_seconds 10);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status ~error_message:_ on_success _on_error =
+    refresh_success_statuses := status :: !refresh_success_statuses;
+    on_success ()
+end
+
+module Twitter_refresh_success = Social_twitter_v2.Make(Mock_config_refresh_success)
+
+let test_health_status_refresh_success () =
+  refresh_success_statuses := [];
+  refresh_success_refresh_calls := 0;
+  let result = ref None in
+  Twitter_refresh_success.get_tweet ~account_id:"test_account" ~tweet_id:"123" ()
+    (function
+      | Ok _ -> result := Some (Ok ())
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok ()) -> ()
+   | Some (Error err) -> failwith ("Expected successful refresh path: " ^ err)
+   | None -> failwith "No result in refresh success test");
+
+  assert (!refresh_success_refresh_calls = 1);
+  assert (List.mem "healthy" !refresh_success_statuses);
+  print_endline "✓ Health status refresh-success test passed"
+
+let refresh_missing_statuses = ref []
+
+module Mock_http_refresh_missing : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = {|{"data":{"id":"x"}}|} }
+  let post ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 500; headers = []; body = "{}" }
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_refresh_missing = struct
+  module Http = Mock_http_refresh_missing
+  let get_env _ = Some "value"
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "expired_access";
+      refresh_token = None;
+      expires_at = Some (rfc3339_in_seconds 10);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status ~error_message:_ on_success _on_error =
+    refresh_missing_statuses := status :: !refresh_missing_statuses;
+    on_success ()
+end
+
+module Twitter_refresh_missing = Social_twitter_v2.Make(Mock_config_refresh_missing)
+
+let test_health_status_missing_refresh_token () =
+  refresh_missing_statuses := [];
+  let result = ref None in
+  Twitter_refresh_missing.get_tweet ~account_id:"test_account" ~tweet_id:"123" ()
+    (function
+      | Ok _ -> result := Some (Ok ())
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Error _err) -> ()
+   | Some (Ok ()) -> failwith "Expected missing-refresh-token path to fail"
+   | None -> failwith "No result in missing-refresh-token test");
+
+  assert (List.mem "token_expired" !refresh_missing_statuses);
+  print_endline "✓ Health status missing-refresh-token test passed"
+
+let refresh_failed_statuses = ref []
+
+module Mock_http_refresh_failed : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = {|{"data":{"id":"x"}}|} }
+  let post ?headers:_ ?body:_ url on_success _on_error =
+    if String.ends_with ~suffix:"/oauth2/token" url then
+      on_success { Social_core.status = 401; headers = []; body = {|{"detail":"invalid refresh token"}|} }
+    else
+      on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_refresh_failed = struct
+  module Http = Mock_http_refresh_failed
+  let get_env = function
+    | "TWITTER_CLIENT_ID" -> Some "test_client_id"
+    | "TWITTER_CLIENT_SECRET" -> Some "test_client_secret"
+    | _ -> None
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "expired_access";
+      refresh_token = Some "bad_refresh";
+      expires_at = Some (rfc3339_in_seconds 10);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status ~error_message:_ on_success _on_error =
+    refresh_failed_statuses := status :: !refresh_failed_statuses;
+    on_success ()
+end
+
+module Twitter_refresh_failed = Social_twitter_v2.Make(Mock_config_refresh_failed)
+
+let test_health_status_refresh_failed () =
+  refresh_failed_statuses := [];
+  let result = ref None in
+  Twitter_refresh_failed.get_tweet ~account_id:"test_account" ~tweet_id:"123" ()
+    (function
+      | Ok _ -> result := Some (Ok ())
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Error _err) -> ()
+   | Some (Ok ()) -> failwith "Expected refresh-failed path to fail"
+   | None -> failwith "No result in refresh-failed test");
+
+  assert (List.mem "refresh_failed" !refresh_failed_statuses);
+  print_endline "✓ Health status refresh-failed test passed"
+
+let refresh_preserve_updated_refresh = ref None
+
+module Mock_http_refresh_preserve : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = {|{"data":{"id":"x"}}|} }
+  let post ?headers:_ ?body:_ url on_success _on_error =
+    if String.ends_with ~suffix:"/oauth2/token" url then
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"access_token":"new_access_only","expires_in":7200,"token_type":"Bearer"}|};
+      }
+    else
+      on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_refresh_preserve = struct
+  module Http = Mock_http_refresh_preserve
+  let get_env = function
+    | "TWITTER_CLIENT_ID" -> Some "test_client_id"
+    | "TWITTER_CLIENT_SECRET" -> Some "test_client_secret"
+    | _ -> None
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "expired_access";
+      refresh_token = Some "old_refresh_token";
+      expires_at = Some (rfc3339_in_seconds 5);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials on_success _on_error =
+    refresh_preserve_updated_refresh := credentials.Social_core.refresh_token;
+    on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_refresh_preserve = Social_twitter_v2.Make(Mock_config_refresh_preserve)
+
+let test_refresh_response_without_refresh_token_preserves_old_token () =
+  refresh_preserve_updated_refresh := None;
+  let result = ref None in
+  Twitter_refresh_preserve.get_tweet ~account_id:"test_account" ~tweet_id:"123" ()
+    (function
+      | Ok _ -> result := Some (Ok ())
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok ()) -> ()
+   | Some (Error err) -> failwith ("Expected refresh-preserve path to succeed: " ^ err)
+   | None -> failwith "No result in refresh-preserve test");
+
+  assert (!refresh_preserve_updated_refresh = Some "old_refresh_token");
+  print_endline "✓ Refresh response without refresh token preserves existing token test passed"
+
+let no_refresh_token_calls = ref 0
+
+module Mock_http_no_refresh : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = {|{"data":{"id":"x"}}|} }
+  let post ?headers:_ ?body:_ url on_success _on_error =
+    if String.ends_with ~suffix:"/oauth2/token" url then incr no_refresh_token_calls;
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_no_refresh = struct
+  module Http = Mock_http_no_refresh
+  let get_env _ = Some "value"
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "still_valid_access";
+      refresh_token = Some "refresh_token";
+      expires_at = Some (rfc3339_in_seconds 4000);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_no_refresh = Social_twitter_v2.Make(Mock_config_no_refresh)
+
+let test_valid_token_skips_refresh_call () =
+  no_refresh_token_calls := 0;
+  let result = ref None in
+  Twitter_no_refresh.get_tweet ~account_id:"test_account" ~tweet_id:"123" ()
+    (function
+      | Ok _ -> result := Some (Ok ())
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok ()) -> ()
+   | Some (Error err) -> failwith ("Expected valid-token path to succeed: " ^ err)
+   | None -> failwith "No result in valid-token refresh-skip test");
+
+  assert (!no_refresh_token_calls = 0);
+  print_endline "✓ Valid token skips refresh endpoint call test passed"
+
+let missing_client_refresh_calls = ref 0
+let missing_client_statuses = ref []
+
+module Mock_http_missing_client : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = {|{"data":{"id":"x"}}|} }
+  let post ?headers:_ ?body:_ url on_success _on_error =
+    if String.ends_with ~suffix:"/oauth2/token" url then incr missing_client_refresh_calls;
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_missing_client = struct
+  module Http = Mock_http_missing_client
+  let get_env _ = None
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "expired_access";
+      refresh_token = Some "refresh_token";
+      expires_at = Some (rfc3339_in_seconds 5);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status ~error_message:_ on_success _on_error =
+    missing_client_statuses := status :: !missing_client_statuses;
+    on_success ()
+end
+
+module Twitter_missing_client = Social_twitter_v2.Make(Mock_config_missing_client)
+
+let test_missing_client_credentials_fails_before_refresh_call () =
+  missing_client_refresh_calls := 0;
+  missing_client_statuses := [];
+  let result = ref None in
+  Twitter_missing_client.get_tweet ~account_id:"test_account" ~tweet_id:"123" ()
+    (function
+      | Ok _ -> result := Some (Ok ())
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Error err) -> assert (string_contains (String.lowercase_ascii err) "refresh")
+   | Some (Ok ()) -> failwith "Expected missing-client-credentials path to fail"
+   | None -> failwith "No result in missing-client-credentials test");
+
+  assert (!missing_client_refresh_calls = 0);
+  assert (List.mem "refresh_failed" !missing_client_statuses);
+  print_endline "✓ Missing client credentials fail before refresh endpoint call test passed"
+
+module Mock_http_mixed_payload : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ url on_success _on_error =
+    if string_contains url "/tweets/" then
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{
+          "data": {"id": "tweet_mixed_1", "text": "hello"},
+          "errors": [{"title": "Partial Error", "detail": "Some expansions unavailable"}],
+          "meta": {"result_count": 1}
+        }|};
+      }
+    else
+      on_success { Social_core.status = 200; headers = []; body = {|{"data":{}}|} }
+
+  let post ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_mixed_payload = struct
+  module Http = Mock_http_mixed_payload
+  let get_env _ = Some "value"
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "valid_access";
+      refresh_token = Some "refresh";
+      expires_at = Some (rfc3339_in_seconds 4000);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_mixed_payload = Social_twitter_v2.Make(Mock_config_mixed_payload)
+
+let test_mixed_payload_data_and_errors_preserved () =
+  let result = ref None in
+  Twitter_mixed_payload.get_tweet ~account_id:"test_account" ~tweet_id:"tweet_mixed_1" ()
+    (function
+      | Ok json -> result := Some (Ok json)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok json) ->
+       let open Yojson.Basic.Util in
+       let data_id = json |> member "data" |> member "id" |> to_string in
+       let err_title = json |> member "errors" |> index 0 |> member "title" |> to_string in
+       assert (data_id = "tweet_mixed_1");
+       assert (err_title = "Partial Error")
+   | Some (Error err) -> failwith ("Mixed payload test failed: " ^ err)
+   | None -> failwith "No result in mixed payload test");
+
+  print_endline "✓ Mixed payload data+errors preservation test passed"
+
+let test_parse_api_error_preserves_details () =
+  let err =
+    Twitter.parse_api_error
+      ~status_code:429
+      ~body:{|{"title":"Too Many Requests","detail":"Rate limit hit"}|}
+      ~headers:[]
+  in
+  let msg = Error_types.error_to_string err in
+  assert (string_contains (String.lowercase_ascii msg) "rate");
+  print_endline "✓ API error parsing preserves detail test passed"
+
+let test_parse_api_error_401_maps_token_invalid () =
+  let err = Twitter.parse_api_error ~status_code:401 ~body:{|{"detail":"unauthorized"}|} ~headers:[] in
+  (match err with
+   | Error_types.Auth_error Error_types.Token_invalid -> ()
+   | _ -> failwith "Expected 401 to map to Auth_error Token_invalid");
+  print_endline "✓ API error 401 mapping test passed"
+
+let test_parse_api_error_403_forbidden_maps_insufficient_permissions () =
+  let err =
+    Twitter.parse_api_error
+      ~status_code:403
+      ~body:{|{"detail":"Forbidden: write access required"}|}
+      ~headers:[]
+  in
+  (match err with
+   | Error_types.Auth_error (Error_types.Insufficient_permissions perms) ->
+       assert (List.mem "tweet.write" perms)
+   | _ -> failwith "Expected forbidden 403 to map to Insufficient_permissions");
+  print_endline "✓ API error 403 forbidden mapping test passed"
+
+let test_parse_api_error_403_nonforbidden_maps_api_error () =
+  let err =
+    Twitter.parse_api_error
+      ~status_code:403
+      ~body:{|{"detail":"Account locked due to policy"}|}
+      ~headers:[]
+  in
+  (match err with
+   | Error_types.Api_error api ->
+       assert (api.status_code = 403);
+       assert (string_contains (String.lowercase_ascii api.message) "account locked")
+   | _ -> failwith "Expected non-forbidden 403 to map to Api_error");
+  print_endline "✓ API error 403 non-forbidden mapping test passed"
+
+let test_parse_api_error_429_maps_rate_limited () =
+  let err = Twitter.parse_api_error ~status_code:429 ~body:{|{"detail":"too many requests"}|} ~headers:[] in
+  (match err with
+   | Error_types.Rate_limited _ -> ()
+   | _ -> failwith "Expected 429 to map to Rate_limited");
+  print_endline "✓ API error 429 mapping test passed"
+
+let test_parse_api_error_429_uses_reset_header_retry_after () =
+  let now = int_of_float (Unix.time ()) in
+  let reset = string_of_int (now + 120) in
+  let err =
+    Twitter.parse_api_error
+      ~status_code:429
+      ~body:{|{"detail":"too many requests"}|}
+      ~headers:[("x-rate-limit-reset", reset)]
+  in
+  (match err with
+   | Error_types.Rate_limited info ->
+       (match info.retry_after_seconds with
+        | Some secs -> assert (secs >= 100 && secs <= 130)
+        | None -> failwith "Expected retry_after_seconds from reset header")
+   | _ -> failwith "Expected 429 to map to Rate_limited with retry_after_seconds");
+  print_endline "✓ API error 429 reset-header retry_after test passed"
+
+let test_parse_api_error_500_prefers_detail_then_errors_then_default () =
+  let err_detail =
+    Twitter.parse_api_error
+      ~status_code:500
+      ~body:{|{"detail":"backend outage"}|}
+      ~headers:[]
+  in
+  (match err_detail with
+   | Error_types.Api_error api -> assert (api.message = "backend outage")
+   | _ -> failwith "Expected 500 detail case to map to Api_error");
+
+  let err_errors =
+    Twitter.parse_api_error
+      ~status_code:500
+      ~body:{|{"errors":[{"message":"first error message"}]}|}
+      ~headers:[]
+  in
+  (match err_errors with
+   | Error_types.Api_error api -> assert (api.message = "first error message")
+   | _ -> failwith "Expected 500 errors case to map to Api_error");
+
+  let err_default = Twitter.parse_api_error ~status_code:500 ~body:"not-json" ~headers:[] in
+  (match err_default with
+   | Error_types.Api_error api -> assert (api.message = "API error")
+   | _ -> failwith "Expected 500 invalid-json case to map to Api_error default message");
+
+  print_endline "✓ API error 500 mapping fallback order test passed"
+
+let test_parse_api_error_400_duplicate_maps_duplicate_content () =
+  let err =
+    Twitter.parse_api_error
+      ~status_code:400
+      ~body:{|{"detail":"Status is a duplicate."}|}
+      ~headers:[]
+  in
+  (match err with
+   | Error_types.Duplicate_content -> ()
+   | _ -> failwith "Expected duplicate message to map to Duplicate_content");
+  print_endline "✓ API error 400 duplicate mapping test passed"
+
+let test_parse_api_error_400_invalid_media_maps_api_error () =
+  let err =
+    Twitter.parse_api_error
+      ~status_code:400
+      ~body:{|{"detail":"Invalid media ID"}|}
+      ~headers:[]
+  in
+  (match err with
+   | Error_types.Api_error api ->
+       assert (api.status_code = 400);
+       assert (string_contains (String.lowercase_ascii api.message) "invalid media")
+   | _ -> failwith "Expected invalid media message to map to Api_error");
+  print_endline "✓ API error 400 invalid-media mapping test passed"
+
+let oauth_contract_last_url = ref ""
+let oauth_contract_last_headers = ref []
+let oauth_contract_last_body = ref ""
+let oauth_contract_status = ref 200
+let oauth_contract_body = ref {|{"access_token":"token","refresh_token":"refresh","expires_in":7200,"token_type":"Bearer"}|}
+
+module Mock_http_oauth_contract : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+
+  let post ?headers ?body url on_success _on_error =
+    oauth_contract_last_url := url;
+    oauth_contract_last_headers := Option.value ~default:[] headers;
+    oauth_contract_last_body := Option.value ~default:"" body;
+    on_success {
+      Social_core.status = !oauth_contract_status;
+      headers = [("content-type", "application/json")];
+      body = !oauth_contract_body;
+    }
+
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module OAuth_contract_client = Social_twitter_v2.OAuth.Make(Mock_http_oauth_contract)
+
+let test_oauth_exchange_code_request_contract () =
+  oauth_contract_last_url := "";
+  oauth_contract_last_headers := [];
+  oauth_contract_last_body := "";
+  oauth_contract_status := 200;
+  oauth_contract_body := {|{"access_token":"token_a","refresh_token":"refresh_a","expires_in":7200,"token_type":"Bearer"}|};
+
+  let result = ref None in
+  OAuth_contract_client.exchange_code
+    ~client_id:"cid_123"
+    ~client_secret:"csecret_456"
+    ~redirect_uri:"https://example.com/callback"
+    ~code:"auth_code_1"
+    ~code_verifier:"verifier_1"
+    (fun _ -> result := Some (Ok ()))
+    (fun err -> result := Some (Error err));
+
+  (match !result with
+   | Some (Ok ()) -> ()
+   | Some (Error err) -> failwith ("OAuth exchange contract test failed: " ^ err)
+   | None -> failwith "No result in OAuth exchange contract test");
+
+  assert (!oauth_contract_last_url = Social_twitter_v2.OAuth.Metadata.token_endpoint);
+  let body_q = Uri.query_of_encoded !oauth_contract_last_body in
+  let get1 key =
+    match List.assoc_opt key body_q with
+    | Some (v :: _) -> v
+    | _ -> ""
+  in
+  assert (get1 "grant_type" = "authorization_code");
+  assert (get1 "code" = "auth_code_1");
+  assert (get1 "redirect_uri" = "https://example.com/callback");
+  assert (get1 "code_verifier" = "verifier_1");
+  let expected_basic = "Basic " ^ Base64.encode_exn ("cid_123:csecret_456") in
+  let auth_header = List.assoc_opt "Authorization" !oauth_contract_last_headers |> Option.value ~default:"" in
+  let ctype_header = List.assoc_opt "Content-Type" !oauth_contract_last_headers |> Option.value ~default:"" in
+  assert (auth_header = expected_basic);
+  assert (ctype_header = "application/x-www-form-urlencoded");
+  print_endline "✓ OAuth exchange request contract test passed"
+
+let test_oauth_refresh_request_contract () =
+  oauth_contract_last_url := "";
+  oauth_contract_last_headers := [];
+  oauth_contract_last_body := "";
+  oauth_contract_status := 200;
+  oauth_contract_body := {|{"access_token":"token_b","refresh_token":"refresh_b","expires_in":7200,"token_type":"Bearer"}|};
+
+  let result = ref None in
+  OAuth_contract_client.refresh_token
+    ~client_id:"cid_123"
+    ~client_secret:"csecret_456"
+    ~refresh_token:"refresh_old"
+    (fun _ -> result := Some (Ok ()))
+    (fun err -> result := Some (Error err));
+
+  (match !result with
+   | Some (Ok ()) -> ()
+   | Some (Error err) -> failwith ("OAuth refresh contract test failed: " ^ err)
+   | None -> failwith "No result in OAuth refresh contract test");
+
+  let body_q = Uri.query_of_encoded !oauth_contract_last_body in
+  let get1 key =
+    match List.assoc_opt key body_q with
+    | Some (v :: _) -> v
+    | _ -> ""
+  in
+  assert (get1 "grant_type" = "refresh_token");
+  assert (get1 "refresh_token" = "refresh_old");
+  assert (get1 "client_id" = "cid_123");
+  print_endline "✓ OAuth refresh request contract test passed"
+
+let test_oauth_exchange_code_deterministic_failure () =
+  oauth_contract_status := 400;
+  oauth_contract_body := {|{"error":"invalid_grant"}|};
+  let result = ref None in
+  OAuth_contract_client.exchange_code
+    ~client_id:"cid_123"
+    ~client_secret:"csecret_456"
+    ~redirect_uri:"https://example.com/callback"
+    ~code:"bad_code"
+    ~code_verifier:"verifier_1"
+    (fun _ -> result := Some (Ok ()))
+    (fun err -> result := Some (Error err));
+
+  (match !result with
+   | Some (Error err) -> assert (string_contains err "Token exchange failed (400)")
+   | Some (Ok ()) -> failwith "Expected deterministic OAuth exchange failure"
+   | None -> failwith "No result in OAuth failure test");
+  print_endline "✓ OAuth exchange deterministic failure test passed"
+
+let test_oauth_redaction_helper () =
+  let sample =
+    {|{"access_token":"abc123","refresh_token":"ref456","note":"ok"} Authorization: Bearer tok_xyz Basic QWxhZGRpbjpPcGVuU2VzYW1l|}
+  in
+  let redacted = Social_twitter_v2.OAuth.redact_sensitive_text sample in
+  assert (not (string_contains redacted "abc123"));
+  assert (not (string_contains redacted "ref456"));
+  assert (not (string_contains redacted "tok_xyz"));
+  assert (string_contains redacted "[REDACTED]");
+  print_endline "✓ OAuth redaction helper test passed"
+
+let test_oauth_exchange_failure_redacts_sensitive_response () =
+  oauth_contract_status := 400;
+  oauth_contract_body := {|{"error":"invalid_grant","access_token":"leak_a","refresh_token":"leak_r"}|};
+  let result = ref None in
+  OAuth_contract_client.exchange_code
+    ~client_id:"cid_123"
+    ~client_secret:"csecret_456"
+    ~redirect_uri:"https://example.com/callback"
+    ~code:"bad_code"
+    ~code_verifier:"verifier_1"
+    (fun _ -> result := Some (Ok ()))
+    (fun err -> result := Some (Error err));
+
+  (match !result with
+   | Some (Error err) ->
+       assert (not (string_contains err "leak_a"));
+       assert (not (string_contains err "leak_r"));
+       assert (string_contains err "[REDACTED]")
+   | Some (Ok ()) -> failwith "Expected OAuth exchange failure for redaction test"
+   | None -> failwith "No result in OAuth exchange redaction test");
+  print_endline "✓ OAuth exchange failure redaction test passed"
+
+let last_reply_quote_body = ref None
+
+module Mock_http_reply_quote_contract : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ _url on_success _on_error =
+    on_success {
+      Social_core.status = 200;
+      headers = [("content-type", "application/json")];
+      body = {|{"data":{"id":"media_unused"}}|};
+    }
+
+  let post ?headers:_ ?body url on_success _on_error =
+    if string_contains url "/tweets" then
+      last_reply_quote_body := body;
+    on_success {
+      Social_core.status = 200;
+      headers = [("content-type", "application/json")];
+      body = {|{"data":{"id":"tweet_contract_ok"}}|};
+    }
+
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_reply_quote_contract = struct
+  module Http = Mock_http_reply_quote_contract
+  let get_env = function
+    | "TWITTER_CLIENT_ID" -> Some "test_client_id"
+    | "TWITTER_CLIENT_SECRET" -> Some "test_client_secret"
+    | "TWITTER_LINK_REDIRECT_URI" -> Some "http://localhost/callback"
+    | _ -> None
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "test_access_token";
+      refresh_token = Some "test_refresh_token";
+      expires_at = Some (rfc3339_in_seconds 4000);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_reply_quote_contract = Social_twitter_v2.Make(Mock_config_reply_quote_contract)
+
+let test_reply_payload_contract () =
+  last_reply_quote_body := None;
+  let result = ref None in
+  Twitter_reply_quote_contract.reply_to_tweet
+    ~account_id:"test_account"
+    ~text:"reply text"
+    ~reply_to_tweet_id:"tweet_parent_1"
+    ~media_urls:[]
+    (fun _tweet_id -> result := Some (Ok ()))
+    (fun err -> result := Some (Error err));
+
+  (match !result with
+   | Some (Ok ()) -> ()
+   | Some (Error err) -> failwith ("Reply contract test failed: " ^ err)
+   | None -> failwith "No result in reply contract test");
+
+  (match !last_reply_quote_body with
+   | Some body ->
+       let open Yojson.Basic.Util in
+       let json = Yojson.Basic.from_string body in
+       assert ((json |> member "text" |> to_string) = "reply text");
+       assert ((json |> member "reply" |> member "in_reply_to_tweet_id" |> to_string) = "tweet_parent_1")
+   | None -> failwith "Missing reply request body");
+  print_endline "✓ Reply payload contract test passed"
+
+let test_quote_payload_contract () =
+  last_reply_quote_body := None;
+  let result = ref None in
+  Twitter_reply_quote_contract.quote_tweet
+    ~account_id:"test_account"
+    ~text:"quote text"
+    ~quoted_tweet_id:"tweet_quote_1"
+    ~media_urls:[]
+    (fun _tweet_id -> result := Some (Ok ()))
+    (fun err -> result := Some (Error err));
+
+  (match !result with
+   | Some (Ok ()) -> ()
+   | Some (Error err) -> failwith ("Quote contract test failed: " ^ err)
+   | None -> failwith "No result in quote contract test");
+
+  (match !last_reply_quote_body with
+   | Some body ->
+       let open Yojson.Basic.Util in
+       let json = Yojson.Basic.from_string body in
+       assert ((json |> member "text" |> to_string) = "quote text");
+       assert ((json |> member "quote_tweet_id" |> to_string) = "tweet_quote_1")
+   | None -> failwith "Missing quote request body");
+  print_endline "✓ Quote payload contract test passed"
+
+let captured_get_urls = ref []
+let captured_get_headers = ref []
+let captured_post_bodies = ref []
+
+module Mock_http_request_contract : Social_core.HTTP_CLIENT = struct
+  let get ?headers url on_success _on_error =
+    captured_get_headers := Option.value ~default:[] headers;
+    captured_get_urls := !captured_get_urls @ [url];
+    on_success {
+      Social_core.status = 200;
+      headers = [("content-type", "application/json")];
+      body = {|{"data":{"id":"req_contract_1","text":"ok"},"meta":{"result_count":1}}|};
+    }
+
+  let post ?headers:_ ?body url on_success _on_error =
+    (if string_contains url "/tweets" then
+       captured_post_bodies := !captured_post_bodies @ [Option.value ~default:"{}" body]);
+    on_success {
+      Social_core.status = 200;
+      headers = [("content-type", "application/json")];
+      body = {|{"data":{"id":"req_contract_tweet_1"}}|};
+    }
+
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_request_contract = struct
+  module Http = Mock_http_request_contract
+  let get_env = function
+    | "TWITTER_CLIENT_ID" -> Some "test_client_id"
+    | "TWITTER_CLIENT_SECRET" -> Some "test_client_secret"
+    | "TWITTER_LINK_REDIRECT_URI" -> Some "http://localhost/callback"
+    | _ -> None
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "test_access_token";
+      refresh_token = Some "test_refresh_token";
+      expires_at = Some (rfc3339_in_seconds 4000);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_request_contract = Social_twitter_v2.Make(Mock_config_request_contract)
+
+let test_get_tweet_query_contract () =
+  captured_get_urls := [];
+  let result = ref None in
+  Twitter_request_contract.get_tweet
+    ~account_id:"test_account"
+    ~tweet_id:"12345"
+    ~expansions:["author_id"; "referenced_tweets.id"]
+    ~tweet_fields:["created_at"; "public_metrics"]
+    ()
+    (function | Ok _ -> result := Some (Ok ()) | Error err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok ()) -> ()
+   | Some (Error err) -> failwith ("Get tweet query contract failed: " ^ err)
+   | None -> failwith "No result in get tweet query contract test");
+
+  (match !captured_get_urls with
+   | url :: _ ->
+       let uri = Uri.of_string url in
+       let expansions = Uri.get_query_param uri "expansions" |> Option.value ~default:"" in
+       let tweet_fields = Uri.get_query_param uri "tweet.fields" |> Option.value ~default:"" in
+       assert (expansions = "author_id,referenced_tweets.id");
+       assert (tweet_fields = "created_at,public_metrics")
+   | [] -> failwith "Expected captured get URL for get_tweet");
+
+  print_endline "✓ Get tweet query contract test passed"
+
+let test_search_tweets_query_contract () =
+  captured_get_urls := [];
+  let result = ref None in
+  Twitter_request_contract.search_tweets
+    ~account_id:"test_account"
+    ~query:"ocaml"
+    ~max_results:25
+    ~next_token:(Some "next_123")
+    ~expansions:["author_id"]
+    ~tweet_fields:["created_at"]
+    ()
+    (function | Ok _ -> result := Some (Ok ()) | Error err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok ()) -> ()
+   | Some (Error err) -> failwith ("Search query contract failed: " ^ err)
+   | None -> failwith "No result in search query contract test");
+
+  (match !captured_get_urls with
+   | url :: _ ->
+       let uri = Uri.of_string url in
+       assert ((Uri.get_query_param uri "query" |> Option.value ~default:"") = "ocaml");
+       assert ((Uri.get_query_param uri "max_results" |> Option.value ~default:"") = "25");
+       assert ((Uri.get_query_param uri "next_token" |> Option.value ~default:"") = "next_123");
+       assert ((Uri.get_query_param uri "expansions" |> Option.value ~default:"") = "author_id");
+       assert ((Uri.get_query_param uri "tweet.fields" |> Option.value ~default:"") = "created_at")
+   | [] -> failwith "Expected captured get URL for search_tweets");
+
+  print_endline "✓ Search tweets query contract test passed"
+
+let test_post_single_payload_contract () =
+  captured_post_bodies := [];
+  let result = ref None in
+  Twitter_request_contract.post_single
+    ~account_id:"test_account"
+    ~text:"contract text"
+    ~media_urls:[]
+    (fun outcome ->
+      match outcome with
+      | Error_types.Success _ -> result := Some (Ok ())
+      | Error_types.Partial_success _ -> result := Some (Ok ())
+      | Error_types.Failure err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok ()) -> ()
+   | Some (Error err) -> failwith ("Post payload contract failed: " ^ err)
+   | None -> failwith "No result in post payload contract test");
+
+  (match !captured_post_bodies with
+   | body :: _ ->
+       let open Yojson.Basic.Util in
+       let json = Yojson.Basic.from_string body in
+       assert ((json |> member "text" |> to_string) = "contract text");
+       assert ((json |> member "media") = `Null)
+   | [] -> failwith "Expected captured post body for post_single");
+
+  print_endline "✓ Post single payload contract test passed"
+
+let test_user_context_uses_bearer_access_token_header () =
+  captured_get_headers := [];
+  let result = ref None in
+  Twitter_request_contract.get_me ~account_id:"test_account" ()
+    (function | Ok _ -> result := Some (Ok ()) | Error err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok ()) -> ()
+   | Some (Error err) -> failwith ("User-context header test failed: " ^ err)
+   | None -> failwith "No result in user-context header test");
+
+  let auth_header = List.assoc_opt "Authorization" !captured_get_headers |> Option.value ~default:"" in
+  assert (String.starts_with ~prefix:"Bearer " auth_header);
+  assert (auth_header = "Bearer test_access_token");
+  print_endline "✓ User-context bearer token header test passed"
+
+let invalid_media_post_calls = ref 0
+
+module Mock_http_invalid_media_post : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+
+  let post ?headers:_ ?body:_ url on_success _on_error =
+    if string_contains url "/tweets" then incr invalid_media_post_calls;
+    on_success {
+      Social_core.status = 400;
+      headers = [("content-type", "application/json")];
+      body = {|{"detail":"Invalid media ID"}|};
+    }
+
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_invalid_media_post = struct
+  module Http = Mock_http_invalid_media_post
+  let get_env = function
+    | "TWITTER_CLIENT_ID" -> Some "test_client_id"
+    | "TWITTER_CLIENT_SECRET" -> Some "test_client_secret"
+    | "TWITTER_LINK_REDIRECT_URI" -> Some "http://localhost/callback"
+    | _ -> None
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "test_access_token";
+      refresh_token = Some "test_refresh_token";
+      expires_at = Some (rfc3339_in_seconds 4000);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_invalid_media_post = Social_twitter_v2.Make(Mock_config_invalid_media_post)
+
+let test_post_invalid_media_id_end_to_end_mapping () =
+  invalid_media_post_calls := 0;
+  let result = ref None in
+  Twitter_invalid_media_post.post_single_with_media_ids
+    ~account_id:"test_account"
+    ~text:"post with invalid media id"
+    ~media_ids:["invalid_media_1"]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+   | Some (Error_types.Failure (Error_types.Api_error api)) ->
+       assert (api.status_code = 400);
+       assert (string_contains (String.lowercase_ascii api.message) "invalid media")
+   | Some (Error_types.Failure Error_types.Duplicate_content) ->
+       failwith "Expected invalid media to map to Api_error, not Duplicate_content"
+   | Some _ -> failwith "Expected failure outcome for invalid media ID"
+   | None -> failwith "No result in invalid media ID e2e test");
+  assert (!invalid_media_post_calls = 1);
+  print_endline "✓ Post invalid media ID end-to-end mapping test passed"
+
+let no_retry_post_calls = ref 0
+
+module Mock_http_no_retry_post : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+
+  let post ?headers:_ ?body:_ url _on_success on_error =
+    if string_contains url "/tweets" then incr no_retry_post_calls;
+    on_error "simulated network failure"
+
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_no_retry_post = struct
+  module Http = Mock_http_no_retry_post
+  let get_env = function
+    | "TWITTER_CLIENT_ID" -> Some "test_client_id"
+    | "TWITTER_CLIENT_SECRET" -> Some "test_client_secret"
+    | "TWITTER_LINK_REDIRECT_URI" -> Some "http://localhost/callback"
+    | _ -> None
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "test_access_token";
+      refresh_token = Some "test_refresh_token";
+      expires_at = Some (rfc3339_in_seconds 4000);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_no_retry_post = Social_twitter_v2.Make(Mock_config_no_retry_post)
+
+let test_post_network_failure_does_not_retry_tweet_creation () =
+  no_retry_post_calls := 0;
+  let result = ref None in
+  Twitter_no_retry_post.post_single
+    ~account_id:"test_account"
+    ~text:"network failure no retry"
+    ~media_urls:[]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+   | Some (Error_types.Failure (Error_types.Network_error _)) -> ()
+   | Some _ -> failwith "Expected network failure outcome"
+   | None -> failwith "No result in no-retry post test");
+  assert (!no_retry_post_calls = 1);
+  print_endline "✓ Post network failure no-retry test passed"
+
+let too_long_post_calls = ref 0
+
+module Mock_http_too_long_guard : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+
+  let post ?headers:_ ?body:_ _url on_success _on_error =
+    incr too_long_post_calls;
+    on_success { Social_core.status = 200; headers = []; body = {|{"data":{"id":"should_not_post"}}|} }
+
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_too_long_guard = struct
+  module Http = Mock_http_too_long_guard
+  let get_env = function
+    | "TWITTER_CLIENT_ID" -> Some "test_client_id"
+    | "TWITTER_CLIENT_SECRET" -> Some "test_client_secret"
+    | "TWITTER_LINK_REDIRECT_URI" -> Some "http://localhost/callback"
+    | _ -> None
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "test_access_token";
+      refresh_token = Some "test_refresh_token";
+      expires_at = Some (rfc3339_in_seconds 4000);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_too_long_guard = Social_twitter_v2.Make(Mock_config_too_long_guard)
+
+let test_post_too_long_validates_before_api_call () =
+  too_long_post_calls := 0;
+  let result = ref None in
+  let over_limit = String.make 281 'x' in
+  Twitter_too_long_guard.post_single
+    ~account_id:"test_account"
+    ~text:over_limit
+    ~media_urls:[]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+   | Some (Error_types.Failure (Error_types.Validation_error errs)) ->
+       assert (List.exists (function Error_types.Text_too_long _ -> true | _ -> false) errs)
+   | Some _ -> failwith "Expected validation error for too-long tweet"
+   | None -> failwith "No result in too-long validation test");
+  assert (!too_long_post_calls = 0);
+  print_endline "✓ Post too-long content validates before API call test passed"
+
+let malformed_post_calls = ref 0
+
+module Mock_http_malformed_post_response : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+
+  let post ?headers:_ ?body:_ url on_success _on_error =
+    if string_contains url "/tweets" then incr malformed_post_calls;
+    on_success {
+      Social_core.status = 200;
+      headers = [("content-type", "application/json")];
+      body = {|{"data":{"id":null}}|};
+    }
+
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_malformed_post_response = struct
+  module Http = Mock_http_malformed_post_response
+  let get_env = function
+    | "TWITTER_CLIENT_ID" -> Some "test_client_id"
+    | "TWITTER_CLIENT_SECRET" -> Some "test_client_secret"
+    | "TWITTER_LINK_REDIRECT_URI" -> Some "http://localhost/callback"
+    | _ -> None
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "test_access_token";
+      refresh_token = Some "test_refresh_token";
+      expires_at = Some (rfc3339_in_seconds 4000);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_malformed_post_response = Social_twitter_v2.Make(Mock_config_malformed_post_response)
+
+let test_post_response_id_parse_failure_maps_internal_error () =
+  malformed_post_calls := 0;
+  let result = ref None in
+  Twitter_malformed_post_response.post_single
+    ~account_id:"test_account"
+    ~text:"parse failure case"
+    ~media_urls:[]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+   | Some (Error_types.Failure (Error_types.Internal_error msg)) ->
+       assert (string_contains (String.lowercase_ascii msg) "failed to parse response")
+   | Some _ -> failwith "Expected internal error for malformed post response"
+   | None -> failwith "No result in malformed post response test");
+  assert (!malformed_post_calls = 1);
+  print_endline "✓ Post response ID parse failure mapping test passed"
+
+let boundary_upload_attempts = ref 0
+let boundary_tweet_posts = ref 0
+
+module Mock_http_boundary_validation : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ _url on_success _on_error =
+    (* 6MB image should fail pre-upload validation when enabled (max 5MB) *)
+    on_success {
+      Social_core.status = 200;
+      headers = [("content-type", "image/jpeg")];
+      body = String.make (6 * 1024 * 1024) 'i';
+    }
+
+  let post ?headers:_ ?body:_ url on_success _on_error =
+    if string_contains url "/tweets" then incr boundary_tweet_posts;
+    on_success { Social_core.status = 200; headers = []; body = {|{"data":{"id":"should_not_post"}}|} }
+
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    incr boundary_upload_attempts;
+    on_success { Social_core.status = 200; headers = []; body = {|{"data":{"id":"should_not_upload"}}|} }
+
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_boundary_validation = struct
+  module Http = Mock_http_boundary_validation
+  let get_env = function
+    | "TWITTER_CLIENT_ID" -> Some "test_client_id"
+    | "TWITTER_CLIENT_SECRET" -> Some "test_client_secret"
+    | "TWITTER_LINK_REDIRECT_URI" -> Some "http://localhost/callback"
+    | _ -> None
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "test_access_token";
+      refresh_token = Some "test_refresh_token";
+      expires_at = Some (rfc3339_in_seconds 4000);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_boundary_validation = Social_twitter_v2.Make(Mock_config_boundary_validation)
+
+let test_validate_media_before_upload_blocks_oversize_image () =
+  boundary_upload_attempts := 0;
+  boundary_tweet_posts := 0;
+  let result = ref None in
+
+  Twitter_boundary_validation.post_single
+    ~account_id:"test_account"
+    ~text:"oversize image should fail"
+    ~media_urls:["https://example.com/oversize.jpg"]
+    ~validate_media_before_upload:true
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+   | Some (Error_types.Failure (Error_types.Validation_error errs)) ->
+       assert (List.length errs > 0)
+   | Some _ -> failwith "Expected validation failure for oversize image"
+   | None -> failwith "No result in boundary validation test");
+  assert (!boundary_upload_attempts = 0);
+  assert (!boundary_tweet_posts = 0);
+  print_endline "✓ Pre-upload validation blocks oversize media test passed"
+
+let alt_meta_urls = ref []
+let alt_meta_bodies = ref []
+
+module Mock_http_alt_meta_contract : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ _url on_success _on_error =
+    on_success {
+      Social_core.status = 200;
+      headers = [("content-type", "image/jpeg")];
+      body = "img";
+    }
+
+  let post ?headers:_ ?body url on_success _on_error =
+    if string_contains url "/media/metadata" then begin
+      alt_meta_urls := !alt_meta_urls @ [url];
+      alt_meta_bodies := !alt_meta_bodies @ [Option.value ~default:"{}" body];
+      on_success { Social_core.status = 200; headers = []; body = {|{"data":{"updated":true}}|} }
+    end else if string_contains url "/media/upload" then
+      on_success { Social_core.status = 200; headers = []; body = {|{"data":{"id":"media_alt_contract_1"}}|} }
+    else if string_contains url "/tweets" then
+      on_success { Social_core.status = 200; headers = []; body = {|{"data":{"id":"tweet_alt_contract"}}|} }
+    else
+      on_success { Social_core.status = 200; headers = []; body = "{}" }
+
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = {|{"data":{"id":"media_alt_contract_1"}}|} }
+
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_alt_meta_contract = struct
+  module Http = Mock_http_alt_meta_contract
+  let get_env = function
+    | "TWITTER_CLIENT_ID" -> Some "test_client_id"
+    | "TWITTER_CLIENT_SECRET" -> Some "test_client_secret"
+    | "TWITTER_LINK_REDIRECT_URI" -> Some "http://localhost/callback"
+    | _ -> None
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "test_access_token";
+      refresh_token = Some "test_refresh_token";
+      expires_at = Some (rfc3339_in_seconds 4000);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_alt_meta_contract = Social_twitter_v2.Make(Mock_config_alt_meta_contract)
+
+let test_alt_text_metadata_endpoint_contract () =
+  alt_meta_urls := [];
+  alt_meta_bodies := [];
+  let result = ref None in
+
+  Twitter_alt_meta_contract.post_single
+    ~account_id:"test_account"
+    ~text:"alt metadata contract"
+    ~media_urls:["https://example.com/img.jpg"]
+    ~alt_texts:[Some "A sample alt text"]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+   | Some (Error_types.Success _) -> ()
+   | Some (Error_types.Partial_success _) -> ()
+   | Some (Error_types.Failure err) ->
+       failwith ("Alt metadata contract test failed: " ^ Error_types.error_to_string err)
+   | None -> failwith "No result in alt metadata contract test");
+
+  (match !alt_meta_urls, !alt_meta_bodies with
+   | [url], [body] ->
+       assert (string_contains url "/2/media/metadata");
+       let open Yojson.Basic.Util in
+       let json = Yojson.Basic.from_string body in
+       assert ((json |> member "id" |> to_string) = "media_alt_contract_1");
+       assert ((json |> member "metadata" |> member "alt_text" |> member "text" |> to_string) = "A sample alt text")
+   | _ -> failwith "Expected exactly one metadata endpoint call");
+
+  print_endline "✓ Alt-text metadata endpoint contract test passed"
+
+module Mock_http_unknown_fields : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ _url on_success _on_error =
+    on_success {
+      Social_core.status = 200;
+      headers = [("content-type", "application/json")];
+      body = {|{
+        "data": {
+          "id": "tweet_unknown_1",
+          "text": "hello",
+          "unknown_field": {"nested": true, "count": 3}
+        },
+        "meta": {"result_count": 1, "future_field": "alpha"},
+        "unknown_top": [1,2,3]
+      }|};
+    }
+
+  let post ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_unknown_fields = struct
+  module Http = Mock_http_unknown_fields
+  let get_env _ = Some "value"
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "valid_access";
+      refresh_token = Some "refresh";
+      expires_at = Some (rfc3339_in_seconds 4000);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_unknown_fields = Social_twitter_v2.Make(Mock_config_unknown_fields)
+
+let test_read_unknown_fields_tolerance () =
+  let result = ref None in
+  Twitter_unknown_fields.get_tweet ~account_id:"test_account" ~tweet_id:"tweet_unknown_1" ()
+    (function | Ok json -> result := Some (Ok json) | Error err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok json) ->
+       let open Yojson.Basic.Util in
+       assert ((json |> member "data" |> member "id" |> to_string) = "tweet_unknown_1");
+       assert ((json |> member "data" |> member "unknown_field" |> member "nested" |> to_bool));
+       assert ((json |> member "meta" |> member "future_field" |> to_string) = "alpha")
+   | Some (Error err) -> failwith ("Unknown fields tolerance test failed: " ^ err)
+   | None -> failwith "No result in unknown fields tolerance test");
+
+  print_endline "✓ Read unknown fields tolerance test passed"
+
+let partial_read_get_calls = ref 0
+
+module Mock_http_partial_read : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ _url on_success _on_error =
+    incr partial_read_get_calls;
+    on_success {
+      Social_core.status = 200;
+      headers = [("content-type", "application/json")];
+      body = {|{
+        "data": null,
+        "errors": [{"title":"Not Found Error","detail":"Tweet was deleted"}],
+        "meta": {"result_count": 0}
+      }|};
+    }
+
+  let post ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_partial_read = struct
+  module Http = Mock_http_partial_read
+  let get_env _ = Some "value"
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "valid_access";
+      refresh_token = Some "refresh";
+      expires_at = Some (rfc3339_in_seconds 4000);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_partial_read = Social_twitter_v2.Make(Mock_config_partial_read)
+
+let test_read_partial_response_data_null_with_errors () =
+  partial_read_get_calls := 0;
+  let result = ref None in
+  Twitter_partial_read.get_tweet ~account_id:"test_account" ~tweet_id:"deleted_tweet" ()
+    (function | Ok json -> result := Some (Ok json) | Error err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok json) ->
+       let open Yojson.Basic.Util in
+       assert ((json |> member "data") = `Null);
+       assert ((json |> member "errors" |> index 0 |> member "title" |> to_string) = "Not Found Error")
+   | Some (Error err) -> failwith ("Partial read response test failed: " ^ err)
+   | None -> failwith "No result in partial read response test");
+  assert (!partial_read_get_calls = 1);
+  print_endline "✓ Read partial response (data=null + errors) test passed"
+
+let read_no_retry_get_calls = ref 0
+
+module Mock_http_read_no_retry : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ _url on_success _on_error =
+    incr read_no_retry_get_calls;
+    on_success {
+      Social_core.status = 500;
+      headers = [("content-type", "application/json")];
+      body = {|{"detail":"temporary backend issue"}|};
+    }
+
+  let post ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_read_no_retry = struct
+  module Http = Mock_http_read_no_retry
+  let get_env _ = Some "value"
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "valid_access";
+      refresh_token = Some "refresh";
+      expires_at = Some (rfc3339_in_seconds 4000);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_read_no_retry = Social_twitter_v2.Make(Mock_config_read_no_retry)
+
+let test_read_5xx_no_automatic_retry_policy () =
+  read_no_retry_get_calls := 0;
+  let result = ref None in
+  Twitter_read_no_retry.get_tweet ~account_id:"test_account" ~tweet_id:"500_case" ()
+    (function | Ok _ -> result := Some (Ok ()) | Error err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Error msg) -> assert (string_contains (String.lowercase_ascii msg) "api error")
+   | Some (Ok ()) -> failwith "Expected 500 read call to fail"
+   | None -> failwith "No result in read no-retry test");
+  assert (!read_no_retry_get_calls = 1);
+  print_endline "✓ Read 5xx no-automatic-retry policy test passed"
+
+let rotation_seen_refresh_tokens = ref []
+let rotation_creds = ref {
+  Social_core.access_token = "expired_access";
+  refresh_token = Some "old_refresh_token";
+  expires_at = Some (rfc3339_in_seconds 5);
+  token_type = "Bearer";
+}
+
+module Mock_http_refresh_rotation : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = {|{"data":{"id":"x"}}|} }
+
+  let post ?headers:_ ?body url on_success _on_error =
+    if String.ends_with ~suffix:"/oauth2/token" url then begin
+      let refresh_used =
+        match body with
+        | Some b ->
+            (match Uri.query_of_encoded b |> List.assoc_opt "refresh_token" with
+             | Some (tok :: _) -> tok
+             | _ -> "")
+        | None -> ""
+      in
+      rotation_seen_refresh_tokens := refresh_used :: !rotation_seen_refresh_tokens;
+      let response_body =
+        if refresh_used = "old_refresh_token" then
+          {|{"access_token":"access_after_old","refresh_token":"new_refresh_token","expires_in":1,"token_type":"Bearer"}|}
+        else if refresh_used = "new_refresh_token" then
+          {|{"access_token":"access_after_new","refresh_token":"new_refresh_token_2","expires_in":1,"token_type":"Bearer"}|}
+        else
+          {|{"detail":"invalid refresh token"}|}
+      in
+      let status = if refresh_used = "" then 401 else 200 in
+      on_success { Social_core.status = status; headers = []; body = response_body }
+    end else
+      on_success { Social_core.status = 200; headers = []; body = "{}" }
+
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_refresh_rotation = struct
+  module Http = Mock_http_refresh_rotation
+  let get_env = function
+    | "TWITTER_CLIENT_ID" -> Some "test_client_id"
+    | "TWITTER_CLIENT_SECRET" -> Some "test_client_secret"
+    | _ -> None
+  let get_credentials ~account_id:_ on_success _on_error = on_success !rotation_creds
+  let update_credentials ~account_id:_ ~credentials on_success _on_error =
+    rotation_creds := credentials;
+    on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_refresh_rotation = Social_twitter_v2.Make(Mock_config_refresh_rotation)
+
+let test_refresh_rotation_uses_latest_refresh_token () =
+  rotation_seen_refresh_tokens := [];
+  rotation_creds := {
+    Social_core.access_token = "expired_access";
+    refresh_token = Some "old_refresh_token";
+    expires_at = Some (rfc3339_in_seconds 5);
+    token_type = "Bearer";
+  };
+
+  let result1 = ref None in
+  let result2 = ref None in
+
+  Twitter_refresh_rotation.get_tweet ~account_id:"test_account" ~tweet_id:"123" ()
+    (function | Ok _ -> result1 := Some (Ok ()) | Error err -> result1 := Some (Error (Error_types.error_to_string err)));
+
+  Twitter_refresh_rotation.get_tweet ~account_id:"test_account" ~tweet_id:"123" ()
+    (function | Ok _ -> result2 := Some (Ok ()) | Error err -> result2 := Some (Error (Error_types.error_to_string err)));
+
+  (match !result1 with
+   | Some (Ok ()) -> ()
+   | Some (Error err) -> failwith ("First rotation call failed: " ^ err)
+   | None -> failwith "No result in first rotation call");
+  (match !result2 with
+   | Some (Ok ()) -> ()
+   | Some (Error err) -> failwith ("Second rotation call failed: " ^ err)
+   | None -> failwith "No result in second rotation call");
+
+  assert (List.rev !rotation_seen_refresh_tokens = ["old_refresh_token"; "new_refresh_token"]);
+  assert ((!rotation_creds).Social_core.refresh_token = Some "new_refresh_token_2");
+  print_endline "✓ Refresh rotation uses latest refresh token test passed"
 
 (** Test: Post single (mock) *)
 let test_post_single () =
@@ -1241,6 +2896,40 @@ let test_unfollow_list () =
   
   print_endline "✓ Unfollow list test executed"
 
+(** Test: Pin list *)
+let test_pin_list () =
+  let result = ref None in
+
+  Twitter.pin_list
+    ~account_id:"test_account"
+    ~list_id:"list_12345"
+    (fun () -> result := Some (Ok ()))
+    (fun err -> result := Some (Error err));
+
+  (match !result with
+   | Some (Ok ()) -> ()
+   | Some (Error err) -> failwith ("Pin list failed: " ^ err)
+   | None -> ());
+
+  print_endline "✓ Pin list test executed"
+
+(** Test: Unpin list *)
+let test_unpin_list () =
+  let result = ref None in
+
+  Twitter.unpin_list
+    ~account_id:"test_account"
+    ~list_id:"list_12345"
+    (fun () -> result := Some (Ok ()))
+    (fun err -> result := Some (Error err));
+
+  (match !result with
+   | Some (Ok ()) -> ()
+   | Some (Error err) -> failwith ("Unpin list failed: " ^ err)
+   | None -> ());
+
+  print_endline "✓ Unpin list test executed"
+
 (** Test: Get list tweets *)
 let test_get_list_tweets () =
   let result = ref None in
@@ -1488,6 +3177,50 @@ end
 
 module Twitter_errors = Social_twitter_v2.Make(Mock_config_errors)
 
+module Mock_http_rate_reset : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ _url on_success _on_error =
+    let now = int_of_float (Unix.time ()) in
+    on_success {
+      Social_core.status = 429;
+      headers = [
+        ("x-rate-limit-limit", "900");
+        ("x-rate-limit-remaining", "0");
+        ("x-rate-limit-reset", string_of_int (now + 90));
+      ];
+      body = {|{"title":"Too Many Requests","detail":"Rate limit exceeded"}|};
+    }
+  let post ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_rate_reset = struct
+  module Http = Mock_http_rate_reset
+  let get_env = function
+    | "TWITTER_CLIENT_ID" -> Some "test_client_id"
+    | "TWITTER_CLIENT_SECRET" -> Some "test_client_secret"
+    | "TWITTER_LINK_REDIRECT_URI" -> Some "http://localhost/callback"
+    | _ -> None
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "test_access_token";
+      refresh_token = Some "test_refresh_token";
+      expires_at = Some (rfc3339_in_seconds 4000);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_rate_reset = Social_twitter_v2.Make(Mock_config_rate_reset)
+
 (** Test: Rate limit exceeded (429) handling *)
 let test_rate_limit_error () =
   set_error_mode `RateLimit;
@@ -1510,6 +3243,25 @@ let test_rate_limit_error () =
   
   set_error_mode `None;
   print_endline "✓ Rate limit error test executed"
+
+let test_rate_limit_error_uses_reset_header_in_flow () =
+  let result = ref None in
+  Twitter_rate_reset.get_tweet
+    ~account_id:"test_account"
+    ~tweet_id:"12345"
+    ()
+    (function
+      | Ok _ -> result := Some (Ok ())
+      | Error err -> result := Some (Error err));
+
+  (match !result with
+   | Some (Error (Error_types.Rate_limited info)) ->
+       (match info.retry_after_seconds with
+        | Some secs -> assert (secs >= 60)
+        | None -> failwith "Expected retry_after_seconds from rate-limit reset header")
+   | Some _ -> failwith "Expected rate-limited error with reset-derived retry_after"
+   | None -> failwith "No result in rate-limit reset flow test");
+  print_endline "✓ Rate-limit flow uses reset header for retry_after test passed"
 
 (** Test: Unauthorized (401) handling *)
 let test_unauthorized_error () =
@@ -1689,6 +3441,89 @@ let test_pagination_previous_token () =
   assert (meta.next_token = None);
   
   print_endline "✓ Pagination previous_token test passed"
+
+let pagination_stop_calls = ref 0
+
+module Mock_http_pagination_stop : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ _url on_success _on_error =
+    incr pagination_stop_calls;
+    if !pagination_stop_calls = 1 then
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{
+          "data": [{"id": "p1", "text": "first"}],
+          "meta": {"result_count": 1, "next_token": "next_page_token"}
+        }|};
+      }
+    else
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{
+          "data": [{"id": "p2", "text": "second"}],
+          "meta": {"result_count": 1}
+        }|};
+      }
+
+  let post ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_pagination_stop = struct
+  module Http = Mock_http_pagination_stop
+  let get_env _ = Some "value"
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "valid_access";
+      refresh_token = Some "refresh";
+      expires_at = Some (rfc3339_in_seconds 4000);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_pagination_stop = Social_twitter_v2.Make(Mock_config_pagination_stop)
+
+let test_pagination_end_to_end_stop_condition () =
+  pagination_stop_calls := 0;
+  let collected = ref [] in
+
+  let rec fetch_all next_token =
+    let local_result = ref None in
+    Twitter_pagination_stop.search_tweets
+      ~account_id:"test_account"
+      ~query:"pagination"
+      ~max_results:10
+      ~next_token
+      ()
+      (function | Ok json -> local_result := Some (Ok json) | Error err -> local_result := Some (Error (Error_types.error_to_string err)));
+    match !local_result with
+    | Some (Ok json) ->
+        let open Yojson.Basic.Util in
+        let ids = json |> member "data" |> to_list |> List.map (fun item -> item |> member "id" |> to_string) in
+        collected := !collected @ ids;
+        let meta = Twitter_pagination_stop.parse_pagination_meta json in
+        (match meta.next_token with
+         | Some tok -> fetch_all (Some tok)
+         | None -> ())
+    | Some (Error err) -> failwith ("Pagination stop-condition test failed: " ^ err)
+    | None -> failwith "No result in pagination stop-condition test"
+  in
+
+  fetch_all None;
+  assert (!pagination_stop_calls = 2);
+  assert (!collected = ["p1"; "p2"]);
+  print_endline "✓ Pagination end-to-end stop-condition test passed"
 
 (* ============================================ *)
 (* NEW TESTS: Tweet Fields and Expansions       *)
@@ -2151,6 +3986,969 @@ let test_video_processing_status () =
   
   print_endline "✓ Video processing status test passed"
 
+(* ============================================ *)
+(* NEW TESTS: Video processing gating           *)
+(* ============================================ *)
+
+let video_gate_status_calls = ref 0
+let video_gate_tweet_posts = ref 0
+
+module Mock_http_video_gate : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ url on_success _on_error =
+    if String.ends_with ~suffix:".mp4" url then
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "video/mp4")];
+        body = String.make 1024 'v';
+      }
+    else if string_contains url "command=STATUS" then begin
+      incr video_gate_status_calls;
+      if !video_gate_status_calls = 1 then
+        on_success {
+          Social_core.status = 200;
+          headers = [("content-type", "application/json")];
+          body = {|{"data":{"id":"media_gate_1"},"processing_info":{"state":"in_progress","check_after_secs":1}}|};
+        }
+      else
+        on_success {
+          Social_core.status = 200;
+          headers = [("content-type", "application/json")];
+          body = {|{"data":{"id":"media_gate_1"},"processing_info":{"state":"succeeded"}}|};
+        }
+    end else
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"tweet_gate_1"}}|};
+      }
+
+  let post ?headers:_ ?body:_ url on_success _on_error =
+    if string_contains url "/tweets" then begin
+      incr video_gate_tweet_posts;
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"tweet_gate_1"}}|};
+      }
+    end else
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"media_gate_1"}}|};
+      }
+
+  let post_multipart ?headers:_ ~parts _url on_success _on_error =
+    let command =
+      List.find_opt (fun part -> part.Social_core.name = "command") parts
+      |> Option.map (fun p -> p.Social_core.content)
+      |> Option.value ~default:""
+    in
+    let body =
+      match command with
+      | "INIT" -> {|{"data":{"id":"media_gate_1"}}|}
+      | "APPEND" -> {|{"data":{}}|}
+      | "FINALIZE" -> {|{"data":{"id":"media_gate_1","processing_info":{"state":"in_progress","check_after_secs":1}}}|}
+      | _ -> {|{"data":{}}|}
+    in
+    on_success {
+      Social_core.status = 200;
+      headers = [("content-type", "application/json")];
+      body;
+    }
+
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = {|{"data":{}}|} }
+
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = {|{"data":{"deleted":true}}|} }
+end
+
+module Mock_config_video_gate = struct
+  module Http = Mock_http_video_gate
+
+  let get_env = function
+    | "TWITTER_CLIENT_ID" -> Some "test_client_id"
+    | "TWITTER_CLIENT_SECRET" -> Some "test_client_secret"
+    | "TWITTER_LINK_REDIRECT_URI" -> Some "http://localhost/callback"
+    | _ -> None
+
+  let get_credentials ~account_id:_ on_success _on_error =
+    let expires_at =
+      Ptime_clock.now () |> fun t ->
+      match Ptime.add_span t (Ptime.Span.of_int_s 3600) with
+      | Some t2 -> Ptime.to_rfc3339 t2
+      | None -> Ptime.to_rfc3339 t
+    in
+    on_success {
+      Social_core.access_token = "test_access_token";
+      refresh_token = Some "test_refresh_token";
+      expires_at = Some expires_at;
+      token_type = "Bearer";
+    }
+
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted_data"
+  let decrypt _data on_success _on_error = on_success {|{"access_token":"test_token","refresh_token":"test_refresh"}|}
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_video_gate = Social_twitter_v2.Make(Mock_config_video_gate)
+
+let test_video_processing_pending_then_success_posts_once () =
+  video_gate_status_calls := 0;
+  video_gate_tweet_posts := 0;
+  let result = ref None in
+  let start_time = Ptime_clock.now () in
+
+  Twitter_video_gate.post_single
+    ~account_id:"test_account"
+    ~text:"Video with pending processing"
+    ~media_urls:["https://example.com/clip.mp4"]
+    (fun outcome ->
+      match outcome with
+      | Error_types.Success tweet_id -> result := Some (Ok tweet_id)
+      | Error_types.Partial_success { result = tweet_id; _ } -> result := Some (Ok tweet_id)
+      | Error_types.Failure err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok _) -> ()
+   | Some (Error err) -> failwith ("Video pending->success test failed: " ^ err)
+   | None -> ());
+
+  assert (!video_gate_status_calls >= 1);
+  assert (!video_gate_tweet_posts = 1);
+  let elapsed_seconds =
+    let stop_time = Ptime_clock.now () in
+    Ptime.diff stop_time start_time |> Ptime.Span.to_float_s
+  in
+  assert (elapsed_seconds >= 0.8);
+  print_endline "✓ Video pending->success gating test passed"
+
+let video_immediate_status_calls = ref 0
+let video_immediate_tweet_posts = ref 0
+
+module Mock_http_video_immediate : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ url on_success _on_error =
+    if String.ends_with ~suffix:".mp4" url then
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "video/mp4")];
+        body = String.make 1024 'v';
+      }
+    else if string_contains url "command=STATUS" then begin
+      incr video_immediate_status_calls;
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"media_immediate_1"},"processing_info":{"state":"succeeded"}}|};
+      }
+    end else
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"tweet_immediate_1"}}|};
+      }
+
+  let post ?headers:_ ?body:_ url on_success _on_error =
+    if string_contains url "/tweets" then incr video_immediate_tweet_posts;
+    on_success {
+      Social_core.status = 200;
+      headers = [("content-type", "application/json")];
+      body = {|{"data":{"id":"tweet_immediate_1"}}|};
+    }
+
+  let post_multipart ?headers:_ ~parts _url on_success _on_error =
+    let command =
+      List.find_opt (fun part -> part.Social_core.name = "command") parts
+      |> Option.map (fun p -> p.Social_core.content)
+      |> Option.value ~default:""
+    in
+    let body =
+      match command with
+      | "INIT" -> {|{"data":{"id":"media_immediate_1"}}|}
+      | "APPEND" -> {|{"data":{}}|}
+      | "FINALIZE" -> {|{"data":{"id":"media_immediate_1","processing_info":{"state":"succeeded"}}}|}
+      | _ -> {|{"data":{}}|}
+    in
+    on_success {
+      Social_core.status = 200;
+      headers = [("content-type", "application/json")];
+      body;
+    }
+
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = {|{"data":{}}|} }
+
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = {|{"data":{"deleted":true}}|} }
+end
+
+module Mock_config_video_immediate = struct
+  module Http = Mock_http_video_immediate
+
+  let get_env = function
+    | "TWITTER_CLIENT_ID" -> Some "test_client_id"
+    | "TWITTER_CLIENT_SECRET" -> Some "test_client_secret"
+    | "TWITTER_LINK_REDIRECT_URI" -> Some "http://localhost/callback"
+    | _ -> None
+
+  let get_credentials ~account_id:_ on_success _on_error =
+    let expires_at =
+      Ptime_clock.now () |> fun t ->
+      match Ptime.add_span t (Ptime.Span.of_int_s 3600) with
+      | Some t2 -> Ptime.to_rfc3339 t2
+      | None -> Ptime.to_rfc3339 t
+    in
+    on_success {
+      Social_core.access_token = "test_access_token";
+      refresh_token = Some "test_refresh_token";
+      expires_at = Some expires_at;
+      token_type = "Bearer";
+    }
+
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted_data"
+  let decrypt _data on_success _on_error = on_success {|{"access_token":"test_token","refresh_token":"test_refresh"}|}
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_video_immediate = Social_twitter_v2.Make(Mock_config_video_immediate)
+
+let test_video_processing_immediate_success_skips_status_polling () =
+  video_immediate_status_calls := 0;
+  video_immediate_tweet_posts := 0;
+  let result = ref None in
+
+  Twitter_video_immediate.post_single
+    ~account_id:"test_account"
+    ~text:"Video with immediate processing success"
+    ~media_urls:["https://example.com/instant.mp4"]
+    (fun outcome ->
+      match outcome with
+      | Error_types.Success tweet_id -> result := Some (Ok tweet_id)
+      | Error_types.Partial_success { result = tweet_id; _ } -> result := Some (Ok tweet_id)
+      | Error_types.Failure err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok _) -> ()
+   | Some (Error err) -> failwith ("Video immediate-success test failed: " ^ err)
+   | None -> ());
+
+  assert (!video_immediate_status_calls = 0);
+  assert (!video_immediate_tweet_posts = 1);
+  print_endline "✓ Video immediate-success skips status polling test passed"
+
+let video_fail_status_calls = ref 0
+let video_fail_tweet_posts = ref 0
+
+module Mock_http_video_fail : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ url on_success _on_error =
+    if String.ends_with ~suffix:".mp4" url then
+      on_success { Social_core.status = 200; headers = [("content-type", "video/mp4")]; body = "video" }
+    else if string_contains url "command=STATUS" then begin
+      incr video_fail_status_calls;
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"media_fail_1"},"processing_info":{"state":"failed","error":{"name":"UnsupportedFormat","message":"Codec not supported","code":324}}}|};
+      }
+    end else
+      on_success { Social_core.status = 200; headers = [("content-type", "application/json")]; body = {|{"data":{"id":"tweet_fail_1"}}|} }
+
+  let post ?headers:_ ?body:_ url on_success _on_error =
+    if string_contains url "/tweets" then incr video_fail_tweet_posts;
+    on_success { Social_core.status = 200; headers = [("content-type", "application/json")]; body = {|{"data":{"id":"tweet_fail_1"}}|} }
+
+  let post_multipart ?headers:_ ~parts _url on_success _on_error =
+    let command =
+      List.find_opt (fun part -> part.Social_core.name = "command") parts
+      |> Option.map (fun p -> p.Social_core.content)
+      |> Option.value ~default:""
+    in
+    let body =
+      match command with
+      | "INIT" -> {|{"data":{"id":"media_fail_1"}}|}
+      | "APPEND" -> {|{"data":{}}|}
+        | "FINALIZE" -> {|{"data":{"id":"media_fail_1","processing_info":{"state":"in_progress","check_after_secs":0}}}|}
+      | _ -> {|{"data":{}}|}
+    in
+    on_success { Social_core.status = 200; headers = [("content-type", "application/json")]; body }
+
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = {|{"data":{}}|} }
+
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = {|{"data":{"deleted":true}}|} }
+end
+
+module Mock_config_video_fail = struct
+  module Http = Mock_http_video_fail
+  let get_env = function
+    | "TWITTER_CLIENT_ID" -> Some "test_client_id"
+    | "TWITTER_CLIENT_SECRET" -> Some "test_client_secret"
+    | "TWITTER_LINK_REDIRECT_URI" -> Some "http://localhost/callback"
+    | _ -> None
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success { Social_core.access_token = "test_access_token"; refresh_token = Some "test_refresh_token"; expires_at = None; token_type = "Bearer" }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted_data"
+  let decrypt _data on_success _on_error = on_success {|{"access_token":"test_token","refresh_token":"test_refresh"}|}
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_video_fail = Social_twitter_v2.Make(Mock_config_video_fail)
+
+let test_video_processing_failed_blocks_post () =
+  video_fail_status_calls := 0;
+  video_fail_tweet_posts := 0;
+  let result = ref None in
+
+  Twitter_video_fail.post_single
+    ~account_id:"test_account"
+    ~text:"Video should fail before posting"
+    ~media_urls:["https://example.com/fail.mp4"]
+    (fun outcome ->
+      match outcome with
+      | Error_types.Failure err -> result := Some (Error_types.error_to_string err)
+      | Error_types.Success tweet_id -> result := Some ("unexpected success: " ^ tweet_id)
+      | Error_types.Partial_success { result = tweet_id; _ } -> result := Some ("unexpected partial: " ^ tweet_id));
+
+  (match !result with
+   | Some msg ->
+       assert (string_contains (String.lowercase_ascii msg) "media processing failed");
+       assert (!video_fail_tweet_posts = 0)
+   | None -> failwith "Expected processing failure result");
+
+  print_endline "✓ Video failed-processing blocks posting test passed"
+
+let video_timeout_status_calls = ref 0
+let video_timeout_tweet_posts = ref 0
+
+module Mock_http_video_timeout : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ url on_success _on_error =
+    if String.ends_with ~suffix:".mp4" url then
+      on_success { Social_core.status = 200; headers = [("content-type", "video/mp4")]; body = "video" }
+    else if string_contains url "command=STATUS" then begin
+      incr video_timeout_status_calls;
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"media_timeout_1"},"processing_info":{"state":"in_progress","check_after_secs":0}}|};
+      }
+    end else
+      on_success { Social_core.status = 200; headers = [("content-type", "application/json")]; body = {|{"data":{"id":"tweet_timeout_1"}}|} }
+
+  let post ?headers:_ ?body:_ url on_success _on_error =
+    if string_contains url "/tweets" then incr video_timeout_tweet_posts;
+    on_success { Social_core.status = 200; headers = [("content-type", "application/json")]; body = {|{"data":{"id":"tweet_timeout_1"}}|} }
+
+  let post_multipart ?headers:_ ~parts _url on_success _on_error =
+    let command =
+      List.find_opt (fun part -> part.Social_core.name = "command") parts
+      |> Option.map (fun p -> p.Social_core.content)
+      |> Option.value ~default:""
+    in
+    let body =
+      match command with
+      | "INIT" -> {|{"data":{"id":"media_timeout_1"}}|}
+      | "APPEND" -> {|{"data":{}}|}
+      | "FINALIZE" -> {|{"data":{"id":"media_timeout_1","processing_info":{"state":"in_progress","check_after_secs":0}}}|}
+      | _ -> {|{"data":{}}|}
+    in
+    on_success { Social_core.status = 200; headers = [("content-type", "application/json")]; body }
+
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = {|{"data":{}}|} }
+
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = {|{"data":{"deleted":true}}|} }
+end
+
+module Mock_config_video_timeout = struct
+  module Http = Mock_http_video_timeout
+  let get_env = function
+    | "TWITTER_CLIENT_ID" -> Some "test_client_id"
+    | "TWITTER_CLIENT_SECRET" -> Some "test_client_secret"
+    | "TWITTER_LINK_REDIRECT_URI" -> Some "http://localhost/callback"
+    | _ -> None
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success { Social_core.access_token = "test_access_token"; refresh_token = Some "test_refresh_token"; expires_at = None; token_type = "Bearer" }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted_data"
+  let decrypt _data on_success _on_error = on_success {|{"access_token":"test_token","refresh_token":"test_refresh"}|}
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_video_timeout = Social_twitter_v2.Make(Mock_config_video_timeout)
+
+let test_video_processing_timeout_blocks_post () =
+  video_timeout_status_calls := 0;
+  video_timeout_tweet_posts := 0;
+  let result = ref None in
+
+  Twitter_video_timeout.post_single
+    ~account_id:"test_account"
+    ~text:"Video should timeout before posting"
+    ~media_urls:["https://example.com/timeout.mp4"]
+    (fun outcome ->
+      match outcome with
+      | Error_types.Failure err -> result := Some (Error_types.error_to_string err)
+      | Error_types.Success tweet_id -> result := Some ("unexpected success: " ^ tweet_id)
+      | Error_types.Partial_success { result = tweet_id; _ } -> result := Some ("unexpected partial: " ^ tweet_id));
+
+  (match !result with
+   | Some msg ->
+       assert (string_contains (String.lowercase_ascii msg) "timeout");
+  assert (!video_timeout_status_calls >= 20);
+  assert (!video_timeout_tweet_posts = 0)
+   | None -> failwith "Expected processing timeout result");
+
+  print_endline "✓ Video processing timeout blocks posting test passed"
+
+let video_interrupt_append_calls = ref 0
+let video_interrupt_tweet_posts = ref 0
+let video_interrupt_fail_once = ref true
+
+module Mock_http_video_interrupt : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ url on_success _on_error =
+    if String.ends_with ~suffix:".mp4" url then
+      (* 2 chunks to force APPEND progression *)
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "video/mp4")];
+        body = String.make ((5 * 1024 * 1024) + 1024) 'v';
+      }
+    else if string_contains url "command=STATUS" then
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"media_interrupt_1"},"processing_info":{"state":"succeeded"}}|};
+      }
+    else
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"tweet_interrupt_1"}}|};
+      }
+
+  let post ?headers:_ ?body:_ url on_success _on_error =
+    if string_contains url "/tweets" then incr video_interrupt_tweet_posts;
+    on_success {
+      Social_core.status = 200;
+      headers = [("content-type", "application/json")];
+      body = {|{"data":{"id":"tweet_interrupt_1"}}|};
+    }
+
+  let post_multipart ?headers:_ ~parts _url on_success on_error =
+    let command =
+      List.find_opt (fun part -> part.Social_core.name = "command") parts
+      |> Option.map (fun p -> p.Social_core.content)
+      |> Option.value ~default:""
+    in
+    let seg =
+      List.find_opt (fun part -> part.Social_core.name = "segment_index") parts
+      |> Option.map (fun p -> int_of_string p.Social_core.content)
+      |> Option.value ~default:(-1)
+    in
+
+    match command with
+    | "INIT" ->
+        on_success {
+          Social_core.status = 200;
+          headers = [("content-type", "application/json")];
+          body = {|{"data":{"id":"media_interrupt_1"}}|};
+        }
+    | "APPEND" ->
+        incr video_interrupt_append_calls;
+        if !video_interrupt_fail_once && seg = 1 then begin
+          video_interrupt_fail_once := false;
+          on_error "simulated append interruption"
+        end else
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"data":{}}|};
+          }
+    | "FINALIZE" ->
+        on_success {
+          Social_core.status = 200;
+          headers = [("content-type", "application/json")];
+          body = {|{"data":{"id":"media_interrupt_1","processing_info":{"state":"succeeded"}}}|};
+        }
+    | _ -> on_error ("Unexpected command: " ^ command)
+
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_video_interrupt = struct
+  module Http = Mock_http_video_interrupt
+  let get_env = function
+    | "TWITTER_CLIENT_ID" -> Some "test_client_id"
+    | "TWITTER_CLIENT_SECRET" -> Some "test_client_secret"
+    | "TWITTER_LINK_REDIRECT_URI" -> Some "http://localhost/callback"
+    | _ -> None
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "test_access_token";
+      refresh_token = Some "test_refresh_token";
+      expires_at = Some (rfc3339_in_seconds 4000);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_video_interrupt = Social_twitter_v2.Make(Mock_config_video_interrupt)
+
+let test_video_append_interruption_then_manual_retry_recovery () =
+  video_interrupt_append_calls := 0;
+  video_interrupt_tweet_posts := 0;
+  video_interrupt_fail_once := true;
+
+  let first_result = ref None in
+  Twitter_video_interrupt.post_single
+    ~account_id:"test_account"
+    ~text:"First try should fail"
+    ~media_urls:["https://example.com/interrupted.mp4"]
+    (fun outcome -> first_result := Some outcome);
+
+  (match !first_result with
+   | Some (Error_types.Failure (Error_types.Network_error _)) -> ()
+   | Some _ -> failwith "Expected first upload attempt to fail with network error"
+   | None -> failwith "No first result in interruption/recovery test");
+  assert (!video_interrupt_tweet_posts = 0);
+
+  let second_result = ref None in
+  Twitter_video_interrupt.post_single
+    ~account_id:"test_account"
+    ~text:"Second try should succeed"
+    ~media_urls:["https://example.com/interrupted.mp4"]
+    (fun outcome -> second_result := Some outcome);
+
+  (match !second_result with
+   | Some (Error_types.Success _) -> ()
+   | Some (Error_types.Partial_success _) -> ()
+   | Some (Error_types.Failure err) ->
+       failwith ("Expected retry recovery to succeed, got: " ^ Error_types.error_to_string err)
+   | None -> failwith "No second result in interruption/recovery test");
+
+  assert (!video_interrupt_append_calls >= 3);
+  assert (!video_interrupt_tweet_posts = 1);
+  print_endline "✓ Video append interruption + manual retry recovery test passed"
+
+let video_codec_tweet_posts = ref 0
+
+module Mock_http_video_codec : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ url on_success _on_error =
+    if String.ends_with ~suffix:".webm" url then
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "video/webm")];
+        body = String.make (1024 * 1024) 'w';
+      }
+    else if string_contains url "command=STATUS" then
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"media_codec_1"},"processing_info":{"state":"failed","error":{"name":"UnsupportedFormat","message":"Codec/container unsupported","code":324}}}|};
+      }
+    else
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"tweet_codec_1"}}|};
+      }
+
+  let post ?headers:_ ?body:_ url on_success _on_error =
+    if string_contains url "/tweets" then incr video_codec_tweet_posts;
+    on_success { Social_core.status = 200; headers = []; body = {|{"data":{"id":"tweet_codec_1"}}|} }
+
+  let post_multipart ?headers:_ ~parts _url on_success _on_error =
+    let command =
+      List.find_opt (fun part -> part.Social_core.name = "command") parts
+      |> Option.map (fun p -> p.Social_core.content)
+      |> Option.value ~default:""
+    in
+    let body =
+      match command with
+      | "INIT" -> {|{"data":{"id":"media_codec_1"}}|}
+      | "APPEND" -> {|{"data":{}}|}
+      | "FINALIZE" -> {|{"data":{"id":"media_codec_1","processing_info":{"state":"in_progress","check_after_secs":0}}}|}
+      | _ -> {|{"data":{}}|}
+    in
+    on_success { Social_core.status = 200; headers = []; body }
+
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_video_codec = struct
+  module Http = Mock_http_video_codec
+  let get_env = function
+    | "TWITTER_CLIENT_ID" -> Some "test_client_id"
+    | "TWITTER_CLIENT_SECRET" -> Some "test_client_secret"
+    | "TWITTER_LINK_REDIRECT_URI" -> Some "http://localhost/callback"
+    | _ -> None
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "test_access_token";
+      refresh_token = Some "test_refresh_token";
+      expires_at = Some (rfc3339_in_seconds 4000);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_video_codec = Social_twitter_v2.Make(Mock_config_video_codec)
+
+let test_video_codec_container_failure_mapping () =
+  video_codec_tweet_posts := 0;
+  let result = ref None in
+  Twitter_video_codec.post_single
+    ~account_id:"test_account"
+    ~text:"webm should fail processing"
+    ~media_urls:["https://example.com/unsupported.webm"]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+   | Some (Error_types.Failure err) ->
+       let msg = Error_types.error_to_string err |> String.lowercase_ascii in
+       assert (string_contains msg "media processing failed");
+       assert (string_contains msg "unsupportedformat")
+   | Some _ -> failwith "Expected failure for unsupported codec/container"
+   | None -> failwith "No result in codec/container failure test");
+  assert (!video_codec_tweet_posts = 0);
+  print_endline "✓ Video codec/container failure mapping test passed"
+
+let contract_seen_commands = ref []
+let contract_seen_segments = ref []
+let contract_init_total_bytes = ref None
+let contract_init_media_type = ref None
+let contract_init_media_category = ref None
+let contract_seen_append_media_chunks = ref []
+let contract_tweet_post_count = ref 0
+
+module Mock_http_chunked_contract : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ url on_success _on_error =
+    if String.ends_with ~suffix:".mp4" url then
+      let big_video = String.make ((5 * 1024 * 1024 * 2) + 1024) 'v' in
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "video/mp4")];
+        body = big_video;
+      }
+    else
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"tweet_contract_1"}}|};
+      }
+
+  let post ?headers:_ ?body url on_success _on_error =
+    if string_contains url "/tweets" then begin
+      incr contract_tweet_post_count;
+      (match body with
+       | Some b ->
+           let json = Yojson.Basic.from_string b in
+           let media_ids =
+             json
+             |> Yojson.Basic.Util.member "media"
+             |> Yojson.Basic.Util.member "media_ids"
+             |> Yojson.Basic.Util.to_list
+             |> List.map Yojson.Basic.Util.to_string
+           in
+           assert (media_ids = ["media_contract_1"])
+       | None -> failwith "Expected tweet body for contract test");
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"tweet_contract_1"}}|};
+      }
+    end else
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"media_contract_1"}}|};
+      }
+
+  let post_multipart ?headers:_ ~parts _url on_success _on_error =
+    let get_part name =
+      List.find_opt (fun p -> p.Social_core.name = name) parts
+    in
+    let command =
+      get_part "command"
+      |> Option.map (fun p -> p.Social_core.content)
+      |> Option.value ~default:""
+    in
+    contract_seen_commands := !contract_seen_commands @ [command];
+
+    (match command with
+     | "INIT" ->
+         let total_bytes = get_part "total_bytes" |> Option.map (fun p -> int_of_string p.Social_core.content) in
+         let media_type = get_part "media_type" |> Option.map (fun p -> p.Social_core.content) in
+         let media_category = get_part "media_category" |> Option.map (fun p -> p.Social_core.content) in
+         assert (get_part "media" = None);
+         contract_init_total_bytes := total_bytes;
+         contract_init_media_type := media_type;
+         contract_init_media_category := media_category
+     | "APPEND" ->
+         let seg =
+           get_part "segment_index"
+           |> Option.map (fun p -> int_of_string p.Social_core.content)
+           |> Option.value ~default:(-1)
+         in
+         let media_part =
+           match get_part "media" with
+           | Some p -> p
+           | None -> failwith "APPEND missing media part"
+         in
+         assert (media_part.Social_core.content_type = Some "application/octet-stream");
+         assert (String.length media_part.Social_core.content <= (5 * 1024 * 1024));
+         contract_seen_segments := !contract_seen_segments @ [seg];
+         contract_seen_append_media_chunks :=
+           !contract_seen_append_media_chunks @ [String.length media_part.Social_core.content]
+     | "FINALIZE" ->
+         assert (get_part "media_id" <> None)
+     | _ -> failwith ("Unexpected multipart command: " ^ command));
+
+    let body =
+      match command with
+      | "INIT" -> {|{"data":{"id":"media_contract_1"}}|}
+      | "APPEND" -> {|{"data":{}}|}
+      | "FINALIZE" -> {|{"data":{"id":"media_contract_1"}}|}
+      | _ -> {|{"data":{}}|}
+    in
+    on_success {
+      Social_core.status = 200;
+      headers = [("content-type", "application/json")];
+      body;
+    }
+
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_chunked_contract = struct
+  module Http = Mock_http_chunked_contract
+  let get_env = function
+    | "TWITTER_CLIENT_ID" -> Some "test_client_id"
+    | "TWITTER_CLIENT_SECRET" -> Some "test_client_secret"
+    | "TWITTER_LINK_REDIRECT_URI" -> Some "http://localhost/callback"
+    | _ -> None
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "test_access_token";
+      refresh_token = Some "test_refresh_token";
+      expires_at = Some (rfc3339_in_seconds 3600);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_chunked_contract = Social_twitter_v2.Make(Mock_config_chunked_contract)
+
+let test_chunked_upload_contract_init_append_finalize () =
+  contract_seen_commands := [];
+  contract_seen_segments := [];
+  contract_init_total_bytes := None;
+  contract_init_media_type := None;
+  contract_init_media_category := None;
+  contract_seen_append_media_chunks := [];
+  contract_tweet_post_count := 0;
+
+  let result = ref None in
+  Twitter_chunked_contract.post_single
+    ~account_id:"test_account"
+    ~text:"Chunked contract test"
+    ~media_urls:["https://example.com/contract.mp4"]
+    (fun outcome ->
+      match outcome with
+      | Error_types.Success _ -> result := Some (Ok ())
+      | Error_types.Partial_success _ -> result := Some (Ok ())
+      | Error_types.Failure err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok ()) -> ()
+   | Some (Error err) -> failwith ("Chunked contract test failed: " ^ err)
+   | None -> failwith "No result in chunked contract test");
+
+  assert (!contract_seen_commands = ["INIT"; "APPEND"; "APPEND"; "APPEND"; "FINALIZE"]);
+  assert (!contract_seen_segments = [0; 1; 2]);
+  assert (!contract_init_media_type = Some "video/mp4");
+  assert (!contract_init_media_category = Some "tweet_video");
+  assert (!contract_init_total_bytes = Some ((5 * 1024 * 1024 * 2) + 1024));
+  assert (List.length !contract_seen_append_media_chunks = 3);
+  assert (!contract_tweet_post_count = 1);
+  print_endline "✓ Chunked upload INIT/APPEND/FINALIZE contract test passed"
+
+(* ============================================ *)
+(* NEW TESTS: Upload Mode Selection             *)
+(* ============================================ *)
+
+let upload_mode_simple_calls = ref 0
+let upload_mode_multipart_calls = ref 0
+
+module Mock_http_upload_mode : Social_core.HTTP_CLIENT = struct
+  let get ?headers:_ url on_success _on_error =
+    if String.ends_with ~suffix:".mp4" url then
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "video/mp4")];
+        body = "mock_video_data";
+      }
+    else if String.ends_with ~suffix:".jpg" url then
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "image/jpeg")];
+        body = "mock_image_data";
+      }
+    else if string_contains url "command=STATUS" then
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"media_mode_1","processing_info":{"state":"succeeded"}}}|};
+      }
+    else
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"tweet_mode_1"}}|};
+      }
+
+  let post ?headers:_ ?body:_ url on_success _on_error =
+    if string_contains url "/media/upload" then begin
+      incr upload_mode_simple_calls;
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"media_simple_1"}}|};
+      }
+    end else
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"tweet_mode_1"}}|};
+      }
+
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    incr upload_mode_multipart_calls;
+    on_success {
+      Social_core.status = 200;
+      headers = [("content-type", "application/json")];
+      body = {|{"data":{"id":"media_chunked_1"}}|};
+    }
+
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success {
+      Social_core.status = 200;
+      headers = [];
+      body = {|{"data":{}}|};
+    }
+
+  let delete ?headers:_ _url on_success _on_error =
+    on_success {
+      Social_core.status = 200;
+      headers = [];
+      body = {|{"data":{"deleted":true}}|};
+    }
+end
+
+module Mock_config_upload_mode = struct
+  module Http = Mock_http_upload_mode
+
+  let get_env = function
+    | "TWITTER_CLIENT_ID" -> Some "test_client_id"
+    | "TWITTER_CLIENT_SECRET" -> Some "test_client_secret"
+    | "TWITTER_LINK_REDIRECT_URI" -> Some "http://localhost/callback"
+    | _ -> None
+
+  let get_credentials ~account_id:_ on_success _on_error =
+    let expires_at =
+      Ptime_clock.now () |> fun t ->
+      match Ptime.add_span t (Ptime.Span.of_int_s 3600) with
+      | Some t2 -> Ptime.to_rfc3339 t2
+      | None -> Ptime.to_rfc3339 t
+    in
+    on_success {
+      Social_core.access_token = "test_access_token";
+      refresh_token = Some "test_refresh_token";
+      expires_at = Some expires_at;
+      token_type = "Bearer";
+    }
+
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted_data"
+  let decrypt _data on_success _on_error = on_success {|{"access_token":"test_token","refresh_token":"test_refresh"}|}
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_upload_mode = Social_twitter_v2.Make(Mock_config_upload_mode)
+
+let test_video_uses_chunked_upload_path () =
+  upload_mode_simple_calls := 0;
+  upload_mode_multipart_calls := 0;
+  let result = ref None in
+
+  Twitter_upload_mode.post_single
+    ~account_id:"test_account"
+    ~text:"Video should use chunked upload"
+    ~media_urls:["https://example.com/video.mp4"]
+    (fun outcome ->
+      match outcome with
+      | Error_types.Success tweet_id -> result := Some (Ok tweet_id)
+      | Error_types.Partial_success { result = tweet_id; _ } -> result := Some (Ok tweet_id)
+      | Error_types.Failure err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok _) -> ()
+   | Some (Error err) -> failwith ("Video upload mode test failed: " ^ err)
+   | None -> ());
+
+  assert (!upload_mode_multipart_calls > 0);
+  assert (!upload_mode_simple_calls = 0);
+  print_endline "✓ Video uses chunked upload path test passed"
+
+let test_image_uses_simple_upload_path () =
+  upload_mode_simple_calls := 0;
+  upload_mode_multipart_calls := 0;
+  let result = ref None in
+
+  Twitter_upload_mode.post_single
+    ~account_id:"test_account"
+    ~text:"Image should use simple upload"
+    ~media_urls:["https://example.com/image.jpg"]
+    (fun outcome ->
+      match outcome with
+      | Error_types.Success tweet_id -> result := Some (Ok tweet_id)
+      | Error_types.Partial_success { result = tweet_id; _ } -> result := Some (Ok tweet_id)
+      | Error_types.Failure err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok _) -> ()
+   | Some (Error err) -> failwith ("Image upload mode test failed: " ^ err)
+   | None -> ());
+
+  assert (!upload_mode_simple_calls > 0);
+  assert (!upload_mode_multipart_calls = 0);
+  print_endline "✓ Image uses simple upload path test passed"
+
 (** Run all tests *)
 let () =
   print_endline "===========================================";
@@ -2175,12 +4973,42 @@ let () =
   test_oauth_url_pkce ();
   test_oauth_scopes ();
   test_oauth_state ();
+  test_oauth_state_verification_helper ();
   test_token_exchange ();
   test_token_exchange_with_refresh ();
   test_refresh_token_rotation ();
   test_token_expiry ();
+  test_token_refresh_buffer_boundary ();
   test_pkce_verifier_length ();
   test_oauth_error_handling ();
+  test_health_status_refresh_success ();
+  test_health_status_missing_refresh_token ();
+  test_health_status_refresh_failed ();
+  test_refresh_response_without_refresh_token_preserves_old_token ();
+  test_valid_token_skips_refresh_call ();
+  test_missing_client_credentials_fails_before_refresh_call ();
+  test_refresh_rotation_uses_latest_refresh_token ();
+  test_mixed_payload_data_and_errors_preserved ();
+  test_parse_api_error_preserves_details ();
+  test_parse_api_error_401_maps_token_invalid ();
+  test_parse_api_error_403_forbidden_maps_insufficient_permissions ();
+  test_parse_api_error_403_nonforbidden_maps_api_error ();
+  test_parse_api_error_429_maps_rate_limited ();
+  test_parse_api_error_429_uses_reset_header_retry_after ();
+  test_parse_api_error_500_prefers_detail_then_errors_then_default ();
+  test_parse_api_error_400_duplicate_maps_duplicate_content ();
+  test_parse_api_error_400_invalid_media_maps_api_error ();
+  test_oauth_exchange_code_request_contract ();
+  test_oauth_refresh_request_contract ();
+  test_oauth_exchange_code_deterministic_failure ();
+  test_oauth_redaction_helper ();
+  test_oauth_exchange_failure_redacts_sensitive_response ();
+  test_reply_payload_contract ();
+  test_quote_payload_contract ();
+  test_user_context_uses_bearer_access_token_header ();
+  test_read_unknown_fields_tolerance ();
+  test_read_partial_response_data_null_with_errors ();
+  test_read_5xx_no_automatic_retry_policy ();
   
   (* Tweet operations tests *)
   print_endline "";
@@ -2191,6 +5019,15 @@ let () =
   test_get_tweet_with_expansions ();
   test_search_tweets ();
   test_search_with_fields ();
+  test_get_tweet_query_contract ();
+  test_search_tweets_query_contract ();
+  test_post_single_payload_contract ();
+  test_post_invalid_media_id_end_to_end_mapping ();
+  test_post_network_failure_does_not_retry_tweet_creation ();
+  test_post_too_long_validates_before_api_call ();
+  test_post_response_id_parse_failure_maps_internal_error ();
+  test_validate_media_before_upload_blocks_oversize_image ();
+  test_alt_text_metadata_endpoint_contract ();
   test_thread_posting ();
   test_quote_tweet ();
   test_reply_tweet ();
@@ -2241,6 +5078,8 @@ let () =
   test_get_list_members ();
   test_follow_list ();
   test_unfollow_list ();
+  test_pin_list ();
+  test_unpin_list ();
   test_get_list_tweets ();
   
   (* Pagination tests *)
@@ -2250,6 +5089,7 @@ let () =
   test_pagination_with_next_token ();
   test_pagination_empty_meta ();
   test_pagination_previous_token ();
+  test_pagination_end_to_end_stop_condition ();
   
   (* Rate limit tests *)
   print_endline "";
@@ -2263,6 +5103,7 @@ let () =
   print_endline "";
   print_endline "--- Error Handling Tests ---";
   test_rate_limit_error ();
+  test_rate_limit_error_uses_reset_header_in_flow ();
   test_unauthorized_error ();
   test_forbidden_error ();
   test_not_found_error ();
@@ -2302,6 +5143,15 @@ let () =
   test_chunked_upload_init ();
   test_video_post_with_tweet ();
   test_video_processing_status ();
+  test_video_processing_immediate_success_skips_status_polling ();
+  test_video_processing_pending_then_success_posts_once ();
+  test_video_processing_failed_blocks_post ();
+  test_video_processing_timeout_blocks_post ();
+  test_video_append_interruption_then_manual_retry_recovery ();
+  test_video_codec_container_failure_mapping ();
+  test_video_uses_chunked_upload_path ();
+  test_image_uses_simple_upload_path ();
+  test_chunked_upload_contract_init_append_finalize ();
   
   print_endline "";
   print_endline "===========================================";
@@ -2310,17 +5160,17 @@ let () =
   print_endline "";
   print_endline "Test Coverage Summary:";
   print_endline "  - Content & media validation (7 tests)";
-  print_endline "  - OAuth 2.0 authentication (10 tests)";
+  print_endline "  - OAuth 2.0 authentication (53 tests)";
   print_endline "  - Tweet CRUD operations (9 tests)";
   print_endline "  - Timeline operations (4 tests)";
   print_endline "  - User operations (12 tests)";
   print_endline "  - Engagement operations (6 tests)";
-  print_endline "  - Lists management (10 tests)";
-  print_endline "  - Pagination (4 tests)";
+  print_endline "  - Lists management (12 tests)";
+  print_endline "  - Pagination (5 tests)";
   print_endline "  - Rate limiting (3 tests)";
   print_endline "  - Error handling (6 tests)";
   print_endline "  - Alt-text accessibility (6 tests)";
   print_endline "  - Character counting (9 tests)";
-  print_endline "  - Video upload (7 tests)";
+  print_endline "  - Video upload (16 tests)";
   print_endline "";
-  print_endline "Total: 93 test functions"
+  print_endline "Total: 145 test functions"

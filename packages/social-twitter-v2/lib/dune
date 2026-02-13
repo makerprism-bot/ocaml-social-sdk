@@ -9,6 +9,7 @@
   digestif
   ptime
   ptime.clock.os
+  unix
   uri
   uutf
   str))

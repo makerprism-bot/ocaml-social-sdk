@@ -573,7 +573,7 @@ This implementation supports the following Twitter API v2 endpoints:
 
 ### Media
 - `POST /2/media/upload` - Simple upload (INIT/APPEND/FINALIZE for chunked)
-- `POST /2/media/metadata/create` - Add alt text
+- `POST /2/media/metadata` - Add alt text
 
 ## Architecture
 
@@ -611,6 +611,19 @@ Your implementation now matches or exceeds the feature set of popular Twitter v2
 ```bash
 dune test  # ✅ All tests pass!
 ```
+
+## Conformance Review Artifacts
+
+- `packages/social-twitter-v2/checklist.md` - PR checklist for OAuth/read/post/video conformance review
+- `packages/social-twitter-v2/conformance_matrix.md` - endpoint-by-endpoint parity tracking
+- `packages/social-twitter-v2/deviation_log.md` - deviation triage and fix tracking
+- `packages/social-twitter-v2/test_gap_map.md` - checklist-to-tests coverage and missing test map
+- `packages/social-twitter-v2/implementation_backlog.md` - prioritized implementation batches to close deviations
+- `packages/social-twitter-v2/differential_runtime_report.md` - mock-driven runtime evidence and remaining live-reference steps
+- `packages/social-twitter-v2/live_differential_runbook.md` - executable checklist for live `twurl`/reference parity validation
+- `packages/social-twitter-v2/live_differential_execution_log.md` - fill-in template for recording live parity outcomes
+- `packages/social-twitter-v2/release_readiness_report.md` - readiness snapshot and final external-parity gate status
+- `packages/social-twitter-v2/REFERENCE_IMPLEMENTATIONS.md` - pinned reference SDKs/repos
 
 ## Future Enhancements
 

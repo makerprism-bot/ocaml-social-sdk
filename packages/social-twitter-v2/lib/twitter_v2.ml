@@ -17,6 +17,16 @@ open Social_core
     - TWITTER_REDIRECT_URI: Registered callback URL
 *)
 module OAuth = struct
+  (** Redact sensitive token-like fields from strings used in errors/logging. *)
+  let redact_sensitive_text text =
+    let rules = [
+      (Str.regexp "\"access_token\"[ \t\r\n]*:[ \t\r\n]*\"[^\"]*\"", "\"access_token\":\"[REDACTED]\"");
+      (Str.regexp "\"refresh_token\"[ \t\r\n]*:[ \t\r\n]*\"[^\"]*\"", "\"refresh_token\":\"[REDACTED]\"");
+      (Str.regexp {|Bearer[ 	]+[A-Za-z0-9._~+/=-]+|}, "Bearer [REDACTED]");
+      (Str.regexp {|Basic[ 	]+[A-Za-z0-9._~+/=-]+|}, "Basic [REDACTED]");
+    ] in
+    List.fold_left (fun acc (re, repl) -> Str.global_replace re repl acc) text rules
+
   (** Scope definitions for Twitter API v2 *)
   module Scopes = struct
     (** Scopes required for read-only operations *)
@@ -205,7 +215,7 @@ module OAuth = struct
             with e ->
               on_error (Printf.sprintf "Failed to parse token response: %s" (Printexc.to_string e))
           else
-            on_error (Printf.sprintf "Token exchange failed (%d): %s" response.status response.body))
+            on_error (Printf.sprintf "Token exchange failed (%d): %s" response.status (redact_sensitive_text response.body)))
         on_error
     
     (** Refresh access token using refresh token
@@ -258,7 +268,7 @@ module OAuth = struct
             with e ->
               on_error (Printf.sprintf "Failed to parse token response: %s" (Printexc.to_string e))
           else
-            on_error (Printf.sprintf "Token refresh failed (%d): %s" response.status response.body))
+            on_error (Printf.sprintf "Token refresh failed (%d): %s" response.status (redact_sensitive_text response.body)))
         on_error
     
     (** Revoke a token
@@ -285,7 +295,7 @@ module OAuth = struct
           if response.status >= 200 && response.status < 300 then
             on_success ()
           else
-            on_error (Printf.sprintf "Token revocation failed (%d): %s" response.status response.body))
+            on_error (Printf.sprintf "Token revocation failed (%d): %s" response.status (redact_sensitive_text response.body)))
         on_error
   end
 end
@@ -464,7 +474,15 @@ module Make (Config : CONFIG) = struct
   (** {1 Internal Helpers} *)
   
   (** Parse API error from response *)
-  let parse_api_error ~status_code ~body =
+  let parse_api_error ~status_code ~body ~headers =
+    let contains_sub s sub =
+      let s_l = String.lowercase_ascii s in
+      let sub_l = String.lowercase_ascii sub in
+      try
+        ignore (Str.search_forward (Str.regexp_string sub_l) s_l 0);
+        true
+      with Not_found -> false
+    in
     if status_code = 401 then
       Error_types.Auth_error Error_types.Token_invalid
     else if status_code = 403 then
@@ -472,7 +490,8 @@ module Make (Config : CONFIG) = struct
       (try
         let json = Yojson.Basic.from_string body in
         let detail = json |> Yojson.Basic.Util.member "detail" |> Yojson.Basic.Util.to_string in
-        if String.length detail > 0 && (String.sub detail 0 (min 10 (String.length detail)) = "Forbidden") then
+        let detail_lower = String.lowercase_ascii detail in
+        if String.starts_with ~prefix:"forbidden" detail_lower then
           Error_types.Auth_error (Error_types.Insufficient_permissions ["tweet.write"])
         else
           Error_types.make_api_error
@@ -483,22 +502,45 @@ module Make (Config : CONFIG) = struct
       with _ ->
         Error_types.Auth_error (Error_types.Insufficient_permissions ["tweet.write"]))
     else if status_code = 429 then
-      Error_types.make_rate_limited ()
+      let retry_after_seconds =
+        let now_unix = int_of_float (Unix.time ()) in
+        match List.assoc_opt "x-rate-limit-reset" headers with
+        | Some reset_str ->
+            (try
+               let reset_unix = int_of_string reset_str in
+               max 1 (reset_unix - now_unix)
+             with _ -> 60)
+        | None -> 60
+      in
+      Error_types.make_rate_limited ~retry_after_seconds ()
     else
-      Error_types.make_api_error
-        ~platform:Platform_types.Twitter
-        ~status_code
-        ~message:(try
+      let message =
+        try
           let json = Yojson.Basic.from_string body in
-          let detail = json |> Yojson.Basic.Util.member "detail" |> Yojson.Basic.Util.to_string in
-          if detail <> "" then detail
-          else
-            let errors = json |> Yojson.Basic.Util.member "errors" |> Yojson.Basic.Util.to_list in
-            match errors with
-            | err :: _ -> err |> Yojson.Basic.Util.member "message" |> Yojson.Basic.Util.to_string
-            | [] -> "API error"
-        with _ -> "API error")
-        ~raw_response:body ()
+          let open Yojson.Basic.Util in
+          let detail_opt = json |> member "detail" |> to_string_option in
+          match detail_opt with
+          | Some detail when detail <> "" -> detail
+          | _ ->
+              let errors =
+                try json |> member "errors" |> to_list
+                with _ -> []
+              in
+              (match errors with
+               | err :: _ ->
+                   let msg_opt = err |> member "message" |> to_string_option in
+                   Option.value msg_opt ~default:"API error"
+               | [] -> "API error")
+        with _ -> "API error"
+      in
+      if status_code = 400 && contains_sub message "duplicate" then
+        Error_types.Duplicate_content
+      else
+        Error_types.make_api_error
+          ~platform:Platform_types.Twitter
+          ~status_code
+          ~message
+          ~raw_response:body ()
   
   (** Check if token is expired or expiring soon *)
   let is_token_expired_buffer ~buffer_seconds expires_at_opt =
@@ -552,7 +594,7 @@ module Make (Config : CONFIG) = struct
           with e ->
             on_error (Printf.sprintf "Failed to parse token response: %s" (Printexc.to_string e))
         else
-          on_error (Printf.sprintf "Token refresh failed (%d): %s" response.status response.body))
+          on_error (Printf.sprintf "Token refresh failed (%d): %s" response.status (OAuth.redact_sensitive_text response.body)))
       on_error
   
   (** Ensure valid OAuth 2.0 access token, refreshing if needed *)
@@ -569,29 +611,35 @@ module Make (Config : CONFIG) = struct
                 (fun () -> on_error (Error_types.Auth_error Error_types.Missing_credentials))
                 (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
           | Some refresh_token ->
-              let client_id = Config.get_env "TWITTER_CLIENT_ID" |> Option.value ~default:"" in
-              let client_secret = Config.get_env "TWITTER_CLIENT_SECRET" |> Option.value ~default:"" in
-              
-              refresh_access_token ~client_id ~client_secret ~refresh_token
-                (fun (new_access, new_refresh, expires_at) ->
-                  (* Update stored credentials *)
-                  let updated_creds = {
-                    access_token = new_access;
-                    refresh_token = Some new_refresh;
-                    expires_at = Some expires_at;
-                    token_type = "Bearer";
-                  } in
-                  Config.update_credentials ~account_id ~credentials:updated_creds
-                    (fun () ->
-                      Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
-                        (fun () -> on_success new_access)
-                        (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
-                    (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
-                (fun err ->
-                  Config.update_health_status ~account_id ~status:"refresh_failed" 
-                    ~error_message:(Some err)
-                    (fun () -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err)))
-                    (fun err2 -> on_error (Error_types.Network_error (Error_types.Connection_failed err2))))
+               let client_id = Config.get_env "TWITTER_CLIENT_ID" |> Option.value ~default:"" in
+               let client_secret = Config.get_env "TWITTER_CLIENT_SECRET" |> Option.value ~default:"" in
+               if client_id = "" || client_secret = "" then
+                 let err = "TWITTER_CLIENT_ID or TWITTER_CLIENT_SECRET is missing" in
+                 Config.update_health_status ~account_id ~status:"refresh_failed"
+                   ~error_message:(Some err)
+                   (fun () -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err)))
+                   (fun err2 -> on_error (Error_types.Network_error (Error_types.Connection_failed err2)))
+               else
+                 refresh_access_token ~client_id ~client_secret ~refresh_token
+                   (fun (new_access, new_refresh, expires_at) ->
+                     (* Update stored credentials *)
+                     let updated_creds = {
+                       access_token = new_access;
+                       refresh_token = Some new_refresh;
+                       expires_at = Some expires_at;
+                       token_type = "Bearer";
+                     } in
+                     Config.update_credentials ~account_id ~credentials:updated_creds
+                       (fun () ->
+                         Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
+                           (fun () -> on_success new_access)
+                           (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
+                       (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
+                   (fun err ->
+                     Config.update_health_status ~account_id ~status:"refresh_failed" 
+                       ~error_message:(Some err)
+                       (fun () -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err)))
+                       (fun err2 -> on_error (Error_types.Network_error (Error_types.Connection_failed err2))))
         else
           (* Token still valid *)
           Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
@@ -630,6 +678,119 @@ module Make (Config : CONFIG) = struct
           on_success false)  (* Alt-text failed, but don't block the upload *)
       (fun _err -> 
         on_success false)  (* Network error for alt-text, don't block *)
+
+  type media_processing_status =
+    | Media_processing_succeeded
+    | Media_processing_pending of int option
+    | Media_processing_failed of string
+
+  let parse_media_processing_status json =
+    let open Yojson.Basic.Util in
+    let processing_info_in_data = json |> member "data" |> member "processing_info" in
+    let processing_info =
+      if processing_info_in_data = `Null then json |> member "processing_info"
+      else processing_info_in_data
+    in
+    if processing_info = `Null then
+      Media_processing_succeeded
+    else
+      let state =
+        try processing_info |> member "state" |> to_string |> String.lowercase_ascii
+        with _ -> "succeeded"
+      in
+      match state with
+      | "succeeded" -> Media_processing_succeeded
+      | "failed" ->
+          let err_json = processing_info |> member "error" in
+          let err_msg =
+            if err_json = `Null then "Media processing failed"
+            else
+              let name = try err_json |> member "name" |> to_string with _ -> "" in
+              let message = try err_json |> member "message" |> to_string with _ -> "" in
+              let code =
+                try string_of_int (err_json |> member "code" |> to_int)
+                with _ -> ""
+              in
+              let parts = List.filter (fun s -> s <> "") [name; code; message] in
+              if parts = [] then "Media processing failed" else String.concat " | " parts
+          in
+          Media_processing_failed err_msg
+      | "pending" | "in_progress" ->
+          let check_after_secs =
+            try Some (processing_info |> member "check_after_secs" |> to_int)
+            with _ -> None
+          in
+          Media_processing_pending check_after_secs
+      | _ -> Media_processing_succeeded
+
+  let get_media_processing_status ~access_token ~media_id on_success on_error =
+    let query = Uri.encoded_of_query [
+      ("command", ["STATUS"]);
+      ("media_id", [media_id]);
+    ] in
+    let url = Printf.sprintf "%s/media/upload?%s" twitter_upload_base query in
+    let headers = [
+      ("Authorization", Printf.sprintf "Bearer %s" access_token);
+    ] in
+    Config.Http.get ~headers url
+      (fun response ->
+        if response.status >= 200 && response.status < 300 then
+          try
+            let json = Yojson.Basic.from_string response.body in
+            on_success (parse_media_processing_status json)
+          with e ->
+            on_error (Printf.sprintf "Failed to parse media STATUS response: %s" (Printexc.to_string e))
+        else
+          on_error (Printf.sprintf "Media STATUS check failed (%d): %s" response.status response.body))
+      on_error
+
+  let wait_for_media_processing ~access_token ~media_id ?(max_attempts=20) on_success on_error =
+    let sleep_for_poll_delay seconds =
+      if seconds > 0 then
+        try
+          ignore (Unix.select [] [] [] (float_of_int seconds))
+        with _ -> ()
+    in
+    let rec poll attempt last_check_after_secs =
+      if attempt >= max_attempts then
+        let hint =
+          match last_check_after_secs with
+          | Some secs -> Printf.sprintf " Last check_after_secs=%d." secs
+          | None -> ""
+        in
+        on_error (Printf.sprintf
+          "Media processing timeout for media_id=%s after %d STATUS attempts.%s"
+          media_id max_attempts hint)
+      else
+        get_media_processing_status ~access_token ~media_id
+          (function
+            | Media_processing_succeeded -> on_success ()
+            | Media_processing_failed msg ->
+                on_error (Printf.sprintf "Media processing failed for media_id=%s: %s" media_id msg)
+            | Media_processing_pending check_after_secs ->
+                sleep_for_poll_delay (Option.value ~default:1 check_after_secs);
+                poll (attempt + 1) check_after_secs)
+          on_error
+    in
+    poll 0 None
+
+  let finalize_media_upload_result ~access_token ~media_id ~alt_text on_success =
+    match alt_text with
+    | Some alt when String.length alt > 0 ->
+        update_media_metadata ~access_token ~media_id ~alt_text:alt
+          (fun alt_text_succeeded -> on_success (media_id, not alt_text_succeeded))
+    | _ -> on_success (media_id, false)
+
+  let ensure_media_processing_ready ~access_token ~media_id ~initial_status ~alt_text on_success on_error =
+    match initial_status with
+    | Media_processing_succeeded ->
+        finalize_media_upload_result ~access_token ~media_id ~alt_text on_success
+    | Media_processing_failed msg ->
+        on_error (Printf.sprintf "Media processing failed for media_id=%s: %s" media_id msg)
+    | Media_processing_pending _ ->
+        wait_for_media_processing ~access_token ~media_id
+          (fun () -> finalize_media_upload_result ~access_token ~media_id ~alt_text on_success)
+          on_error
   
   (** Upload media to X API v2 (requires S256 PKCE tokens)
       
@@ -689,14 +850,9 @@ module Make (Config : CONFIG) = struct
                 try json |> Yojson.Basic.Util.member "id" |> Yojson.Basic.Util.to_string
                 with _ -> json |> Yojson.Basic.Util.member "media_id_string" |> Yojson.Basic.Util.to_string
             in
-            (* If alt text provided, update media metadata via POST /2/media/metadata *)
-            (match alt_text with
-            | Some alt when String.length alt > 0 ->
-                update_media_metadata ~access_token ~media_id ~alt_text:alt
-                  (fun alt_text_succeeded -> 
-                    (* Return tuple of (media_id, alt_text_failed) *)
-                    on_success (media_id, not alt_text_succeeded))
-            | _ -> on_success (media_id, false))  (* No alt-text requested, no failure *)
+            let processing_status = parse_media_processing_status json in
+            ensure_media_processing_ready ~access_token ~media_id ~initial_status:processing_status ~alt_text
+              on_success on_error
           with e ->
             on_error (Printf.sprintf "Failed to parse media response: %s\nBody: %s" (Printexc.to_string e) response.body)
         else if response.status = 403 then
@@ -757,13 +913,19 @@ module Make (Config : CONFIG) = struct
                 Config.Http.post_multipart ~headers ~parts:finalize_parts url
                   (fun finalize_response ->
                     if finalize_response.status >= 200 && finalize_response.status < 300 then
-                      (* Optionally add alt text *)
-                      (match alt_text with
-                       | Some text ->
-                           update_media_metadata ~access_token ~media_id:media_id_string ~alt_text:text
-                             (fun alt_text_succeeded -> 
-                               on_success (media_id_string, not alt_text_succeeded))
-                       | None -> on_success (media_id_string, false))
+                      let initial_status =
+                        try
+                          let finalize_json = Yojson.Basic.from_string finalize_response.body in
+                          parse_media_processing_status finalize_json
+                        with _ -> Media_processing_succeeded
+                      in
+                      ensure_media_processing_ready
+                        ~access_token
+                        ~media_id:media_id_string
+                        ~initial_status
+                        ~alt_text
+                        on_success
+                        on_error
                     else
                       on_error (Printf.sprintf "Failed to finalize upload (%d): %s" 
                         finalize_response.status finalize_response.body))
@@ -801,6 +963,12 @@ module Make (Config : CONFIG) = struct
           on_error (Printf.sprintf "Failed to initialize upload (%d): %s" 
             init_response.status init_response.body))
       on_error
+
+  let upload_media_with_mode ~access_token ~media_data ~mime_type ~alt_text on_success on_error =
+    if String.starts_with ~prefix:"video/" mime_type then
+      upload_media_chunked ~access_token ~media_data ~mime_type ~alt_text () on_success on_error
+    else
+      upload_media ~access_token ~media_data ~mime_type ~alt_text on_success on_error
   
   (** Post a single tweet with optional media
       
@@ -900,7 +1068,7 @@ module Make (Config : CONFIG) = struct
                               on_result (Error_types.Failure (Error_types.Validation_error errs))
                           | Ok () ->
                               (* Upload to Twitter - alt text failures become warnings, not errors *)
-                              upload_media ~access_token ~media_data:media_resp.body ~mime_type ~alt_text
+                              upload_media_with_mode ~access_token ~media_data:media_resp.body ~mime_type ~alt_text
                                 (fun (media_id, alt_text_failed) -> 
                                   if alt_text_failed then
                                     accumulated_warnings := Error_types.Alt_text_failed media_id :: !accumulated_warnings;
@@ -954,7 +1122,7 @@ module Make (Config : CONFIG) = struct
                               (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))))
                         else
                           on_result (Error_types.Failure (parse_api_error 
-                            ~status_code:response.status ~body:response.body)))
+                            ~status_code:response.status ~body:response.body ~headers:response.headers)))
                       (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
                         (Error_types.Connection_failed err)))))
                    (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
@@ -1019,7 +1187,7 @@ module Make (Config : CONFIG) = struct
                           (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))))
                     else
                       on_result (Error_types.Failure (parse_api_error 
-                        ~status_code:response.status ~body:response.body)))
+                        ~status_code:response.status ~body:response.body ~headers:response.headers)))
                    (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
                     (Error_types.Connection_failed err)))))
               (fun err -> on_result (Error_types.Failure err))
@@ -1117,7 +1285,7 @@ module Make (Config : CONFIG) = struct
                           failed_at_index = Some (total_requested - List.length texts_remaining);
                           total_requested;
                         } in
-                        let err = parse_api_error ~status_code:response.status ~body:response.body in
+                        let err = parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers in
                         if acc_ids = [] then
                           on_result (Error_types.Failure err)
                         else
@@ -1224,7 +1392,7 @@ module Make (Config : CONFIG) = struct
                           on_result (Error_types.Failure (Error_types.Validation_error errs))
                       | Ok () ->
                           (* Upload with alt text - failures become warnings *)
-                          upload_media ~access_token ~media_data:media_resp.body ~mime_type ~alt_text
+                          upload_media_with_mode ~access_token ~media_data:media_resp.body ~mime_type ~alt_text
                             (fun (media_id, alt_text_failed) -> 
                               if alt_text_failed then
                                 accumulated_warnings := Error_types.Alt_text_failed media_id :: !accumulated_warnings;
@@ -1321,7 +1489,7 @@ module Make (Config : CONFIG) = struct
                               failed_at_index = Some (total_requested - List.length texts_remaining);
                               total_requested;
                             } in
-                            let err = parse_api_error ~status_code:response.status ~body:response.body in
+                            let err = parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers in
                             if acc_ids = [] then
                               on_result (Error_types.Failure err)
                             else
@@ -1397,7 +1565,7 @@ module Make (Config : CONFIG) = struct
               on_result (Error_types.Failure (Error_types.Resource_not_found tweet_id))
             else
               on_result (Error_types.Failure (parse_api_error 
-                ~status_code:response.status ~body:response.body)))
+                ~status_code:response.status ~body:response.body ~headers:response.headers)))
           (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
             (Error_types.Connection_failed err)))))
               (fun err -> on_result (Error_types.Failure err))
@@ -1432,7 +1600,7 @@ module Make (Config : CONFIG) = struct
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse tweet response: %s" (Printexc.to_string e))))
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
   
@@ -1469,7 +1637,7 @@ module Make (Config : CONFIG) = struct
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse search response: %s" (Printexc.to_string e))))
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
   
@@ -1505,7 +1673,7 @@ module Make (Config : CONFIG) = struct
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse timeline response: %s" (Printexc.to_string e))))
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
   
@@ -1535,7 +1703,7 @@ module Make (Config : CONFIG) = struct
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user response: %s" (Printexc.to_string e))))
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
   
@@ -1579,7 +1747,7 @@ module Make (Config : CONFIG) = struct
                       with e ->
                         on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse mentions: %s" (Printexc.to_string e))))
                     else
-                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
@@ -1626,7 +1794,7 @@ module Make (Config : CONFIG) = struct
                       with e ->
                         on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse home timeline: %s" (Printexc.to_string e))))
                     else
-                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
@@ -1658,7 +1826,7 @@ module Make (Config : CONFIG) = struct
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user response: %s" (Printexc.to_string e))))
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
   
@@ -1688,7 +1856,7 @@ module Make (Config : CONFIG) = struct
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user response: %s" (Printexc.to_string e))))
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
   
@@ -1720,7 +1888,7 @@ module Make (Config : CONFIG) = struct
                     if response.status >= 200 && response.status < 300 then
                       on_result (Ok ())
                     else
-                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
@@ -1750,7 +1918,7 @@ module Make (Config : CONFIG) = struct
                     if response.status >= 200 && response.status < 300 then
                       on_result (Ok ())
                     else
-                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
@@ -1783,7 +1951,7 @@ module Make (Config : CONFIG) = struct
                     if response.status >= 200 && response.status < 300 then
                       on_result (Ok ())
                     else
-                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
@@ -1813,7 +1981,7 @@ module Make (Config : CONFIG) = struct
                     if response.status >= 200 && response.status < 300 then
                       on_result (Ok ())
                     else
-                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
@@ -1846,7 +2014,7 @@ module Make (Config : CONFIG) = struct
                     if response.status >= 200 && response.status < 300 then
                       on_result (Ok ())
                     else
-                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
@@ -1876,7 +2044,7 @@ module Make (Config : CONFIG) = struct
                     if response.status >= 200 && response.status < 300 then
                       on_result (Ok ())
                     else
-                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
@@ -1911,7 +2079,7 @@ module Make (Config : CONFIG) = struct
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse followers: %s" (Printexc.to_string e))))
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
   
@@ -1944,7 +2112,7 @@ module Make (Config : CONFIG) = struct
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse following: %s" (Printexc.to_string e))))
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
   
@@ -1978,7 +2146,7 @@ module Make (Config : CONFIG) = struct
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user search: %s" (Printexc.to_string e))))
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
   
@@ -2009,7 +2177,7 @@ module Make (Config : CONFIG) = struct
                     if response.status >= 200 && response.status < 300 then
                       on_result (Ok ())
                     else
-                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
@@ -2039,7 +2207,7 @@ module Make (Config : CONFIG) = struct
                     if response.status >= 200 && response.status < 300 then
                       on_result (Ok ())
                     else
-                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
@@ -2072,7 +2240,7 @@ module Make (Config : CONFIG) = struct
                     if response.status >= 200 && response.status < 300 then
                       on_result (Ok ())
                     else
-                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
@@ -2102,7 +2270,7 @@ module Make (Config : CONFIG) = struct
                     if response.status >= 200 && response.status < 300 then
                       on_result (Ok ())
                     else
-                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
@@ -2141,7 +2309,7 @@ module Make (Config : CONFIG) = struct
                         List.assoc_opt "content-type" media_resp.headers 
                         |> Option.value ~default:"image/jpeg"
                       in
-                      upload_media ~access_token ~media_data:media_resp.body ~mime_type
+                      upload_media_with_mode ~access_token ~media_data:media_resp.body ~mime_type ~alt_text:None
                         (fun (media_id, _alt_text_failed) -> 
                           upload_media_seq rest (media_id :: acc) on_complete on_err)
                         on_err)
@@ -2223,7 +2391,7 @@ module Make (Config : CONFIG) = struct
                         List.assoc_opt "content-type" media_resp.headers 
                         |> Option.value ~default:"image/jpeg"
                       in
-                      upload_media ~access_token ~media_data:media_resp.body ~mime_type
+                      upload_media_with_mode ~access_token ~media_data:media_resp.body ~mime_type ~alt_text:None
                         (fun (media_id, _alt_text_failed) -> 
                           upload_media_seq rest (media_id :: acc) on_complete on_err)
                         on_err)
@@ -2300,7 +2468,7 @@ module Make (Config : CONFIG) = struct
                     if response.status >= 200 && response.status < 300 then
                       on_result (Ok ())
                     else
-                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
@@ -2330,7 +2498,7 @@ module Make (Config : CONFIG) = struct
                     if response.status >= 200 && response.status < 300 then
                       on_result (Ok ())
                     else
-                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                      on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
                   (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user ID: %s" (Printexc.to_string e))))))
@@ -2367,7 +2535,7 @@ module Make (Config : CONFIG) = struct
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse list response: %s" (Printexc.to_string e))))
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
   
@@ -2411,7 +2579,7 @@ module Make (Config : CONFIG) = struct
                 with e ->
                   on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse list response: %s" (Printexc.to_string e))))
               else
-                on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
             (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
   
@@ -2440,7 +2608,7 @@ module Make (Config : CONFIG) = struct
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse delete response: %s" (Printexc.to_string e))))
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
   
@@ -2470,7 +2638,7 @@ module Make (Config : CONFIG) = struct
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse list response: %s" (Printexc.to_string e))))
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
   
@@ -2492,7 +2660,7 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               on_result (Ok ())
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
   
@@ -2510,7 +2678,7 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               on_result (Ok ())
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
   
@@ -2543,7 +2711,7 @@ module Make (Config : CONFIG) = struct
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse members: %s" (Printexc.to_string e))))
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
   
@@ -2643,7 +2811,7 @@ module Make (Config : CONFIG) = struct
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse list tweets: %s" (Printexc.to_string e))))
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
   
@@ -2767,6 +2935,10 @@ module Make (Config : CONFIG) = struct
       ~state 
       ~code_challenge 
       ()
+
+  (** Verify OAuth callback state against expected state for CSRF protection. *)
+  let verify_oauth_state ~expected_state ~returned_state =
+    String.equal expected_state returned_state
   
   (** Exchange authorization code for access token
       
@@ -2801,6 +2973,6 @@ module Make (Config : CONFIG) = struct
           with e ->
             on_error (Printf.sprintf "Failed to parse token response: %s" (Printexc.to_string e))
         else
-          on_error (Printf.sprintf "Token exchange failed (%d): %s" response.status response.body))
+          on_error (Printf.sprintf "Token exchange failed (%d): %s" response.status (OAuth.redact_sensitive_text response.body)))
       on_error
 end

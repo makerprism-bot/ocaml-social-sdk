@@ -10,6 +10,10 @@ let string_contains s substr =
     true
   with Not_found -> false
 
+let find_header headers name =
+  List.find_opt (fun (k, _) -> String.lowercase_ascii k = String.lowercase_ascii name) headers
+  |> Option.map snd
+
 (** Helper to handle outcome results in tests *)
 let handle_outcome on_success on_error outcome =
   match outcome with
@@ -184,8 +188,72 @@ let test_token_exchange () =
       assert (creds.refresh_token = Some "new_refresh_token_456");
       assert (creds.token_type = "Bearer");
       assert (creds.expires_at <> None);
+      let requests = !Mock_http.requests in
+      (match requests with
+      | ("POST", url, headers, body) :: _ ->
+          assert (string_contains url "/oauth/v2/accessToken");
+          assert (not (string_contains url "grant_type="));
+          assert (find_header headers "Content-Type" = Some "application/x-www-form-urlencoded");
+          assert (string_contains body "grant_type=authorization_code");
+          assert (string_contains body "code=test_code");
+          assert (string_contains body "redirect_uri=")
+      | _ -> failwith "Expected OAuth token exchange POST request");
       print_endline "✓ Token exchange")
     (fun err -> failwith ("Token exchange failed: " ^ err))
+
+(** Test: OAuth URL rejects state with surrounding whitespace *)
+let test_oauth_url_rejects_whitespace_state () =
+  Mock_config.reset ();
+  Mock_config.set_env "LINKEDIN_CLIENT_ID" "test_client_id";
+  LinkedIn.get_oauth_url ~redirect_uri:"https://example.com/callback" ~state:" state "
+    (fun _ -> failwith "Expected whitespace state rejection")
+    (fun err ->
+      assert (string_contains err "state");
+      print_endline "✓ OAuth URL rejects whitespace state")
+
+(** Test: OAuth URL rejects redirect URI mismatch with configured value *)
+let test_oauth_url_rejects_redirect_mismatch () =
+  Mock_config.reset ();
+  Mock_config.set_env "LINKEDIN_CLIENT_ID" "test_client_id";
+  Mock_config.set_env "LINKEDIN_REDIRECT_URI" "https://example.com/callback";
+  LinkedIn.get_oauth_url ~redirect_uri:"https://example.com/other" ~state:"ok-state"
+    (fun _ -> failwith "Expected configured redirect mismatch rejection")
+    (fun err ->
+      assert (string_contains err "LINKEDIN_REDIRECT_URI");
+      print_endline "✓ OAuth URL rejects configured redirect mismatch")
+
+(** Test: exchange_code rejects whitespace in authorization code *)
+let test_exchange_code_rejects_whitespace_code () =
+  Mock_config.reset ();
+  Mock_config.set_env "LINKEDIN_CLIENT_ID" "test_client";
+  Mock_config.set_env "LINKEDIN_CLIENT_SECRET" "test_secret";
+  LinkedIn.exchange_code ~code:" code " ~redirect_uri:"https://example.com/callback"
+    (fun _ -> failwith "Expected whitespace code rejection")
+    (fun err ->
+      assert (string_contains err "authorization code");
+      print_endline "✓ exchange_code rejects whitespace code")
+
+(** Test: validate_oauth_state succeeds on exact match *)
+let test_validate_oauth_state_success () =
+  LinkedIn.validate_oauth_state ~expected:"abc123" ~received:"abc123"
+    (fun () -> print_endline "✓ validate_oauth_state success")
+    (fun err -> failwith ("Unexpected validate_oauth_state failure: " ^ err))
+
+(** Test: validate_oauth_state rejects mismatch *)
+let test_validate_oauth_state_mismatch () =
+  LinkedIn.validate_oauth_state ~expected:"abc123" ~received:"xyz999"
+    (fun () -> failwith "Expected validate_oauth_state mismatch")
+    (fun err ->
+      assert (string_contains err "mismatch");
+      print_endline "✓ validate_oauth_state mismatch rejected")
+
+(** Test: validate_oauth_state rejects whitespace *)
+let test_validate_oauth_state_whitespace_rejected () =
+  LinkedIn.validate_oauth_state ~expected:" abc123 " ~received:" abc123 "
+    (fun () -> failwith "Expected validate_oauth_state whitespace rejection")
+    (fun err ->
+      assert (string_contains err "whitespace");
+      print_endline "✓ validate_oauth_state whitespace rejected")
 
 (** Test: Get person URN *)
 let test_get_person_urn () =
@@ -204,6 +272,175 @@ let test_get_person_urn () =
       assert (person_urn = "urn:li:person:abc123xyz");
       print_endline "✓ Get person URN")
     (fun err -> failwith ("Get person URN failed: " ^ err))
+
+(** Test: Get person URN rejects malformed subject identifier *)
+let test_get_person_urn_rejects_malformed_subject () =
+  Mock_config.reset ();
+
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"sub":"bad,user"}|};
+    headers = [];
+  };
+
+  LinkedIn.get_person_urn ~access_token:"test_token"
+    (fun _ -> failwith "Expected malformed subject rejection")
+    (fun err ->
+      assert (string_contains err "person URN");
+      assert (string_contains err "invalid characters");
+      print_endline "✓ Get person URN rejects malformed subject")
+
+(** Test: Get person URN rejects subject with surrounding whitespace *)
+let test_get_person_urn_rejects_whitespace_subject () =
+  Mock_config.reset ();
+
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"sub":" abc123 "}|};
+    headers = [];
+  };
+
+  LinkedIn.get_person_urn ~access_token:"test_token"
+    (fun _ -> failwith "Expected whitespace subject rejection")
+    (fun err ->
+      assert (string_contains err "subject identifier");
+      assert (string_contains err "whitespace");
+      print_endline "✓ Get person URN rejects whitespace subject")
+
+(** Test: Get person URN rejects empty subject identifier *)
+let test_get_person_urn_rejects_empty_subject () =
+  Mock_config.reset ();
+
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"sub":""}|};
+    headers = [];
+  };
+
+  LinkedIn.get_person_urn ~access_token:"test_token"
+    (fun _ -> failwith "Expected empty subject rejection")
+    (fun err ->
+      assert (string_contains err "empty subject identifier");
+      print_endline "✓ Get person URN rejects empty subject")
+
+(** Test: Get person URN error response redacts sensitive fields *)
+let test_get_person_urn_error_redaction () =
+  Mock_config.reset ();
+
+  Mock_http.set_response {
+    status = 500;
+    body = {|{"message":"backend failed","access_token":"leak-me"}|};
+    headers = [];
+  };
+
+  LinkedIn.get_person_urn ~access_token:"test_token"
+    (fun _ -> failwith "Expected person URN failure")
+    (fun err ->
+      assert (string_contains err "Failed to get person URN (500)");
+      assert (string_contains err "backend failed");
+      assert (not (string_contains err "leak-me"));
+      print_endline "✓ Get person URN error redaction")
+
+(** Test: Get person URN non-JSON error body is not leaked *)
+let test_get_person_urn_non_json_error_redaction () =
+  Mock_config.reset ();
+
+  Mock_http.set_response {
+    status = 500;
+    body = "backend exploded access_token=leak-me";
+    headers = [];
+  };
+
+  LinkedIn.get_person_urn ~access_token:"test_token"
+    (fun _ -> failwith "Expected person URN failure")
+    (fun err ->
+      assert (string_contains err "Failed to get person URN (500)");
+      assert (not (string_contains err "leak-me"));
+      print_endline "✓ Get person URN non-JSON error redaction")
+
+(** Test: Get person URN rejects response missing subject *)
+let test_get_person_urn_missing_subject () =
+  Mock_config.reset ();
+
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"name":"No Subject"}|};
+    headers = [];
+  };
+
+  LinkedIn.get_person_urn ~access_token:"test_token"
+    (fun _ -> failwith "Expected missing subject rejection")
+    (fun err ->
+      assert (string_contains err "Failed to parse person URN");
+      print_endline "✓ Get person URN rejects missing subject")
+
+(** Test: Get person URN rejects malformed JSON payload *)
+let test_get_person_urn_malformed_json () =
+  Mock_config.reset ();
+
+  Mock_http.set_response {
+    status = 200;
+    body = "not-json";
+    headers = [];
+  };
+
+  LinkedIn.get_person_urn ~access_token:"test_token"
+    (fun _ -> failwith "Expected malformed JSON rejection")
+    (fun err ->
+      assert (string_contains err "Failed to parse person URN");
+      print_endline "✓ Get person URN rejects malformed JSON")
+
+(** Test: Get person URN 403 returns scope hint message *)
+let test_get_person_urn_insufficient_permissions_message () =
+  Mock_config.reset ();
+
+  Mock_http.set_response {
+    status = 403;
+    body = {|{"message":"Not enough permissions"}|};
+    headers = [];
+  };
+
+  LinkedIn.get_person_urn ~access_token:"test_token"
+    (fun _ -> failwith "Expected person URN permission failure")
+    (fun err ->
+      assert (string_contains err "Failed to get person URN (403)");
+      assert (string_contains err "openid");
+      assert (string_contains err "profile");
+      print_endline "✓ Get person URN 403 scope hint")
+
+(** Test: Get person URN 401 returns auth hint message *)
+let test_get_person_urn_auth_failure_message () =
+  Mock_config.reset ();
+
+  Mock_http.set_response {
+    status = 401;
+    body = {|{"message":"Invalid access token"}|};
+    headers = [];
+  };
+
+  LinkedIn.get_person_urn ~access_token:"test_token"
+    (fun _ -> failwith "Expected person URN auth failure")
+    (fun err ->
+      assert (string_contains err "Failed to get person URN (401)");
+      assert (string_contains err "authentication failed");
+      print_endline "✓ Get person URN 401 auth hint")
+
+(** Test: Get person URN 429 returns rate-limit hint message *)
+let test_get_person_urn_rate_limited_message () =
+  Mock_config.reset ();
+
+  Mock_http.set_response {
+    status = 429;
+    body = {|{"message":"Rate limit exceeded"}|};
+    headers = [];
+  };
+
+  LinkedIn.get_person_urn ~access_token:"test_token"
+    (fun _ -> failwith "Expected person URN rate-limit failure")
+    (fun err ->
+      assert (string_contains err "Failed to get person URN (429)");
+      assert (string_contains err "rate limited");
+      print_endline "✓ Get person URN 429 rate-limit hint")
 
 (** Test: Register upload *)
 let test_register_upload () =
@@ -273,8 +510,32 @@ let test_token_refresh_partner () =
     (fun (access, refresh, _expires) ->
       assert (access = "refreshed_token");
       assert (refresh = "new_refresh_token");
+      let requests = !Mock_http.requests in
+      (match requests with
+      | ("POST", url, headers, body) :: _ ->
+          assert (string_contains url "/oauth/v2/accessToken");
+          assert (find_header headers "Content-Type" = Some "application/x-www-form-urlencoded");
+          assert (string_contains body "grant_type=refresh_token");
+          assert (string_contains body "refresh_token=old_refresh")
+      | _ -> failwith "Expected refresh_access_token POST request");
       print_endline "✓ Token refresh (partner)")
     (fun err -> failwith ("Token refresh failed: " ^ err))
+
+(** Test: Token refresh rejects whitespace refresh token *)
+let test_token_refresh_rejects_whitespace () =
+  Mock_config.reset ();
+  Mock_config.set_env "LINKEDIN_CLIENT_ID" "test_client";
+  Mock_config.set_env "LINKEDIN_CLIENT_SECRET" "test_secret";
+  Mock_config.set_env "LINKEDIN_ENABLE_PROGRAMMATIC_REFRESH" "true";
+
+  LinkedIn.refresh_access_token
+    ~client_id:"test_client"
+    ~client_secret:"test_secret"
+    ~refresh_token:" old_refresh "
+    (fun _ -> failwith "Expected whitespace refresh token rejection")
+    (fun err ->
+      assert (string_contains err "whitespace");
+      print_endline "✓ Token refresh rejects whitespace refresh token")
 
 (** Test: Token refresh disabled (standard app) *)
 let test_token_refresh_standard () =
@@ -364,6 +625,112 @@ let test_get_profile () =
         print_endline "✓ Get profile")
       (fun err -> failwith ("Get profile failed: " ^ err)))
 
+(** Test: get_profile maps 403 to profile scope *)
+let test_get_profile_insufficient_permissions_error () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response { status = 403; body = {|{"message":"Not enough permissions"}|}; headers = [] };
+
+  LinkedIn.get_profile ~account_id:"test_account"
+    (fun result ->
+      match result with
+      | Error (Error_types.Auth_error (Error_types.Insufficient_permissions scopes)) ->
+          assert (List.mem "openid" scopes);
+          assert (List.mem "profile" scopes);
+          print_endline "✓ Get profile maps 403 to OpenID profile scopes"
+      | Ok _ -> failwith "Expected permission error"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: API error raw response redacts sensitive JSON fields *)
+let test_api_error_redacts_sensitive_json () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 500;
+    headers = [];
+    body = "{\"message\":\"backend failed\",\"access_token\":\"leak-me\"}";
+  };
+
+  LinkedIn.get_profile ~account_id:"test_account"
+    (function
+      | Ok _ -> failwith "Expected API error"
+      | Error (Error_types.Api_error api_err) ->
+          (match api_err.raw_response with
+           | Some body ->
+               assert (string_contains body "[REDACTED]");
+               assert (not (string_contains body "leak-me"));
+               print_endline "✓ API error redacts sensitive JSON fields"
+           | None -> failwith "Expected raw_response in API error")
+      | Error err ->
+          failwith ("Expected Api_error, got: " ^ Error_types.error_to_string err))
+
+(** Test: API error raw response redacts non-JSON body *)
+let test_api_error_redacts_non_json () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 500;
+    headers = [];
+    body = "backend exploded access_token=leak-me";
+  };
+
+  LinkedIn.get_profile ~account_id:"test_account"
+    (function
+      | Ok _ -> failwith "Expected API error"
+      | Error (Error_types.Api_error api_err) ->
+          (match api_err.raw_response with
+           | Some body ->
+               assert (body = "[REDACTED_NON_JSON_ERROR_BODY]");
+               print_endline "✓ API error redacts non-JSON body"
+           | None -> failwith "Expected raw_response in API error")
+      | Error err ->
+          failwith ("Expected Api_error, got: " ^ Error_types.error_to_string err))
+
 (** Test: Get posts with pagination *)
 let test_get_posts () =
   Mock_config.reset ();
@@ -415,11 +782,18 @@ let test_get_posts () =
   LinkedIn.get_posts ~account_id:"test_account" ~start:0 ~count:10
     (fun result ->
       match result with
-      | Ok collection ->
+        | Ok collection ->
           assert (List.length collection.elements = 1);
           let post = List.hd collection.elements in
           assert (post.id = "urn:li:share:123");
           assert (post.text = Some "Test post");
+          let requests = List.rev !Mock_http.requests in
+          (match requests with
+          | _ :: (_, posts_url, headers, _) :: _ ->
+              assert (string_contains posts_url "q=authors");
+              assert (string_contains posts_url "authors=List" || string_contains posts_url "authors=List%28");
+              assert (find_header headers "X-RestLi-Method" = Some "FINDER")
+          | _ -> failwith "Expected userinfo + posts requests");
           (match collection.paging with
           | Some p -> 
               assert (p.start = 0);
@@ -428,6 +802,142 @@ let test_get_posts () =
           | None -> failwith "Expected paging metadata");
           print_endline "✓ Get posts with pagination"
       | Error err -> failwith ("Get posts failed: " ^ Error_types.error_to_string err))
+
+(** Test: get_posts rejects malformed resolved person URN *)
+let test_get_posts_rejects_malformed_person_urn () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response { status = 200; body = {|{"sub":"user,123"}|}; headers = [] };
+
+  LinkedIn.get_posts ~account_id:"test_account"
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "person URN");
+          assert (string_contains msg "invalid characters");
+          let requests = List.rev !Mock_http.requests in
+          assert (List.length requests = 1);
+          print_endline "✓ Get posts rejects malformed resolved person URN"
+      | Ok _ -> failwith "Expected malformed person URN rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: get_posts normalizes negative start and caps count to 50 *)
+let test_get_posts_pagination_normalization () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  let person_response = {|{"sub":"user123"}|} in
+  let posts_response = {|{"elements": [], "paging": {"start": 0, "count": 0, "total": 0}}|} in
+  Mock_http.set_responses [
+    { status = 200; body = person_response; headers = [] };
+    { status = 200; body = posts_response; headers = [] };
+  ];
+
+  LinkedIn.get_posts ~account_id:"test_account" ~start:(-10) ~count:999
+    (handle_result
+      (fun _collection ->
+        let requests = List.rev !Mock_http.requests in
+        (match requests with
+        | _ :: (_, url, _, _) :: _ ->
+            assert (string_contains url "start=0");
+            assert (string_contains url "count=50");
+            print_endline "✓ Get posts pagination normalization"
+        | _ -> failwith "Expected userinfo + posts requests"))
+      (fun err -> failwith ("Get posts normalization failed: " ^ err)))
+
+(** Test: get_posts maps 429 to Rate_limited *)
+let test_get_posts_rate_limited_error () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_responses [
+    { status = 200; body = {|{"sub":"user123"}|}; headers = [] };
+    { status = 429; body = {|{"message":"Rate limit exceeded","serviceErrorCode":42901}|}; headers = [] };
+  ];
+
+  LinkedIn.get_posts ~account_id:"test_account"
+    (fun result ->
+      match result with
+      | Error (Error_types.Rate_limited _) ->
+          print_endline "✓ Get posts maps 429 to rate limited"
+      | Ok _ -> failwith "Expected rate-limited error"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: get_posts maps 403 to insufficient permissions *)
+let test_get_posts_insufficient_permissions_error () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_responses [
+    { status = 200; body = {|{"sub":"user123"}|}; headers = [] };
+    { status = 403; body = {|{"message":"Not enough permissions"}|}; headers = [] };
+  ];
+
+  LinkedIn.get_posts ~account_id:"test_account"
+    (fun result ->
+      match result with
+      | Error (Error_types.Auth_error (Error_types.Insufficient_permissions scopes)) ->
+          assert (List.mem "r_member_social" scopes);
+          print_endline "✓ Get posts maps 403 to insufficient permissions"
+      | Ok _ -> failwith "Expected permission error"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
 
 (** Test: Batch get posts *)
 let test_batch_get_posts () =
@@ -485,6 +995,104 @@ let test_batch_get_posts () =
         print_endline "✓ Batch get posts")
       (fun err -> failwith ("Batch get posts failed: " ^ err)))
 
+(** Test: Batch get posts rejects malformed URNs for Rest.li list encoding *)
+let test_batch_get_posts_rejects_malformed_urns () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+
+  LinkedIn.batch_get_posts
+    ~account_id:"test_account"
+    ~post_urns:["urn:li:share:123,urn:li:share:456"]
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "Invalid post URN");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Batch get posts rejects malformed URNs"
+      | Ok _ -> failwith "Expected malformed URN rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: Batch get posts handles malformed JSON payload *)
+let test_batch_get_posts_malformed_json () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response { status = 200; body = "not-json"; headers = [] };
+
+  LinkedIn.batch_get_posts
+    ~account_id:"test_account"
+    ~post_urns:["urn:li:share:123"]
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "Failed to parse batch results");
+          print_endline "✓ Batch get posts malformed JSON handling"
+      | Ok _ -> failwith "Expected parse error"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: batch_get_posts maps 403 to read scope *)
+let test_batch_get_posts_insufficient_permissions_error () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 403;
+    headers = [];
+    body = {|{"message":"Not enough permissions"}|};
+  };
+
+  LinkedIn.batch_get_posts ~account_id:"test_account" ~post_urns:["urn:li:share:123"]
+    (fun result ->
+      match result with
+      | Error (Error_types.Auth_error (Error_types.Insufficient_permissions scopes)) ->
+          assert (List.mem "r_member_social" scopes);
+          print_endline "✓ Batch get posts maps 403 to read scope"
+      | Ok _ -> failwith "Expected permission error"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
 (** Test: Posts scroller *)
 let test_posts_scroller () =
   Mock_config.reset ();
@@ -527,6 +1135,407 @@ let test_posts_scroller () =
         print_endline "✓ Posts scroller")
       (fun err -> failwith ("Posts scroller failed: " ^ err)))
 
+(** Test: Posts scroller scroll_back returns previous page after multiple nexts *)
+let test_posts_scroller_back_from_second_page () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+
+  let userinfo = {|{"sub":"user123"}|} in
+  let page0 = {|{"elements":[{"id":"p1","author":"urn:li:person:user123","lifecycleState":"PUBLISHED"}],"paging":{"start":0,"count":1,"total":3}}|} in
+  let page1 = {|{"elements":[{"id":"p2","author":"urn:li:person:user123","lifecycleState":"PUBLISHED"}],"paging":{"start":1,"count":1,"total":3}}|} in
+  let page_back = page1 in
+
+  Mock_http.set_responses [
+    { status = 200; body = userinfo; headers = [] };
+    { status = 200; body = page0; headers = [] };
+    { status = 200; body = userinfo; headers = [] };
+    { status = 200; body = page1; headers = [] };
+    { status = 200; body = userinfo; headers = [] };
+    { status = 200; body = page_back; headers = [] };
+  ];
+
+  let scroller = LinkedIn.create_posts_scroller ~account_id:"test_account" ~page_size:1 () in
+  scroller.scroll_next (handle_result (fun _ -> ()) (fun err -> failwith ("Posts first page failed: " ^ err)));
+  scroller.scroll_next (handle_result (fun _ -> ()) (fun err -> failwith ("Posts second page failed: " ^ err)));
+  scroller.scroll_back
+    (handle_result
+      (fun page ->
+        assert (List.length page.elements = 1);
+        let requests = List.rev !Mock_http.requests in
+        let posts_requests = List.filter (fun (m, u, _, _) -> m = "GET" && string_contains u "ugcPosts?") requests in
+        (match posts_requests with
+        | _ :: _ :: (_, back_url, _, _) :: _ ->
+            assert (string_contains back_url "start=1");
+            print_endline "✓ Posts scroller back from second page"
+        | _ -> failwith "Expected at least three ugcPosts requests"))
+      (fun err -> failwith ("Posts scroll_back failed: " ^ err)))
+
+(** Test: Posts scroller preserves position when scroll_back fails *)
+let test_posts_scroller_back_error_preserves_position () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+
+  let userinfo = {|{"sub":"user123"}|} in
+  let page0 = {|{"elements":[{"id":"p1","author":"urn:li:person:user123","lifecycleState":"PUBLISHED"}],"paging":{"start":0,"count":1,"total":3}}|} in
+  Mock_http.set_responses [
+    { status = 200; body = userinfo; headers = [] };
+    { status = 200; body = page0; headers = [] };
+    { status = 500; body = {|{"message":"boom"}|}; headers = [] };
+  ];
+
+  let scroller = LinkedIn.create_posts_scroller ~account_id:"test_account" ~page_size:1 () in
+  scroller.scroll_next (handle_result (fun _ -> ()) (fun err -> failwith ("Posts first page failed: " ^ err)));
+  assert (scroller.current_position () = 1);
+  scroller.scroll_back
+    (fun result ->
+      match result with
+      | Error _ ->
+          assert (scroller.current_position () = 1);
+          print_endline "✓ Posts scroller back error preserves position"
+      | Ok _ -> failwith "Expected scroll_back failure")
+
+(** Test: Search scroller with explicit author filter *)
+let test_search_scroller_with_author () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+
+  let page1 = {|{
+    "elements": [{"id": "s1", "author": "urn:li:person:user1", "lifecycleState": "PUBLISHED"}],
+    "paging": {"start": 0, "count": 1, "total": 2}
+  }|} in
+  let page2 = {|{
+    "elements": [{"id": "s1", "author": "urn:li:person:user1", "lifecycleState": "PUBLISHED"}],
+    "paging": {"start": 0, "count": 1, "total": 2}
+  }|} in
+  Mock_http.set_responses [
+    { status = 200; body = page1; headers = [] };
+    { status = 200; body = page2; headers = [] };
+  ];
+
+  let scroller = LinkedIn.create_search_scroller
+    ~account_id:"test_account"
+    ~author:"urn:li:person:user1"
+    ~page_size:1
+    ()
+  in
+
+  scroller.scroll_next
+    (handle_result
+      (fun collection ->
+        assert (List.length collection.elements = 1);
+        assert (scroller.current_position () = 1);
+        assert (scroller.has_more () = true);
+        scroller.scroll_back
+          (handle_result
+            (fun back_page ->
+              assert (List.length back_page.elements = 1);
+              assert (scroller.current_position () = 1);
+              let requests = List.rev !Mock_http.requests in
+              (match requests with
+              | (_method1, url1, headers1, _) :: (_method2, url2, headers2, _) :: _ ->
+                  assert (string_contains url1 "q=authors");
+                  assert (string_contains url2 "q=authors");
+                  assert (find_header headers1 "X-RestLi-Method" = Some "FINDER");
+                  assert (find_header headers2 "X-RestLi-Method" = Some "FINDER")
+              | _ -> failwith "Expected two finder requests for search scroller");
+              print_endline "✓ Search scroller with author")
+            (fun err -> failwith ("Search scroller back failed: " ^ err)))
+      )
+      (fun err -> failwith ("Search scroller next failed: " ^ err)))
+
+(** Test: Search scroller scroll_back returns previous page after multiple nexts *)
+let test_search_scroller_back_from_second_page () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+
+  let page0 = {|{"elements":[{"id":"s1","author":"urn:li:person:user1","lifecycleState":"PUBLISHED"}],"paging":{"start":0,"count":1,"total":3}}|} in
+  let page1 = {|{"elements":[{"id":"s2","author":"urn:li:person:user1","lifecycleState":"PUBLISHED"}],"paging":{"start":1,"count":1,"total":3}}|} in
+  let page_back = page1 in
+
+  Mock_http.set_responses [
+    { status = 200; body = page0; headers = [] };
+    { status = 200; body = page1; headers = [] };
+    { status = 200; body = page_back; headers = [] };
+  ];
+
+  let scroller = LinkedIn.create_search_scroller
+    ~account_id:"test_account"
+    ~author:"urn:li:person:user1"
+    ~page_size:1
+    ()
+  in
+
+  scroller.scroll_next (handle_result (fun _ -> ()) (fun err -> failwith ("Search first page failed: " ^ err)));
+  scroller.scroll_next (handle_result (fun _ -> ()) (fun err -> failwith ("Search second page failed: " ^ err)));
+  scroller.scroll_back
+    (handle_result
+      (fun page ->
+        assert (List.length page.elements = 1);
+        let requests = List.rev !Mock_http.requests in
+        match requests with
+        | _ :: _ :: (_, back_url, _, _) :: _ ->
+            assert (string_contains back_url "start=1");
+            print_endline "✓ Search scroller back from second page"
+        | _ -> failwith "Expected at least three search requests")
+      (fun err -> failwith ("Search scroll_back failed: " ^ err)))
+
+(** Test: Search scroller preserves position when scroll_back fails *)
+let test_search_scroller_back_error_preserves_position () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+
+  let page0 = {|{"elements":[{"id":"s1","author":"urn:li:person:user1","lifecycleState":"PUBLISHED"}],"paging":{"start":0,"count":1,"total":3}}|} in
+  Mock_http.set_responses [
+    { status = 200; body = page0; headers = [] };
+    { status = 500; body = {|{"message":"boom"}|}; headers = [] };
+  ];
+
+  let scroller = LinkedIn.create_search_scroller
+    ~account_id:"test_account"
+    ~author:"urn:li:person:user1"
+    ~page_size:1
+    ()
+  in
+
+  scroller.scroll_next (handle_result (fun _ -> ()) (fun err -> failwith ("Search first page failed: " ^ err)));
+  assert (scroller.current_position () = 1);
+  scroller.scroll_back
+    (fun result ->
+      match result with
+      | Error _ ->
+          assert (scroller.current_position () = 1);
+          print_endline "✓ Search scroller back error preserves position"
+      | Ok _ -> failwith "Expected scroll_back failure")
+
+(** Test: Search scroller propagates keyword-search rejection *)
+let test_search_scroller_rejects_keywords () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+
+  let scroller = LinkedIn.create_search_scroller
+    ~account_id:"test_account"
+    ~keywords:"ocaml"
+    ~page_size:5
+    ()
+  in
+
+  scroller.scroll_next
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "does not support keyword finder search");
+          assert (scroller.current_position () = 0);
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Search scroller rejects unsupported keyword finder"
+      | Ok _ -> failwith "Expected keyword search rejection in scroller"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: Search scroller without author uses current member URN *)
+let test_search_scroller_defaults_to_current_author () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+
+  let person_response = {|{"sub":"user123"}|} in
+  let page = {|{
+    "elements": [{"id": "s1", "author": "urn:li:person:user123", "lifecycleState": "PUBLISHED"}],
+    "paging": {"start": 0, "count": 1, "total": 1}
+  }|} in
+  Mock_http.set_responses [
+    { status = 200; body = person_response; headers = [] };
+    { status = 200; body = page; headers = [] };
+  ];
+
+  let scroller = LinkedIn.create_search_scroller ~account_id:"test_account" ~page_size:1 () in
+
+  scroller.scroll_next
+    (handle_result
+      (fun collection ->
+        assert (List.length collection.elements = 1);
+        let requests = List.rev !Mock_http.requests in
+        (match requests with
+        | (_m1, url1, _h1, _) :: (_m2, url2, headers2, _) :: _ ->
+            assert (string_contains url1 "userinfo");
+            assert (string_contains url2 "q=authors");
+            assert (string_contains url2 "user123");
+            assert (find_header headers2 "X-RestLi-Method" = Some "FINDER")
+        | _ -> failwith "Expected userinfo + finder requests");
+        print_endline "✓ Search scroller defaults to current author")
+      (fun err -> failwith ("Search scroller default author failed: " ^ err)))
+
+(** Test: Posts scroller normalizes non-positive page_size to 1 *)
+let test_posts_scroller_page_size_normalization () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_responses [
+    { status = 200; body = {|{"sub":"user123"}|}; headers = [] };
+    { status = 200; body = {|{"elements": [], "paging": {"start": 0, "count": 0, "total": 0}}|}; headers = [] };
+  ];
+
+  let scroller = LinkedIn.create_posts_scroller ~account_id:"test_account" ~page_size:0 () in
+  scroller.scroll_next
+    (handle_result
+      (fun _collection ->
+        let requests = List.rev !Mock_http.requests in
+        (match requests with
+        | _ :: (_, url, _, _) :: _ ->
+            assert (string_contains url "count=1");
+            print_endline "✓ Posts scroller page_size normalization"
+        | _ -> failwith "Expected userinfo + posts requests"))
+      (fun err -> failwith ("Posts scroller page_size normalization failed: " ^ err)))
+
+(** Test: Search scroller normalizes non-positive page_size to 1 *)
+let test_search_scroller_page_size_normalization () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response { status = 200; body = {|{"elements": [], "paging": {"start": 0, "count": 0, "total": 0}}|}; headers = [] };
+
+  let scroller = LinkedIn.create_search_scroller ~account_id:"test_account" ~author:"urn:li:person:user1" ~page_size:0 () in
+  scroller.scroll_next
+    (handle_result
+      (fun _collection ->
+        let requests = !Mock_http.requests in
+        (match requests with
+        | (_, url, _, _) :: _ ->
+            assert (string_contains url "count=1");
+            print_endline "✓ Search scroller page_size normalization"
+        | [] -> failwith "No requests recorded"))
+      (fun err -> failwith ("Search scroller page_size normalization failed: " ^ err)))
+
 (** Test: Search posts *)
 let test_search_posts () =
   Mock_config.reset ();
@@ -558,11 +1567,283 @@ let test_search_posts () =
   Mock_http.set_response { status = 200; body = search_response; headers = [] };
   
   LinkedIn.search_posts ~account_id:"test_account" ~keywords:"OCaml" ~start:0 ~count:10
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "does not support keyword finder search");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Search posts rejects unsupported keyword finder"
+      | Ok _ -> failwith "Expected keyword search to be rejected"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: Search posts with author filter uses Rest.li list syntax *)
+let test_search_posts_author_filter_encoding () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+
+  let search_response = {|{"elements": [], "paging": {"start": 0, "count": 0, "total": 0}}|} in
+  Mock_http.set_response { status = 200; body = search_response; headers = [] };
+
+  LinkedIn.search_posts ~account_id:"test_account" ~author:"urn:li:person:user1"
     (handle_result
-      (fun collection ->
-        assert (List.length collection.elements = 2);
-        print_endline "✓ Search posts")
-      (fun err -> failwith ("Search posts failed: " ^ err)))
+      (fun _collection ->
+        let requests = !Mock_http.requests in
+        (match requests with
+        | (_, url, headers, _) :: _ ->
+            assert (string_contains url "q=authors");
+            assert (string_contains url "authors=List" || string_contains url "authors=List%28");
+            assert (find_header headers "X-RestLi-Method" = Some "FINDER");
+            print_endline "✓ Search author filter encoding"
+        | [] -> failwith "No requests recorded"))
+      (fun err -> failwith ("Search posts author filter failed: " ^ err)))
+
+(** Test: Search posts defaults to current member author finder *)
+let test_search_posts_defaults_to_current_author () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+
+  let person_response = {|{"sub": "user123"}|} in
+  let search_response = {|{"elements": [], "paging": {"start": 0, "count": 0, "total": 0}}|} in
+  Mock_http.set_responses [
+    { status = 200; body = person_response; headers = [] };
+    { status = 200; body = search_response; headers = [] };
+  ];
+
+  LinkedIn.search_posts ~account_id:"test_account"
+    (handle_result
+      (fun _collection ->
+        let requests = List.rev !Mock_http.requests in
+        (match requests with
+        | _ :: (_, url, _, _) :: _ ->
+            assert (string_contains url "q=authors");
+            assert (string_contains url "authors=List" || string_contains url "authors=List%28");
+            assert (string_contains url "user123");
+            print_endline "✓ Search defaults to current author"
+        | _ -> failwith "Expected userinfo + search requests"))
+      (fun err -> failwith ("Search default author failed: " ^ err)))
+
+(** Test: Search defaults reject malformed resolved person URN *)
+let test_search_posts_defaults_reject_malformed_person_urn () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response { status = 200; body = {|{"sub":"user,123"}|}; headers = [] };
+
+  LinkedIn.search_posts ~account_id:"test_account"
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "person URN");
+          assert (string_contains msg "invalid characters");
+          let requests = List.rev !Mock_http.requests in
+          assert (List.length requests = 1);
+          print_endline "✓ Search defaults reject malformed resolved person URN"
+      | Ok _ -> failwith "Expected malformed person URN rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: Search posts rejects author URN with surrounding whitespace *)
+let test_search_posts_rejects_whitespace_author () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+
+  LinkedIn.search_posts ~account_id:"test_account" ~author:" urn:li:person:user1 "
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "author URN");
+          assert (string_contains msg "whitespace");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Search posts rejects whitespace author"
+      | Ok _ -> failwith "Expected whitespace author rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: Search posts rejects author URN with Rest.li list-breaking chars *)
+let test_search_posts_rejects_malformed_author () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+
+  LinkedIn.search_posts ~account_id:"test_account" ~author:"urn:li:person:user1,user2"
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "invalid characters");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Search posts rejects malformed author"
+      | Ok _ -> failwith "Expected malformed author rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: Search posts normalizes negative start and caps count to 50 *)
+let test_search_posts_pagination_normalization () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  let search_response = {|{"elements": [], "paging": {"start": 0, "count": 0, "total": 0}}|} in
+  Mock_http.set_response { status = 200; body = search_response; headers = [] };
+
+  LinkedIn.search_posts ~account_id:"test_account" ~author:"urn:li:person:user1" ~start:(-3) ~count:999
+    (handle_result
+      (fun _collection ->
+        let requests = !Mock_http.requests in
+        (match requests with
+        | (_, url, _, _) :: _ ->
+            assert (string_contains url "start=0");
+            assert (string_contains url "count=50");
+            print_endline "✓ Search posts pagination normalization"
+        | [] -> failwith "No requests recorded"))
+      (fun err -> failwith ("Search posts normalization failed: " ^ err)))
+
+(** Test: Zero count is normalized to minimum 1 for finder reads *)
+let test_finder_zero_count_normalization () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response { status = 200; body = {|{"elements": [], "paging": {"start": 0, "count": 0, "total": 0}}|}; headers = [] };
+
+  LinkedIn.search_posts ~account_id:"test_account" ~author:"urn:li:person:user1" ~count:0
+    (handle_result
+      (fun _collection ->
+        let requests = !Mock_http.requests in
+        match requests with
+        | (_, url, _, _) :: _ ->
+            assert (string_contains url "count=1");
+            print_endline "✓ Finder zero count normalization"
+        | [] -> failwith "No requests recorded")
+      (fun err -> failwith ("Finder zero count normalization failed: " ^ err)))
+
+(** Test: Search posts propagates API error details *)
+let test_search_posts_api_error () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 429;
+    headers = [];
+    body = {|{"message":"Rate limit exceeded","serviceErrorCode":42901}|};
+  };
+
+  LinkedIn.search_posts ~account_id:"test_account" ~author:"urn:li:person:user1"
+    (fun result ->
+      match result with
+      | Error (Error_types.Rate_limited _) ->
+          print_endline "✓ Search posts API error propagation"
+      | Ok _ -> failwith "Expected API error for search_posts"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
 
 (** Test: Like post *)
 let test_like_post () =
@@ -595,6 +1876,82 @@ let test_like_post () =
     (handle_result
       (fun () -> print_endline "✓ Like post")
       (fun err -> failwith ("Like post failed: " ^ err)))
+
+(** Test: like_post maps 403 to write scope *)
+let test_like_post_insufficient_permissions_error () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_responses [
+    { status = 200; body = {|{"sub":"user123"}|}; headers = [] };
+    { status = 403; body = {|{"message":"Not enough permissions"}|}; headers = [] };
+  ];
+
+  LinkedIn.like_post ~account_id:"test_account" ~post_urn:"urn:li:share:123"
+    (fun result ->
+      match result with
+      | Error (Error_types.Auth_error (Error_types.Insufficient_permissions scopes)) ->
+          assert (List.mem "w_member_social" scopes);
+          print_endline "✓ Like post maps 403 to write scope"
+      | Ok _ -> failwith "Expected permission error"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: like_post rejects whitespace post URN without network calls *)
+let test_like_post_rejects_whitespace_urn () =
+  Mock_config.reset ();
+
+  LinkedIn.like_post ~account_id:"test_account" ~post_urn:" urn:li:share:123 "
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "post URN");
+          assert (string_contains msg "whitespace");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Like post rejects whitespace URN"
+      | Ok _ -> failwith "Expected whitespace URN rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: like_post rejects blank post URN without network calls *)
+let test_like_post_rejects_blank_urn () =
+  Mock_config.reset ();
+
+  LinkedIn.like_post ~account_id:"test_account" ~post_urn:""
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "post URN is required");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Like post rejects blank URN"
+      | Ok _ -> failwith "Expected blank URN rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: like_post rejects malformed delimiter characters in post URN *)
+let test_like_post_rejects_malformed_delimiter_urn () =
+  Mock_config.reset ();
+
+  LinkedIn.like_post ~account_id:"test_account" ~post_urn:"urn:li:share:123,456"
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "invalid delimiter");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Like post rejects malformed delimiter URN"
+      | Ok _ -> failwith "Expected malformed delimiter URN rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
 
 (** Test: Comment on post *)
 let test_comment_on_post () =
@@ -633,6 +1990,96 @@ let test_comment_on_post () =
         assert (comment_id = "comment123");
         print_endline "✓ Comment on post")
       (fun err -> failwith ("Comment failed: " ^ err)))
+
+(** Test: comment_on_post maps 403 to write scope *)
+let test_comment_on_post_insufficient_permissions_error () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_responses [
+    { status = 200; body = {|{"sub":"user123"}|}; headers = [] };
+    { status = 403; body = {|{"message":"Not enough permissions"}|}; headers = [] };
+  ];
+
+  LinkedIn.comment_on_post ~account_id:"test_account" ~post_urn:"urn:li:share:123" ~text:"Great post!"
+    (fun result ->
+      match result with
+      | Error (Error_types.Auth_error (Error_types.Insufficient_permissions scopes)) ->
+          assert (List.mem "w_member_social" scopes);
+          print_endline "✓ Comment on post maps 403 to write scope"
+      | Ok _ -> failwith "Expected permission error"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: comment_on_post rejects whitespace post URN without network calls *)
+let test_comment_on_post_rejects_whitespace_urn () =
+  Mock_config.reset ();
+
+  LinkedIn.comment_on_post ~account_id:"test_account" ~post_urn:" urn:li:share:123 " ~text:"hi"
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "post URN");
+          assert (string_contains msg "whitespace");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Comment on post rejects whitespace URN"
+      | Ok _ -> failwith "Expected whitespace URN rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: comment_on_post rejects blank post URN without network calls *)
+let test_comment_on_post_rejects_blank_urn () =
+  Mock_config.reset ();
+
+  LinkedIn.comment_on_post ~account_id:"test_account" ~post_urn:"" ~text:"hi"
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "post URN is required");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Comment on post rejects blank URN"
+      | Ok _ -> failwith "Expected blank URN rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: comment_on_post rejects blank text without network calls *)
+let test_comment_on_post_rejects_blank_text () =
+  Mock_config.reset ();
+
+  LinkedIn.comment_on_post ~account_id:"test_account" ~post_urn:"urn:li:share:123" ~text:"   "
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "comment text is required");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Comment on post rejects blank text"
+      | Ok _ -> failwith "Expected blank text rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: comment_on_post rejects malformed delimiter characters in post URN *)
+let test_comment_on_post_rejects_malformed_delimiter_urn () =
+  Mock_config.reset ();
+
+  LinkedIn.comment_on_post ~account_id:"test_account" ~post_urn:"urn:li:share:123,456" ~text:"hi"
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "invalid delimiter");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Comment on post rejects malformed delimiter URN"
+      | Ok _ -> failwith "Expected malformed delimiter URN rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
 
 (** Test: Get post comments *)
 let test_get_post_comments () =
@@ -676,6 +2123,235 @@ let test_get_post_comments () =
         assert (comment.text = "Nice!");
         print_endline "✓ Get post comments")
       (fun err -> failwith ("Get comments failed: " ^ err)))
+
+(** Test: get_post_comments maps 403 to read scope *)
+let test_get_post_comments_insufficient_permissions_error () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response { status = 403; body = {|{"message":"Not enough permissions"}|}; headers = [] };
+
+  LinkedIn.get_post_comments ~account_id:"test_account" ~post_urn:"urn:li:share:123"
+    (fun result ->
+      match result with
+      | Error (Error_types.Auth_error (Error_types.Insufficient_permissions scopes)) ->
+          assert (List.mem "r_member_social" scopes);
+          print_endline "✓ Get post comments maps 403 to read scope"
+      | Ok _ -> failwith "Expected permission error"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: get_post_comments rejects whitespace post URN without network calls *)
+let test_get_post_comments_rejects_whitespace_urn () =
+  Mock_config.reset ();
+
+  LinkedIn.get_post_comments ~account_id:"test_account" ~post_urn:" urn:li:share:123 "
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "post URN");
+          assert (string_contains msg "whitespace");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Get post comments rejects whitespace URN"
+      | Ok _ -> failwith "Expected whitespace URN rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: get_post_comments rejects blank post URN without network calls *)
+let test_get_post_comments_rejects_blank_urn () =
+  Mock_config.reset ();
+
+  LinkedIn.get_post_comments ~account_id:"test_account" ~post_urn:""
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "post URN is required");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Get post comments rejects blank URN"
+      | Ok _ -> failwith "Expected blank URN rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: get_post_comments rejects malformed delimiter characters in post URN *)
+let test_get_post_comments_rejects_malformed_delimiter_urn () =
+  Mock_config.reset ();
+
+  LinkedIn.get_post_comments ~account_id:"test_account" ~post_urn:"urn:li:share:123,456"
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "invalid delimiter");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Get post comments rejects malformed delimiter URN"
+      | Ok _ -> failwith "Expected malformed delimiter URN rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: Get post engagement metrics *)
+let test_get_post_engagement () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+
+  let engagement_response = {|{
+    "totalLikes": 12,
+    "totalComments": 3,
+    "totalShares": 2,
+    "totalImpressions": 100
+  }|} in
+  Mock_http.set_response { status = 200; body = engagement_response; headers = [] };
+
+  LinkedIn.get_post_engagement ~account_id:"test_account" ~post_urn:"urn:li:share:123"
+    (handle_result
+      (fun engagement ->
+        assert (engagement.like_count = Some 12);
+        assert (engagement.comment_count = Some 3);
+        assert (engagement.share_count = Some 2);
+        assert (engagement.impression_count = Some 100);
+        let requests = !Mock_http.requests in
+        (match requests with
+        | (_, url, headers, _) :: _ ->
+            assert (string_contains url "socialMetadata");
+            assert (find_header headers "X-Restli-Protocol-Version" = Some "2.0.0")
+        | [] -> failwith "No requests recorded");
+        print_endline "✓ Get post engagement")
+      (fun err -> failwith ("Get post engagement failed: " ^ err)))
+
+(** Test: Get post engagement handles missing optional fields gracefully *)
+let test_get_post_engagement_missing_fields () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 200;
+    headers = [];
+    body = {|{"totalLikes": 5}|};
+  };
+
+  LinkedIn.get_post_engagement ~account_id:"test_account" ~post_urn:"urn:li:share:123"
+    (handle_result
+      (fun engagement ->
+        assert (engagement.like_count = Some 5);
+        assert (engagement.comment_count = None);
+        assert (engagement.share_count = None);
+        assert (engagement.impression_count = None);
+        print_endline "✓ Get post engagement missing fields handling")
+      (fun err -> failwith ("Get post engagement missing fields failed: " ^ err)))
+
+(** Test: Get post engagement propagates API error details *)
+let test_get_post_engagement_api_error () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 403;
+    headers = [];
+    body = {|{"message":"Not enough permissions","serviceErrorCode":100}|};
+  };
+
+  LinkedIn.get_post_engagement ~account_id:"test_account" ~post_urn:"urn:li:share:123"
+    (fun result ->
+      match result with
+      | Error (Error_types.Auth_error (Error_types.Insufficient_permissions scopes)) ->
+          assert (List.mem "r_member_social" scopes);
+          print_endline "✓ Get post engagement API error propagation"
+      | Ok _ -> failwith "Expected API error for get_post_engagement"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: get_post_engagement rejects whitespace post URN without network calls *)
+let test_get_post_engagement_rejects_whitespace_urn () =
+  Mock_config.reset ();
+
+  LinkedIn.get_post_engagement ~account_id:"test_account" ~post_urn:" urn:li:share:123 "
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "post URN");
+          assert (string_contains msg "whitespace");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Get post engagement rejects whitespace URN"
+      | Ok _ -> failwith "Expected whitespace URN rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: get_post_engagement rejects blank post URN without network calls *)
+let test_get_post_engagement_rejects_blank_urn () =
+  Mock_config.reset ();
+
+  LinkedIn.get_post_engagement ~account_id:"test_account" ~post_urn:""
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "post URN is required");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Get post engagement rejects blank URN"
+      | Ok _ -> failwith "Expected blank URN rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: get_post_engagement rejects malformed delimiter characters in post URN *)
+let test_get_post_engagement_rejects_malformed_delimiter_urn () =
+  Mock_config.reset ();
+
+  LinkedIn.get_post_engagement ~account_id:"test_account" ~post_urn:"urn:li:share:123,456"
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "invalid delimiter");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Get post engagement rejects malformed delimiter URN"
+      | Ok _ -> failwith "Expected malformed delimiter URN rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
 
 (** Test: Post with URL preview (ARTICLE media category) *)
 let test_post_with_url_preview () =
@@ -726,6 +2402,39 @@ let test_post_with_url_preview () =
         
         print_endline "✓ Post with URL preview (ARTICLE)")
       (fun err -> failwith ("Post with URL failed: " ^ err)))
+
+(** Test: post_single maps 403 to write scope *)
+let test_post_single_insufficient_permissions_error () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_responses [
+    { status = 200; body = {|{"sub":"user123"}|}; headers = [] };
+    { status = 403; body = {|{"message":"Not enough permissions"}|}; headers = [] };
+  ];
+
+  LinkedIn.post_single ~account_id:"test_account" ~text:"hello" ~media_urls:[]
+    (function
+      | Error_types.Failure (Error_types.Auth_error (Error_types.Insufficient_permissions scopes)) ->
+          assert (List.mem "w_member_social" scopes);
+          print_endline "✓ Post single maps 403 to write scope"
+      | Error_types.Success _ -> failwith "Expected permission failure"
+      | Error_types.Partial_success _ -> failwith "Expected permission failure"
+      | Error_types.Failure err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
 
 (** Test: OAuth URL contains all required parameters *)
 let test_oauth_url_parameters () =
@@ -800,6 +2509,24 @@ let test_token_exchange_missing_fields () =
       print_endline "✓ Token exchange with missing optional fields")
     (fun err -> failwith ("Should succeed with minimal response: " ^ err))
 
+(** Test: Token exchange treats blank refresh_token as absent *)
+let test_token_exchange_blank_refresh_token () =
+  Mock_config.reset ();
+  Mock_config.set_env "LINKEDIN_CLIENT_ID" "test_client";
+  Mock_config.set_env "LINKEDIN_CLIENT_SECRET" "test_secret";
+
+  let response = {|{"access_token":"token123","refresh_token":"   ","expires_in":5184000}|} in
+  Mock_http.set_response { status = 200; body = response; headers = [] };
+
+  LinkedIn.exchange_code
+    ~code:"test_code"
+    ~redirect_uri:"https://example.com/callback"
+    (fun creds ->
+      assert (creds.access_token = "token123");
+      assert (creds.refresh_token = None);
+      print_endline "✓ Token exchange blank refresh token handled")
+    (fun err -> failwith ("Should treat blank refresh token as missing: " ^ err))
+
 (** Test: Token refresh with rotating tokens *)
 let test_token_refresh_rotation () =
   Mock_config.reset ();
@@ -827,6 +2554,26 @@ let test_token_refresh_rotation () =
       assert (refresh <> "old_refresh_v1");
       print_endline "✓ Token refresh with rotation")
     (fun err -> failwith ("Token refresh rotation failed: " ^ err))
+
+(** Test: Token refresh keeps previous token when new refresh_token is blank *)
+let test_token_refresh_blank_refresh_token_fallback () =
+  Mock_config.reset ();
+  Mock_config.set_env "LINKEDIN_CLIENT_ID" "test_client";
+  Mock_config.set_env "LINKEDIN_CLIENT_SECRET" "test_secret";
+  Mock_config.set_env "LINKEDIN_ENABLE_PROGRAMMATIC_REFRESH" "true";
+
+  let response_body = {|{"access_token":"new_access","refresh_token":" ","expires_in":5184000}|} in
+  Mock_http.set_response { status = 200; body = response_body; headers = [] };
+
+  LinkedIn.refresh_access_token
+    ~client_id:"test_client"
+    ~client_secret:"test_secret"
+    ~refresh_token:"old_refresh"
+    (fun (access, refresh, _expires) ->
+      assert (access = "new_access");
+      assert (refresh = "old_refresh");
+      print_endline "✓ Token refresh blank refresh token fallback")
+    (fun err -> failwith ("Refresh should fallback to existing token: " ^ err))
 
 (** Test: Expired token detection *)
 let test_expired_token_detection () =
@@ -1145,11 +2892,6 @@ let test_thread_with_alt_texts () =
    They ensure correct REST.li headers, URL encoding, and request formatting.
 *)
 
-(** Helper to find a header value in a request *)
-let find_header headers name =
-  List.find_opt (fun (k, _) -> String.lowercase_ascii k = String.lowercase_ascii name) headers
-  |> Option.map snd
-
 (** Test: X-RestLi-Protocol-Version header is sent on API calls *)
 let test_restli_protocol_version_header () =
   Mock_config.reset ();
@@ -1321,6 +3063,83 @@ let test_urn_path_encoding () =
         | [] -> failwith "No requests recorded")
       (fun err -> failwith ("Get post failed: " ^ err)))
 
+(** Test: get_post maps 403 to read scope *)
+let test_get_post_insufficient_permissions_error () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 403;
+    headers = [];
+    body = {|{"message":"Not enough permissions"}|};
+  };
+
+  LinkedIn.get_post ~account_id:"test_account" ~post_urn:"urn:li:share:123"
+    (fun result ->
+      match result with
+      | Error (Error_types.Auth_error (Error_types.Insufficient_permissions scopes)) ->
+          assert (List.mem "r_member_social" scopes);
+          print_endline "✓ Get post maps 403 to read scope"
+      | Ok _ -> failwith "Expected permission error"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: get_post rejects whitespace post URN without network calls *)
+let test_get_post_rejects_whitespace_urn () =
+  Mock_config.reset ();
+
+  LinkedIn.get_post ~account_id:"test_account" ~post_urn:" urn:li:share:123 "
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "post URN");
+          assert (string_contains msg "whitespace");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Get post rejects whitespace URN"
+      | Ok _ -> failwith "Expected whitespace URN rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: get_post rejects blank post URN without network calls *)
+let test_get_post_rejects_blank_urn () =
+  Mock_config.reset ();
+
+  LinkedIn.get_post ~account_id:"test_account" ~post_urn:""
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "post URN is required");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Get post rejects blank URN"
+      | Ok _ -> failwith "Expected blank URN rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: get_post rejects malformed delimiter characters in post URN *)
+let test_get_post_rejects_malformed_delimiter_urn () =
+  Mock_config.reset ();
+
+  LinkedIn.get_post ~account_id:"test_account" ~post_urn:"urn:li:share:123,456"
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "invalid delimiter");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Get post rejects malformed delimiter URN"
+      | Ok _ -> failwith "Expected malformed delimiter URN rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
 (** Test: Batch request URL encoding for multiple URNs *)
 let test_batch_urns_encoding () =
   Mock_config.reset ();
@@ -1357,14 +3176,53 @@ let test_batch_urns_encoding () =
       (fun _posts ->
         let requests = !Mock_http.requests in
         match requests with
-        | (_, url, _, _) :: _ ->
-            (* URL should contain ids parameter with encoded URNs *)
+        | (_, url, headers, _) :: _ ->
+            (* URL should contain ids parameter encoded as Rest.li list syntax *)
             assert (string_contains url "ids=");
-            (* Should have comma-separated values *)
-            assert (string_contains url "," || string_contains url "%2C");
+            assert (string_contains url "List" || string_contains url "List%28");
+            assert (not (string_contains url "%25"));
+            assert (string_contains url "111");
+            assert (string_contains url "222");
+            assert (find_header headers "X-RestLi-Method" = Some "BATCH_GET");
             print_endline "✓ Batch URNs encoding"
         | [] -> failwith "No requests recorded")
       (fun err -> failwith ("Batch get posts failed: " ^ err)))
+
+(** Test: FINDER requests include X-RestLi-Method header *)
+let test_finder_method_header () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 200;
+    headers = [];
+    body = "{\"elements\": [], \"paging\": {\"start\": 0, \"count\": 0, \"total\": 0}}";
+  };
+
+  LinkedIn.search_posts ~account_id:"test_account" ~author:"urn:li:person:user1"
+    (handle_result
+      (fun _collection ->
+        let requests = !Mock_http.requests in
+        match requests with
+        | (_, _, headers, _) :: _ ->
+            assert (find_header headers "X-RestLi-Method" = Some "FINDER");
+            print_endline "✓ Finder request method header"
+        | [] -> failwith "No requests recorded")
+      (fun err -> failwith ("Search posts failed: " ^ err)))
 
 (** Test: Request body structure for ugcPost creation *)
 let test_ugcpost_request_body_structure () =
@@ -1518,6 +3376,82 @@ let test_unlike_post_delete () =
         | None -> failwith "No DELETE request found")
       (fun err -> failwith ("Unlike post failed: " ^ err)))
 
+(** Test: unlike_post maps 403 to write scope *)
+let test_unlike_post_insufficient_permissions_error () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_responses [
+    { status = 200; body = {|{"sub":"user123"}|}; headers = [] };
+    { status = 403; body = {|{"message":"Not enough permissions"}|}; headers = [] };
+  ];
+
+  LinkedIn.unlike_post ~account_id:"test_account" ~post_urn:"urn:li:share:123"
+    (fun result ->
+      match result with
+      | Error (Error_types.Auth_error (Error_types.Insufficient_permissions scopes)) ->
+          assert (List.mem "w_member_social" scopes);
+          print_endline "✓ Unlike post maps 403 to write scope"
+      | Ok _ -> failwith "Expected permission error"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: unlike_post rejects whitespace post URN without network calls *)
+let test_unlike_post_rejects_whitespace_urn () =
+  Mock_config.reset ();
+
+  LinkedIn.unlike_post ~account_id:"test_account" ~post_urn:" urn:li:share:123 "
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "post URN");
+          assert (string_contains msg "whitespace");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Unlike post rejects whitespace URN"
+      | Ok _ -> failwith "Expected whitespace URN rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: unlike_post rejects blank post URN without network calls *)
+let test_unlike_post_rejects_blank_urn () =
+  Mock_config.reset ();
+
+  LinkedIn.unlike_post ~account_id:"test_account" ~post_urn:""
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "post URN is required");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Unlike post rejects blank URN"
+      | Ok _ -> failwith "Expected blank URN rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: unlike_post rejects malformed delimiter characters in post URN *)
+let test_unlike_post_rejects_malformed_delimiter_urn () =
+  Mock_config.reset ();
+
+  LinkedIn.unlike_post ~account_id:"test_account" ~post_urn:"urn:li:share:123,456"
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "invalid delimiter");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Unlike post rejects malformed delimiter URN"
+      | Ok _ -> failwith "Expected malformed delimiter URN rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
 (** Test: Like request body structure with actor and object *)
 let test_like_request_body_structure () =
   Mock_config.reset ();
@@ -1639,6 +3573,75 @@ let test_query_param_encoding () =
             print_endline "✓ Query parameter encoding (start, count)"
         | [] -> failwith "No requests recorded")
       (fun err -> failwith ("Get comments failed: " ^ err)))
+
+(** Test: Negative pagination values are normalized safely *)
+let test_negative_pagination_normalization () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+
+  let comments_response = {|{"elements": [], "paging": {"start": 0, "count": 1, "total": 1}}|} in
+  Mock_http.set_response { status = 200; body = comments_response; headers = [] };
+
+  LinkedIn.get_post_comments ~account_id:"test_account" ~post_urn:"urn:li:share:123" ~start:(-5) ~count:(-20)
+    (handle_result
+      (fun _collection ->
+        let requests = !Mock_http.requests in
+        match requests with
+        | (_, url, _, _) :: _ ->
+            assert (string_contains url "start=0");
+            assert (string_contains url "count=1");
+            print_endline "✓ Negative pagination normalization"
+        | [] -> failwith "No requests recorded")
+      (fun err -> failwith ("Negative pagination test failed: " ^ err)))
+
+(** Test: get_post_comments caps count to 100 *)
+let test_comments_count_cap () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+
+  let comments_response = {|{"elements": [], "paging": {"start": 0, "count": 0, "total": 0}}|} in
+  Mock_http.set_response { status = 200; body = comments_response; headers = [] };
+
+  LinkedIn.get_post_comments ~account_id:"test_account" ~post_urn:"urn:li:share:123" ~count:999
+    (handle_result
+      (fun _collection ->
+        let requests = !Mock_http.requests in
+        match requests with
+        | (_, url, _, _) :: _ ->
+            assert (string_contains url "count=100");
+            print_endline "✓ Comments count cap"
+        | [] -> failwith "No requests recorded")
+      (fun err -> failwith ("Comments count cap test failed: " ^ err)))
 
 (** {1 Video Upload Tests}
     
@@ -1842,31 +3845,101 @@ let () =
   test_oauth_url ();
   test_oauth_url_parameters ();
   test_oauth_url_encoding ();
+  test_oauth_url_rejects_whitespace_state ();
+  test_oauth_url_rejects_redirect_mismatch ();
   test_oauth_state_validation ();
+  test_validate_oauth_state_success ();
+  test_validate_oauth_state_mismatch ();
+  test_validate_oauth_state_whitespace_rejected ();
   test_oauth_scope_validation ();
   test_token_exchange ();
+  test_exchange_code_rejects_whitespace_code ();
   test_token_exchange_invalid ();
   test_token_exchange_missing_fields ();
+  test_token_exchange_blank_refresh_token ();
   test_token_refresh_partner ();
+  test_token_refresh_rejects_whitespace ();
   test_token_refresh_standard ();
   test_token_refresh_rotation ();
+  test_token_refresh_blank_refresh_token_fallback ();
   test_refresh_token_expiry ();
   test_expired_token_detection ();
   
   print_endline "\n--- API Operation Tests ---";
   test_get_person_urn ();
+  test_get_person_urn_rejects_malformed_subject ();
+  test_get_person_urn_rejects_whitespace_subject ();
+  test_get_person_urn_rejects_empty_subject ();
+  test_get_person_urn_error_redaction ();
+  test_get_person_urn_non_json_error_redaction ();
+  test_get_person_urn_missing_subject ();
+  test_get_person_urn_malformed_json ();
+  test_get_person_urn_insufficient_permissions_message ();
+  test_get_person_urn_auth_failure_message ();
+  test_get_person_urn_rate_limited_message ();
   test_register_upload ();
   test_content_validation ();
   test_ensure_valid_token_fresh ();
   test_get_profile ();
+  test_get_profile_insufficient_permissions_error ();
+  test_api_error_redacts_sensitive_json ();
+  test_api_error_redacts_non_json ();
   test_get_posts ();
+  test_get_posts_rejects_malformed_person_urn ();
+  test_get_posts_pagination_normalization ();
+  test_get_posts_rate_limited_error ();
+  test_get_posts_insufficient_permissions_error ();
   test_batch_get_posts ();
+  test_batch_get_posts_rejects_malformed_urns ();
+  test_batch_get_posts_malformed_json ();
+  test_batch_get_posts_insufficient_permissions_error ();
   test_posts_scroller ();
+  test_posts_scroller_back_from_second_page ();
+  test_posts_scroller_back_error_preserves_position ();
+  test_posts_scroller_page_size_normalization ();
+  test_search_scroller_with_author ();
+  test_search_scroller_back_from_second_page ();
+  test_search_scroller_back_error_preserves_position ();
+  test_search_scroller_rejects_keywords ();
+  test_search_scroller_defaults_to_current_author ();
+  test_search_scroller_page_size_normalization ();
   test_search_posts ();
+  test_search_posts_author_filter_encoding ();
+  test_search_posts_defaults_to_current_author ();
+  test_search_posts_defaults_reject_malformed_person_urn ();
+  test_search_posts_rejects_whitespace_author ();
+  test_search_posts_rejects_malformed_author ();
+  test_search_posts_pagination_normalization ();
+  test_finder_zero_count_normalization ();
+  test_search_posts_api_error ();
+  test_get_post_insufficient_permissions_error ();
+  test_get_post_rejects_whitespace_urn ();
+  test_get_post_rejects_blank_urn ();
+  test_get_post_rejects_malformed_delimiter_urn ();
   test_like_post ();
+  test_like_post_insufficient_permissions_error ();
+  test_like_post_rejects_whitespace_urn ();
+  test_like_post_rejects_blank_urn ();
+  test_like_post_rejects_malformed_delimiter_urn ();
   test_comment_on_post ();
+  test_comment_on_post_insufficient_permissions_error ();
+  test_comment_on_post_rejects_whitespace_urn ();
+  test_comment_on_post_rejects_blank_urn ();
+  test_comment_on_post_rejects_blank_text ();
+  test_comment_on_post_rejects_malformed_delimiter_urn ();
   test_get_post_comments ();
+  test_get_post_comments_insufficient_permissions_error ();
+  test_get_post_comments_rejects_whitespace_urn ();
+  test_get_post_comments_rejects_blank_urn ();
+  test_get_post_comments_rejects_malformed_delimiter_urn ();
+  test_get_post_engagement ();
+  test_get_post_engagement_missing_fields ();
+  test_get_post_engagement_api_error ();
+  test_get_post_engagement_rejects_whitespace_urn ();
+  test_get_post_engagement_rejects_blank_urn ();
+  test_get_post_engagement_rejects_malformed_delimiter_urn ();
   test_post_with_url_preview ();
+  test_post_single_insufficient_permissions_error ();
   
   print_endline "\n--- Alt-Text Tests ---";
   test_post_with_alt_text ();
@@ -1882,12 +3955,19 @@ let () =
   test_content_type_header_json ();
   test_urn_path_encoding ();
   test_batch_urns_encoding ();
+  test_finder_method_header ();
   test_ugcpost_request_body_structure ();
   test_comment_request_body_structure ();
   test_unlike_post_delete ();
+  test_unlike_post_insufficient_permissions_error ();
+  test_unlike_post_rejects_whitespace_urn ();
+  test_unlike_post_rejects_blank_urn ();
+  test_unlike_post_rejects_malformed_delimiter_urn ();
   test_like_request_body_structure ();
   test_register_upload_headers ();
   test_query_param_encoding ();
+  test_negative_pagination_normalization ();
+  test_comments_count_cap ();
   
   print_endline "\n--- Video Upload Tests ---";
   test_post_with_video ();
@@ -1897,4 +3977,4 @@ let () =
   test_video_validation_too_long ();
   test_post_video_detection_from_url ();
   
-  print_endline "\n=== All 48 tests passed! ===\n"
+  print_endline "\n=== All tests passed! ===\n"

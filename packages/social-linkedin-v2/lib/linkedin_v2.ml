@@ -31,6 +31,20 @@ open Social_core
     - LINKEDIN_REDIRECT_URI: Registered callback URL
 *)
 module OAuth = struct
+  let has_surrounding_whitespace value = value <> String.trim value
+  let is_blank value = String.trim value = ""
+
+  let normalize_token_type = function
+    | None -> "Bearer"
+    | Some raw ->
+        let trimmed = String.trim raw in
+        if trimmed = "" then "Bearer"
+        else if String.lowercase_ascii trimmed = "bearer" then "Bearer"
+        else trimmed
+
+  let normalize_expires_in seconds =
+    if seconds < 0 then 0 else if seconds > 31_536_000 then 31_536_000 else seconds
+
   (** Scope definitions for LinkedIn API v2 *)
   module Scopes = struct
     (** Scopes required for read-only operations (profile info) *)
@@ -138,40 +152,56 @@ module OAuth = struct
         @param on_error Continuation receiving error message
     *)
     let exchange_code ~client_id ~client_secret ~redirect_uri ~code on_success on_error =
-      (* LinkedIn expects parameters in query string, not body *)
+      let client_id = String.trim client_id in
+      let client_secret = String.trim client_secret in
+      if client_id = "" || client_secret = "" then
+        on_error "LinkedIn OAuth credentials not configured"
+      else if has_surrounding_whitespace redirect_uri then
+        on_error "LinkedIn redirect URI must not contain leading or trailing whitespace"
+      else if is_blank redirect_uri then
+        on_error "LinkedIn redirect URI is required"
+      else if has_surrounding_whitespace code then
+        on_error "LinkedIn authorization code must not contain leading or trailing whitespace"
+      else if is_blank code then
+        on_error "LinkedIn authorization code is required"
+      else
       let params = [
         ("grant_type", ["authorization_code"]);
         ("code", [code]);
         ("redirect_uri", [redirect_uri]);
-        ("client_id", [String.trim client_id]);
-        ("client_secret", [String.trim client_secret]);
+        ("client_id", [client_id]);
+        ("client_secret", [client_secret]);
       ] in
-      let query_string = Uri.encoded_of_query params in
-      let url = Printf.sprintf "%s?%s" Metadata.token_endpoint query_string in
+      let body = Uri.encoded_of_query params in
+      let headers = [
+        ("Content-Type", "application/x-www-form-urlencoded");
+      ] in
       
-      (* POST request with parameters in query string, empty body *)
-      Http.post ~headers:[] ~body:"" url
+      Http.post ~headers ~body Metadata.token_endpoint
         (fun response ->
           if response.status >= 200 && response.status < 300 then
             try
               let json = Yojson.Basic.from_string response.body in
               let open Yojson.Basic.Util in
-              let access_token = json |> member "access_token" |> to_string in
+              let access_token = json |> member "access_token" |> to_string |> String.trim in
+              if access_token = "" then
+                on_error "LinkedIn OAuth response contains empty access token"
+              else
               let refresh_token = 
-                try Some (json |> member "refresh_token" |> to_string)
+                try
+                  let parsed = json |> member "refresh_token" |> to_string |> String.trim in
+                  if parsed = "" then None else Some parsed
                 with _ -> None in
               
               (* LinkedIn always includes expires_in in seconds *)
-              let expires_in = json |> member "expires_in" |> to_int in
+              let expires_in = normalize_expires_in (json |> member "expires_in" |> to_int) in
               let expires_at = 
                 let now = Ptime_clock.now () in
                 match Ptime.add_span now (Ptime.Span.of_int_s expires_in) with
                 | Some exp -> Some (Ptime.to_rfc3339 exp)
                 | None -> None in
               
-              let token_type = 
-                try json |> member "token_type" |> to_string
-                with _ -> "Bearer" in
+              let token_type = normalize_token_type (json |> member "token_type" |> to_string_option) in
               
               let creds : credentials = {
                 access_token;
@@ -214,11 +244,20 @@ module OAuth = struct
         @param on_error Continuation receiving error message
     *)
     let refresh_token ~client_id ~client_secret ~refresh_token on_success on_error =
+      let client_id = String.trim client_id in
+      let client_secret = String.trim client_secret in
+      if client_id = "" || client_secret = "" then
+        on_error "LinkedIn OAuth credentials not configured"
+      else if has_surrounding_whitespace refresh_token then
+        on_error "LinkedIn refresh token must not contain leading or trailing whitespace"
+      else if is_blank refresh_token then
+        on_error "LinkedIn refresh token is required"
+      else
       let body = Uri.encoded_of_query [
         ("grant_type", ["refresh_token"]);
         ("refresh_token", [refresh_token]);
-        ("client_id", [String.trim client_id]);
-        ("client_secret", [String.trim client_secret]);
+        ("client_id", [client_id]);
+        ("client_secret", [client_secret]);
       ] in
       
       let headers = [
@@ -231,19 +270,22 @@ module OAuth = struct
             try
               let json = Yojson.Basic.from_string response.body in
               let open Yojson.Basic.Util in
-              let access_token = json |> member "access_token" |> to_string in
+              let access_token = json |> member "access_token" |> to_string |> String.trim in
+              if access_token = "" then
+                on_error "LinkedIn OAuth response contains empty access token"
+              else
               let new_refresh = 
-                try Some (json |> member "refresh_token" |> to_string) 
+                try
+                  let parsed = json |> member "refresh_token" |> to_string |> String.trim in
+                  if parsed = "" then Some refresh_token else Some parsed
                 with _ -> Some refresh_token in
-              let expires_in = json |> member "expires_in" |> to_int in
+              let expires_in = normalize_expires_in (json |> member "expires_in" |> to_int) in
               let expires_at = 
                 let now = Ptime_clock.now () in
                 match Ptime.add_span now (Ptime.Span.of_int_s expires_in) with
                 | Some exp -> Some (Ptime.to_rfc3339 exp)
                 | None -> None in
-              let token_type = 
-                try json |> member "token_type" |> to_string
-                with _ -> "Bearer" in
+              let token_type = normalize_token_type (json |> member "token_type" |> to_string_option) in
               let creds : credentials = {
                 access_token;
                 refresh_token = new_refresh;
@@ -398,6 +440,67 @@ module Make (Config : CONFIG) = struct
   
   (** Maximum video duration in seconds (10 minutes) *)
   let max_video_duration_seconds = 600
+
+  let has_surrounding_whitespace value = value <> String.trim value
+  let is_blank value = String.trim value = ""
+
+  let normalize_token_type = function
+    | None -> "Bearer"
+    | Some raw ->
+        let trimmed = String.trim raw in
+        if trimmed = "" then "Bearer"
+        else if String.lowercase_ascii trimmed = "bearer" then "Bearer"
+        else trimmed
+
+  let normalize_expires_in seconds =
+    if seconds < 0 then 0 else if seconds > 31_536_000 then 31_536_000 else seconds
+
+  let has_forbidden_restli_list_chars value =
+    String.contains value ',' || String.contains value '(' || String.contains value ')'
+
+  let validate_restli_list_item ~field_name value =
+    if is_blank value then
+      Some (Printf.sprintf "%s is required" field_name)
+    else if has_surrounding_whitespace value then
+      Some (Printf.sprintf "%s must not contain leading or trailing whitespace" field_name)
+    else if has_forbidden_restli_list_chars value then
+      Some (Printf.sprintf "%s contains invalid characters for Rest.li list encoding" field_name)
+    else
+      None
+
+  let validate_required_urn ~field_name value =
+    if is_blank value then
+      Some (Printf.sprintf "%s is required" field_name)
+    else if has_surrounding_whitespace value then
+      Some (Printf.sprintf "%s must not contain leading or trailing whitespace" field_name)
+    else if has_forbidden_restli_list_chars value then
+      Some (Printf.sprintf "%s contains invalid delimiter characters" field_name)
+    else
+      None
+
+  let normalize_start start = max 0 start
+  let normalize_count ~max_count count = min max_count (max 1 count)
+
+  let rec redact_json_sensitive_fields = function
+    | `Assoc fields ->
+        `Assoc
+          (List.map
+             (fun (key, value) ->
+               let lower = String.lowercase_ascii key in
+               if lower = "access_token" || lower = "refresh_token" || lower = "client_secret"
+               then (key, `String "[REDACTED]")
+               else (key, redact_json_sensitive_fields value))
+             fields)
+    | `List values -> `List (List.map redact_json_sensitive_fields values)
+    | other -> other
+
+  let redact_sensitive_payload body =
+    try
+      body
+      |> Yojson.Basic.from_string
+      |> redact_json_sensitive_fields
+      |> Yojson.Basic.to_string
+    with _ -> "[REDACTED_NON_JSON_ERROR_BODY]"
   
   (** {1 Validation} *)
   
@@ -466,11 +569,12 @@ module Make (Config : CONFIG) = struct
   (** {1 Internal Helpers} *)
   
   (** Parse API error from response *)
-  let parse_api_error ~status_code ~body =
+  let parse_api_error ~required_scopes ~status_code ~body =
+    let redacted_body = redact_sensitive_payload body in
     if status_code = 401 then
       Error_types.Auth_error Error_types.Token_expired
     else if status_code = 403 then
-      Error_types.Auth_error (Error_types.Insufficient_permissions ["w_member_social"])
+      Error_types.Auth_error (Error_types.Insufficient_permissions required_scopes)
     else if status_code = 429 then
       Error_types.make_rate_limited ()
     else
@@ -478,7 +582,7 @@ module Make (Config : CONFIG) = struct
         ~platform:Platform_types.LinkedIn
         ~status_code
         ~message:(try
-          let json = Yojson.Basic.from_string body in
+          let json = Yojson.Basic.from_string redacted_body in
           let open Yojson.Basic.Util in
           let msg = json |> member "message" |> to_string_option in
           let service_code = json |> member "serviceErrorCode" |> to_int_option in
@@ -488,7 +592,7 @@ module Make (Config : CONFIG) = struct
           | None, Some code -> Printf.sprintf "Service error code: %d" code
           | None, None -> "API error"
         with _ -> "API error")
-        ~raw_response:body ()
+        ~raw_response:redacted_body ()
   
   (** Refresh OAuth 2.0 access token (PARTNER PROGRAM ONLY)
       
@@ -515,8 +619,14 @@ module Make (Config : CONFIG) = struct
     
     if not enable_programmatic_refresh then
       on_error "Programmatic refresh not enabled - user must re-authorize. Set LINKEDIN_ENABLE_PROGRAMMATIC_REFRESH=true if you have LinkedIn Partner Program access."
-    else if client_id = "" || client_secret = "" then
+    else if String.trim client_id = "" || String.trim client_secret = "" then
       on_error "LinkedIn OAuth credentials not configured"
+    else if has_surrounding_whitespace client_id || has_surrounding_whitespace client_secret then
+      on_error "LinkedIn OAuth credentials must not contain leading or trailing whitespace"
+    else if has_surrounding_whitespace refresh_token then
+      on_error "LinkedIn refresh token must not contain leading or trailing whitespace"
+    else if is_blank refresh_token then
+      on_error "LinkedIn refresh token is required"
     else (
       let url = Printf.sprintf "%s/accessToken" linkedin_auth_url in
       
@@ -537,12 +647,18 @@ module Make (Config : CONFIG) = struct
             try
               let json = Yojson.Basic.from_string response.body in
               let open Yojson.Basic.Util in
-              let new_access = json |> member "access_token" |> to_string in
+              let new_access = json |> member "access_token" |> to_string |> String.trim in
+              if new_access = "" then
+                on_error "LinkedIn OAuth response contains empty access token"
+              else
               let new_refresh = 
-                try json |> member "refresh_token" |> to_string 
-                with _ -> refresh_token in
+                try
+                  let parsed = json |> member "refresh_token" |> to_string |> String.trim in
+                  if parsed = "" then refresh_token else parsed
+                with _ -> refresh_token
+              in
               (* CRITICAL: Read actual expires_in from LinkedIn refresh response *)
-              let expires_in = json |> member "expires_in" |> to_int in
+              let expires_in = normalize_expires_in (json |> member "expires_in" |> to_int) in
               let expires_at = 
                 let now = Ptime_clock.now () in
                 match Ptime.add_span now (Ptime.Span.of_int_s expires_in) with
@@ -636,13 +752,40 @@ module Make (Config : CONFIG) = struct
           try
             let json = Yojson.Basic.from_string response.body in
             (* OpenID Connect returns 'sub' (subject) as the user identifier *)
-            let person_id = json |> Yojson.Basic.Util.member "sub" |> Yojson.Basic.Util.to_string in
-            let person_urn = Printf.sprintf "urn:li:person:%s" person_id in
-            on_success person_urn
+            let raw_person_id = json |> Yojson.Basic.Util.member "sub" |> Yojson.Basic.Util.to_string in
+            if has_surrounding_whitespace raw_person_id then
+              on_error "LinkedIn userinfo subject identifier must not contain leading or trailing whitespace"
+            else if raw_person_id = "" then
+              on_error "LinkedIn userinfo response has empty subject identifier"
+            else
+              let person_urn = Printf.sprintf "urn:li:person:%s" raw_person_id in
+              (match validate_restli_list_item ~field_name:"LinkedIn person URN" person_urn with
+               | Some err -> on_error err
+               | None -> on_success person_urn)
           with e ->
             on_error (Printf.sprintf "Failed to parse person URN: %s" (Printexc.to_string e))
         else
-          on_error (Printf.sprintf "Failed to get person URN (%d): %s" response.status response.body))
+          let redacted = redact_sensitive_payload response.body in
+          let body_message =
+            try
+              let json = Yojson.Basic.from_string redacted in
+              Yojson.Basic.Util.(json |> member "message" |> to_string_option)
+            with _ -> None
+          in
+          let message =
+            match response.status with
+            | 401 ->
+                "Failed to get person URN (401): authentication failed; token may be expired"
+            | 403 ->
+                "Failed to get person URN (403): insufficient permissions (required scopes: openid, profile)"
+            | 429 ->
+                "Failed to get person URN (429): rate limited"
+            | code ->
+                (match body_message with
+                 | Some msg -> Printf.sprintf "Failed to get person URN (%d): %s" code msg
+                 | None -> Printf.sprintf "Failed to get person URN (%d)" code)
+          in
+          on_error message)
       on_error
   
   (** Register image upload with LinkedIn *)
@@ -906,7 +1049,7 @@ module Make (Config : CONFIG) = struct
                           on_result (Error_types.Success post_id)
                         else
                           on_result (Error_types.Failure (parse_api_error 
-                            ~status_code:response.status ~body:response.body)))
+                            ~required_scopes:["w_member_social"] ~status_code:response.status ~body:response.body)))
                       (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
                         (Error_types.Connection_failed err)))))
                    (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
@@ -969,10 +1112,27 @@ module Make (Config : CONFIG) = struct
   
   (** OAuth authorization URL *)
   let get_oauth_url ~redirect_uri ~state on_success on_error =
-    let client_id = Config.get_env "LINKEDIN_CLIENT_ID" |> Option.value ~default:"" in
+    let raw_client_id = Config.get_env "LINKEDIN_CLIENT_ID" |> Option.value ~default:"" in
+    let raw_configured_redirect_uri = Config.get_env "LINKEDIN_REDIRECT_URI" |> Option.value ~default:"" in
+    let client_id = String.trim raw_client_id in
+    let configured_redirect_uri = String.trim raw_configured_redirect_uri in
     
-    if client_id = "" then
+    if raw_client_id = "" then
       on_error "LinkedIn client ID not configured"
+    else if has_surrounding_whitespace raw_client_id then
+      on_error "LinkedIn client ID must not contain leading or trailing whitespace"
+    else if has_surrounding_whitespace raw_configured_redirect_uri then
+      on_error "Configured LinkedIn redirect URI must not contain leading or trailing whitespace"
+    else if has_surrounding_whitespace redirect_uri then
+      on_error "LinkedIn redirect URI must not contain leading or trailing whitespace"
+    else if is_blank redirect_uri then
+      on_error "LinkedIn redirect URI is required"
+    else if has_surrounding_whitespace state then
+      on_error "LinkedIn OAuth state must not contain leading or trailing whitespace"
+    else if is_blank state then
+      on_error "LinkedIn OAuth state is required"
+    else if configured_redirect_uri <> "" && redirect_uri <> configured_redirect_uri then
+      on_error "LinkedIn redirect URI does not match configured LINKEDIN_REDIRECT_URI"
     else (
       (* LinkedIn OAuth 2.0 scopes for personal posting
          
@@ -1000,35 +1160,57 @@ module Make (Config : CONFIG) = struct
   
   (** Exchange OAuth code for access token *)
   let exchange_code ~code ~redirect_uri on_success on_error =
-    let client_id = Config.get_env "LINKEDIN_CLIENT_ID" |> Option.value ~default:"" in
-    let client_secret = Config.get_env "LINKEDIN_CLIENT_SECRET" |> Option.value ~default:"" in
+    let raw_client_id = Config.get_env "LINKEDIN_CLIENT_ID" |> Option.value ~default:"" in
+    let raw_client_secret = Config.get_env "LINKEDIN_CLIENT_SECRET" |> Option.value ~default:"" in
+    let raw_configured_redirect_uri = Config.get_env "LINKEDIN_REDIRECT_URI" |> Option.value ~default:"" in
+    let client_id = String.trim raw_client_id in
+    let client_secret = String.trim raw_client_secret in
+    let configured_redirect_uri = String.trim raw_configured_redirect_uri in
     
-    if client_id = "" || client_secret = "" then
+    if raw_client_id = "" || raw_client_secret = "" then
       on_error "LinkedIn OAuth credentials not configured"
+    else if has_surrounding_whitespace raw_client_id || has_surrounding_whitespace raw_client_secret then
+      on_error "LinkedIn OAuth credentials must not contain leading or trailing whitespace"
+    else if has_surrounding_whitespace raw_configured_redirect_uri then
+      on_error "Configured LinkedIn redirect URI must not contain leading or trailing whitespace"
+    else if has_surrounding_whitespace code then
+      on_error "LinkedIn authorization code must not contain leading or trailing whitespace"
+    else if is_blank code then
+      on_error "LinkedIn authorization code is required"
+    else if has_surrounding_whitespace redirect_uri then
+      on_error "LinkedIn redirect URI must not contain leading or trailing whitespace"
+    else if is_blank redirect_uri then
+      on_error "LinkedIn redirect URI is required"
+    else if configured_redirect_uri <> "" && redirect_uri <> configured_redirect_uri then
+      on_error "LinkedIn redirect URI does not match configured LINKEDIN_REDIRECT_URI"
     else (
-      (* LinkedIn expects token exchange parameters as query string in the URL
-         NOTE: No PKCE (code_verifier) - LinkedIn does not support it. *)
       let params = [
         ("grant_type", ["authorization_code"]);
         ("code", [code]);
-        ("redirect_uri", [redirect_uri]);
-        ("client_id", [String.trim client_id]);
-        ("client_secret", [String.trim client_secret]);
+        ("redirect_uri", [String.trim redirect_uri]);
+        ("client_id", [client_id]);
+        ("client_secret", [client_secret]);
       ] in
-      
-      let query_string = Uri.encoded_of_query params in
-      let url = Printf.sprintf "%s/accessToken?%s" linkedin_auth_url query_string in
-      
-      (* POST request with parameters in query string, empty body *)
-      Config.Http.post ~headers:[] ~body:"" url
+
+      let body = Uri.encoded_of_query params in
+      let headers = [
+        ("Content-Type", "application/x-www-form-urlencoded");
+      ] in
+
+      Config.Http.post ~headers ~body (Printf.sprintf "%s/accessToken" linkedin_auth_url)
         (fun response ->
           if response.status >= 200 && response.status < 300 then
             try
               let json = Yojson.Basic.from_string response.body in
               let open Yojson.Basic.Util in
-              let access_token = json |> member "access_token" |> to_string in
+              let access_token = json |> member "access_token" |> to_string |> String.trim in
+              if access_token = "" then
+                on_error "LinkedIn OAuth response contains empty access token"
+              else
               let refresh_token = 
-                try Some (json |> member "refresh_token" |> to_string)
+                try
+                  let parsed = json |> member "refresh_token" |> to_string |> String.trim in
+                  if parsed = "" then None else Some parsed
                 with _ -> None
               in
               
@@ -1036,7 +1218,7 @@ module Make (Config : CONFIG) = struct
                  LinkedIn's token response ALWAYS includes expires_in in seconds.
                  If it's missing, something is seriously wrong with the OAuth response. *)
               let expires_in_result = 
-                try Ok (json |> member "expires_in" |> to_int)
+                try Ok (normalize_expires_in (json |> member "expires_in" |> to_int))
                 with _ -> Error "LinkedIn OAuth response missing 'expires_in' field"
               in
               
@@ -1056,7 +1238,7 @@ module Make (Config : CONFIG) = struct
                 access_token;
                 refresh_token;
                 expires_at = Some expires_at;
-                token_type = "Bearer";
+                token_type = normalize_token_type (json |> member "token_type" |> to_string_option);
               } in
               on_success credentials
             with e ->
@@ -1077,6 +1259,28 @@ module Make (Config : CONFIG) = struct
             on_error (Printf.sprintf "LinkedIn OAuth exchange failed (%d): %s" response.status error_msg))
         on_error
     )
+
+  let validate_oauth_state ~expected ~received on_success on_error =
+    let constant_time_equal a b =
+      let len = String.length a in
+      if len <> String.length b then false
+      else
+        let diff = ref 0 in
+        for i = 0 to len - 1 do
+          diff := !diff lor (Char.code a.[i] lxor Char.code b.[i])
+        done;
+        !diff = 0
+    in
+    if is_blank expected || is_blank received then
+      on_error "OAuth state is required"
+    else if has_surrounding_whitespace expected || has_surrounding_whitespace received then
+      on_error "OAuth state must not contain leading or trailing whitespace"
+    else if String.length expected <> String.length received then
+      on_error "OAuth state mismatch"
+    else if not (constant_time_equal expected received) then
+      on_error "OAuth state mismatch"
+    else
+      on_success ()
   
   (** Validate content length *)
   let validate_content ~text =
@@ -1123,7 +1327,7 @@ module Make (Config : CONFIG) = struct
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse profile: %s" (Printexc.to_string e))))
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              on_result (Error (parse_api_error ~required_scopes:["openid"; "profile"] ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
   
@@ -1135,6 +1339,9 @@ module Make (Config : CONFIG) = struct
       @param post_urn The URN of the post (e.g., "urn:li:share:123456")
   *)
   let get_post ~account_id ~post_urn on_result =
+    match validate_required_urn ~field_name:"LinkedIn post URN" post_urn with
+    | Some err -> on_result (Error (Error_types.Internal_error err))
+    | None ->
     ensure_valid_token ~account_id
       (fun access_token ->
         let url = Printf.sprintf "%s/ugcPosts/%s" linkedin_api_base (Uri.pct_encode post_urn) in
@@ -1173,7 +1380,7 @@ module Make (Config : CONFIG) = struct
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse post: %s" (Printexc.to_string e))))
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              on_result (Error (parse_api_error ~required_scopes:["r_member_social"] ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
   
@@ -1184,16 +1391,22 @@ module Make (Config : CONFIG) = struct
       @param count Number of posts to fetch (default: 10, max: 50)
   *)
   let get_posts ~account_id ?(start=0) ?(count=10) on_result =
+    let start = normalize_start start in
+    let count = normalize_count ~max_count:50 count in
     ensure_valid_token ~account_id
       (fun access_token ->
         get_person_urn ~access_token
           (fun person_urn ->
+            match validate_restli_list_item ~field_name:"LinkedIn person URN" person_urn with
+            | Some err -> on_result (Error (Error_types.Internal_error err))
+            | None ->
             (* Build query parameters for filtering by author *)
+            let authors_param = Printf.sprintf "List(%s)" person_urn in
             let query_params = [
               ("q", "authors");
-              ("authors", person_urn);
+              ("authors", authors_param);
               ("start", string_of_int start);
-              ("count", string_of_int (min count 50));
+              ("count", string_of_int count);
             ] in
             let query_string = Uri.encoded_of_query 
               (List.map (fun (k, v) -> (k, [v])) query_params) in
@@ -1202,6 +1415,7 @@ module Make (Config : CONFIG) = struct
             let headers = [
               ("Authorization", Printf.sprintf "Bearer %s" access_token);
               ("X-Restli-Protocol-Version", "2.0.0");
+              ("X-RestLi-Method", "FINDER");
             ] in
             
             Config.Http.get ~headers url
@@ -1255,7 +1469,7 @@ module Make (Config : CONFIG) = struct
                   with e ->
                     on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse posts: %s" (Printexc.to_string e))))
                 else
-                  on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                  on_result (Error (parse_api_error ~required_scopes:["r_member_social"] ~status_code:response.status ~body:response.body)))
               (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
           (fun err -> on_result (Error (Error_types.Internal_error err))))
       (fun err -> on_result (Error err))
@@ -1278,6 +1492,7 @@ module Make (Config : CONFIG) = struct
   
   (** Create a scroller for user's posts *)
   let create_posts_scroller ~account_id ?(page_size=10) () =
+    let page_size = max 1 page_size in
     let current_start = ref 0 in
     let last_total = ref None in
     
@@ -1298,8 +1513,7 @@ module Make (Config : CONFIG) = struct
     in
     
     let scroll_back on_result =
-      let new_start = max 0 (!current_start - page_size - page_size) in
-      current_start := new_start;
+      let new_start = max 0 (!current_start - page_size) in
       get_posts ~account_id ~start:new_start ~count:page_size
         (fun result ->
           (match result with
@@ -1333,13 +1547,19 @@ module Make (Config : CONFIG) = struct
       (fun access_token ->
         if List.length post_urns = 0 then
           on_result (Ok [])
+        else if List.exists (fun urn -> is_blank urn || has_surrounding_whitespace urn || has_forbidden_restli_list_chars urn) post_urns then
+          on_result
+            (Error
+               (Error_types.Internal_error
+                  "Invalid post URN for batch get: values must be non-blank, trimmed, and must not contain ',', '(' or ')'"))
         else
-          let encoded_ids = List.map Uri.pct_encode post_urns in
-          let ids_param = String.concat "," encoded_ids in
-          let url = Printf.sprintf "%s/ugcPosts?ids=%s" linkedin_api_base ids_param in
+          let ids_param = Printf.sprintf "List(%s)" (String.concat "," post_urns) in
+          let query_string = Uri.encoded_of_query [ ("ids", [ids_param]) ] in
+          let url = Printf.sprintf "%s/ugcPosts?%s" linkedin_api_base query_string in
           let headers = [
             ("Authorization", Printf.sprintf "Bearer %s" access_token);
             ("X-Restli-Protocol-Version", "2.0.0");
+            ("X-RestLi-Method", "BATCH_GET");
           ] in
           
           Config.Http.get ~headers url
@@ -1384,7 +1604,7 @@ module Make (Config : CONFIG) = struct
                 | Ok posts -> on_result (Ok posts)
                 | Error err -> on_result (Error err)
               else
-                on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                on_result (Error (parse_api_error ~required_scopes:["r_member_social"] ~status_code:response.status ~body:response.body)))
             (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
   
@@ -1392,99 +1612,101 @@ module Make (Config : CONFIG) = struct
   
   (** Search posts with custom criteria
       
-      Uses LinkedIn's FINDER method to search posts by various criteria.
-      This is more flexible than simple listing.
+      Uses LinkedIn's authors finder on ugcPosts.
+      Keyword finder search is intentionally rejected because it is not
+      supported by the ugcPosts finder contract.
       
-      @param keywords Optional keywords to search for
-      @param author Optional author URN to filter by
+      @param keywords Optional keyword input (currently unsupported; returns error)
+      @param author Optional author URN to filter by; defaults to current member
       @param start Starting index
       @param count Results per page
   *)
   let search_posts ~account_id ?keywords ?author ?(start=0) ?(count=10) on_result =
+    let start = normalize_start start in
+    let count = normalize_count ~max_count:50 count in
     ensure_valid_token ~account_id
       (fun access_token ->
-        (* Build query parameters for FINDER *)
-        let base_params = [
-          ("q", "search");  (* FINDER name *)
-          ("start", string_of_int start);
-          ("count", string_of_int (min count 50));
-        ] in
-        
-        (* Add optional parameters *)
-        let with_keywords = match keywords with
-          | Some kw -> ("keywords", kw) :: base_params
-          | None -> base_params
+        let fetch_for_author author_urn =
+          match validate_restli_list_item ~field_name:"LinkedIn author URN" author_urn with
+          | Some err -> on_result (Error (Error_types.Internal_error err))
+          | None ->
+              let query_params = [
+                ("q", "authors");
+                ("authors", Printf.sprintf "List(%s)" author_urn);
+                ("start", string_of_int start);
+                ("count", string_of_int count);
+              ] in
+              let query_string =
+                Uri.encoded_of_query (List.map (fun (k, v) -> (k, [v])) query_params)
+              in
+              let url = Printf.sprintf "%s/ugcPosts?%s" linkedin_api_base query_string in
+              let headers = [
+                ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                ("X-Restli-Protocol-Version", "2.0.0");
+                ("X-RestLi-Method", "FINDER");
+              ] in
+              Config.Http.get ~headers url
+                (fun response ->
+                  if response.status >= 200 && response.status < 300 then
+                    try
+                      let json = Yojson.Basic.from_string response.body in
+                      let open Yojson.Basic.Util in
+                      let elements_json = json |> member "elements" |> to_list in
+                      let posts = List.map (fun elem ->
+                        {
+                          id = elem |> member "id" |> to_string;
+                          author = elem |> member "author" |> to_string;
+                          created_at = (try elem |> member "created" |> member "time" |> to_string_option with _ -> None);
+                          text = (try
+                            elem
+                            |> member "specificContent"
+                            |> member "com.linkedin.ugc.ShareContent"
+                            |> member "shareCommentary"
+                            |> member "text"
+                            |> to_string_option
+                          with _ -> None);
+                          visibility = (try
+                            elem
+                            |> member "visibility"
+                            |> member "com.linkedin.ugc.MemberNetworkVisibility"
+                            |> to_string_option
+                          with _ -> None);
+                          lifecycle_state = elem |> member "lifecycleState" |> to_string_option;
+                        }
+                      ) elements_json in
+                      let paging = try
+                        let paging_json = json |> member "paging" in
+                        Some {
+                          start = paging_json |> member "start" |> to_int;
+                          count = paging_json |> member "count" |> to_int;
+                          total = paging_json |> member "total" |> to_int_option;
+                        }
+                      with _ -> None in
+                      on_result (Ok { elements = posts; paging; metadata = None })
+                    with e ->
+                      on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse search results: %s" (Printexc.to_string e))))
+                  else
+                    on_result (Error (parse_api_error ~required_scopes:["r_member_social"] ~status_code:response.status ~body:response.body)))
+                (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
         in
-        
-        let with_author = match author with
-          | Some auth -> ("author", auth) :: with_keywords
-          | None -> with_keywords
-        in
-        
-        let query_string = Uri.encoded_of_query 
-          (List.map (fun (k, v) -> (k, [v])) with_author) in
-        
-        let url = Printf.sprintf "%s/ugcPosts?%s" linkedin_api_base query_string in
-        let headers = [
-          ("Authorization", Printf.sprintf "Bearer %s" access_token);
-          ("X-Restli-Protocol-Version", "2.0.0");
-        ] in
-        
-        Config.Http.get ~headers url
-          (fun response ->
-            if response.status >= 200 && response.status < 300 then
-              try
-                let json = Yojson.Basic.from_string response.body in
-                let open Yojson.Basic.Util in
-                
-                let elements_json = json |> member "elements" |> to_list in
-                let posts = List.map (fun elem ->
-                  {
-                    id = elem |> member "id" |> to_string;
-                    author = elem |> member "author" |> to_string;
-                    created_at = (try elem |> member "created" |> member "time" |> to_string_option with _ -> None);
-                    text = (try
-                      elem 
-                      |> member "specificContent" 
-                      |> member "com.linkedin.ugc.ShareContent"
-                      |> member "shareCommentary"
-                      |> member "text"
-                      |> to_string_option
-                    with _ -> None);
-                    visibility = (try
-                      elem
-                      |> member "visibility"
-                      |> member "com.linkedin.ugc.MemberNetworkVisibility"
-                      |> to_string_option
-                    with _ -> None);
-                    lifecycle_state = elem |> member "lifecycleState" |> to_string_option;
-                  }
-                ) elements_json in
-                
-                let paging = try
-                  let paging_json = json |> member "paging" in
-                  Some {
-                    start = paging_json |> member "start" |> to_int;
-                    count = paging_json |> member "count" |> to_int;
-                    total = paging_json |> member "total" |> to_int_option;
-                  }
-                with _ -> None in
-                
-                let collection = {
-                  elements = posts;
-                  paging = paging;
-                  metadata = None;
-                } in
-                on_result (Ok collection)
-              with e ->
-                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse search results: %s" (Printexc.to_string e))))
-            else
-              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
-          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+        match keywords with
+        | Some _ ->
+            on_result
+              (Error
+                 (Error_types.Internal_error
+                    "LinkedIn UGC Posts API does not support keyword finder search; use author filtering"))
+        | None ->
+            (match author with
+            | Some auth -> fetch_for_author auth
+            | None ->
+                get_person_urn ~access_token
+                  (fun person_urn -> fetch_for_author person_urn)
+                  (fun err -> on_result (Error (Error_types.Internal_error err)))) )
       (fun err -> on_result (Error err))
   
   (** Create a scroller for post search *)
   let create_search_scroller ~account_id ?keywords ?author ?(page_size=10) () =
+    let page_size = max 1 page_size in
     let current_start = ref 0 in
     let last_total = ref None in
     
@@ -1504,8 +1726,7 @@ module Make (Config : CONFIG) = struct
     in
     
     let scroll_back on_result =
-      let new_start = max 0 (!current_start - page_size - page_size) in
-      current_start := new_start;
+      let new_start = max 0 (!current_start - page_size) in
       search_posts ~account_id ?keywords ?author ~start:new_start ~count:page_size
         (fun result ->
           (match result with
@@ -1534,6 +1755,9 @@ module Make (Config : CONFIG) = struct
       @param post_urn The URN of the post to like
   *)
   let like_post ~account_id ~post_urn on_result =
+    match validate_required_urn ~field_name:"LinkedIn post URN" post_urn with
+    | Some err -> on_result (Error (Error_types.Internal_error err))
+    | None ->
     ensure_valid_token ~account_id
       (fun access_token ->
         get_person_urn ~access_token
@@ -1557,7 +1781,7 @@ module Make (Config : CONFIG) = struct
                 if response.status >= 200 && response.status < 300 then
                   on_result (Ok ())
                 else
-                  on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                  on_result (Error (parse_api_error ~required_scopes:["w_member_social"] ~status_code:response.status ~body:response.body)))
               (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
           (fun err -> on_result (Error (Error_types.Internal_error err))))
       (fun err -> on_result (Error err))
@@ -1568,6 +1792,9 @@ module Make (Config : CONFIG) = struct
       @param post_urn The URN of the post to unlike
   *)
   let unlike_post ~account_id ~post_urn on_result =
+    match validate_required_urn ~field_name:"LinkedIn post URN" post_urn with
+    | Some err -> on_result (Error (Error_types.Internal_error err))
+    | None ->
     ensure_valid_token ~account_id
       (fun access_token ->
         get_person_urn ~access_token
@@ -1588,7 +1815,7 @@ module Make (Config : CONFIG) = struct
                 if response.status >= 200 && response.status < 300 then
                   on_result (Ok ())
                 else
-                  on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                  on_result (Error (parse_api_error ~required_scopes:["w_member_social"] ~status_code:response.status ~body:response.body)))
               (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
           (fun err -> on_result (Error (Error_types.Internal_error err))))
       (fun err -> on_result (Error err))
@@ -1600,6 +1827,12 @@ module Make (Config : CONFIG) = struct
       @param text The comment text
   *)
   let comment_on_post ~account_id ~post_urn ~text on_result =
+    if is_blank text then
+      on_result (Error (Error_types.Internal_error "LinkedIn comment text is required"))
+    else
+    match validate_required_urn ~field_name:"LinkedIn post URN" post_urn with
+    | Some err -> on_result (Error (Error_types.Internal_error err))
+    | None ->
     ensure_valid_token ~account_id
       (fun access_token ->
         get_person_urn ~access_token
@@ -1634,7 +1867,7 @@ module Make (Config : CONFIG) = struct
                     (* If we can't parse the ID, just return success *)
                     on_result (Ok "unknown")
                 else
-                  on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+                  on_result (Error (parse_api_error ~required_scopes:["w_member_social"] ~status_code:response.status ~body:response.body)))
               (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
           (fun err -> on_result (Error (Error_types.Internal_error err))))
       (fun err -> on_result (Error err))
@@ -1647,11 +1880,16 @@ module Make (Config : CONFIG) = struct
       @param count Number of comments to fetch
   *)
   let get_post_comments ~account_id ~post_urn ?(start=0) ?(count=10) on_result =
+    match validate_required_urn ~field_name:"LinkedIn post URN" post_urn with
+    | Some err -> on_result (Error (Error_types.Internal_error err))
+    | None ->
+    let start = normalize_start start in
+    let count = normalize_count ~max_count:100 count in
     ensure_valid_token ~account_id
       (fun access_token ->
         let query_params = [
           ("start", string_of_int start);
-          ("count", string_of_int (min count 100));
+          ("count", string_of_int count);
         ] in
         let query_string = Uri.encoded_of_query 
           (List.map (fun (k, v) -> (k, [v])) query_params) in
@@ -1698,7 +1936,7 @@ module Make (Config : CONFIG) = struct
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse comments: %s" (Printexc.to_string e))))
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              on_result (Error (parse_api_error ~required_scopes:["r_member_social"] ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
   
@@ -1709,6 +1947,9 @@ module Make (Config : CONFIG) = struct
       @param post_urn The URN of the post
   *)
   let get_post_engagement ~account_id ~post_urn on_result =
+    match validate_required_urn ~field_name:"LinkedIn post URN" post_urn with
+    | Some err -> on_result (Error (Error_types.Internal_error err))
+    | None ->
     ensure_valid_token ~account_id
       (fun access_token ->
         let url = Printf.sprintf "%s/socialMetadata/%s" 
@@ -1735,7 +1976,7 @@ module Make (Config : CONFIG) = struct
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse engagement: %s" (Printexc.to_string e))))
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body)))
+              on_result (Error (parse_api_error ~required_scopes:["r_member_social"] ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
 end

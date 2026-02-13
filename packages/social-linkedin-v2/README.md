@@ -2,14 +2,14 @@
 
 OCaml library for LinkedIn API v2 integration with runtime-agnostic design.
 
-> **Status:** This library was primarily built using LLMs. OAuth 2.0 and posting functionality have been used successfully. Read operations and other features should be considered untested. Expect breaking changes as we work towards stability.
+> **Status:** This library was primarily built using LLMs. OAuth, posting, and key read paths now have mocked contract tests. Live LinkedIn integration testing is still recommended before production rollout. Expect breaking changes as we work towards stability.
 
 ## Features
 
 - **OAuth 2.0 Authentication**: Full OAuth flow support (authorization_code grant)
 - **Personal Posting**: Post text, images, and videos to personal profiles
 - **OpenID Connect**: Uses OpenID Connect for user identification
-- **Media Upload**: Support for images (up to 10 MB) and videos (up to 200 MB)
+- **Media Upload**: Support for images (up to 8 MB) and videos (up to 200 MB)
 - **Alt Text Support**: Accessibility support for media descriptions
 - **Token Refresh**: Optional programmatic refresh (Partner Program only)
 - **Profile Fetching**: Get current user's profile information
@@ -17,63 +17,30 @@ OCaml library for LinkedIn API v2 integration with runtime-agnostic design.
 - **Pagination Support**: Built-in scroller pattern for navigating through pages
 - **Collection Responses**: Structured responses with paging metadata
 - **Batch Operations**: Efficiently fetch multiple entities in one API call
-- **Search/FINDER**: Search posts by keywords and criteria
+- **Search/FINDER**: Author-based finder support for post retrieval
 - **Engagement**: Like, unlike, comment on posts
-- **Social Metrics**: Fetch engagement statistics (likes, comments, shares)
+- **Engagement Data**: Fetch comments and basic interaction data for posts
 - **Runtime Agnostic**: Works with Lwt, Eio, or synchronous runtimes via CPS
+
+## Coverage Status
+
+Test labels used below:
+- `mocked` = covered by deterministic unit/contract tests in `test/test_linkedin.ml`
+- `live` = validated against real LinkedIn APIs (limited, depends on app/account permissions)
+
+Current status:
+- OAuth (`get_oauth_url`, `exchange_code`, refresh gating/flows, state validation): `mocked`, limited `live`
+- Posting (`post_single`, URL preview, video path, media upload registration): `mocked`, limited `live`
+- Reads (`get_profile`, `get_post`, `get_posts`, `batch_get_posts`, author finder search): `mocked`
+- Engagement writes/reads (`like_post`, `unlike_post`, `comment_on_post`, `get_post_comments`, `get_post_engagement`): `mocked`
+- Pagination helpers (`create_posts_scroller`, `create_search_scroller`): `mocked`
 
 ## LinkedIn Token Refresh Notes
 
-⚠️ **Important**: Programmatic token refresh is ONLY available for LinkedIn Partner Program apps.
-
-### Token Expiration Behavior
-
-**Critical**: This library now correctly reads the actual `expires_in` value from LinkedIn's OAuth response. Previous versions hardcoded a 60-day expiration, which could cause unexpected failures if LinkedIn returned shorter-lived tokens.
-
-LinkedIn's token lifetime can vary:
-- **Documented**: 60 days for standard apps
-- **Reality**: May be shorter (hours to days) depending on app configuration, scopes, or security policies
-- **This library**: Always uses the actual `expires_in` value from LinkedIn's response
-
-**Example**: If LinkedIn returns `{"expires_in": 7200}` (2 hours), the token will be correctly set to expire in 2 hours, not 60 days.
-
-### Standard Apps
-- Apps using "Sign In with LinkedIn" or "Share on LinkedIn" products
-- Token lifetime varies (check LinkedIn's response)
-- Typically do NOT receive a `refresh_token` in OAuth response
-- Users must re-authorize through OAuth when tokens expire
-- The consent screen is bypassed if user is already logged in
-- This is the default configuration
-
-### Partner Program Apps
-- Apps enrolled in LinkedIn Marketing Developer Platform or similar programs
-- May receive `refresh_token` in OAuth response
-- Can use programmatic refresh with `refresh_token` grant
-- Set `LINKEDIN_ENABLE_PROGRAMMATIC_REFRESH=true` in environment
-- Requires special LinkedIn approval
-
-### Debugging Token Issues
-
-The library now includes comprehensive logging to help diagnose token issues:
-
-```
-[LinkedIn] OAuth exchange successful: access_token received, refresh_token ABSENT
-[LinkedIn] Token expires in 7200 seconds (0 days) according to LinkedIn response
-[LinkedIn] Token expires at: 2025-11-15T14:30:00Z
-```
-
-Monitor these logs to understand:
-1. Whether LinkedIn provides a `refresh_token`
-2. The actual token lifetime (in seconds and days)
-3. When the token will expire
-
-If you see short-lived tokens (< 24 hours) consistently:
-- Check your LinkedIn app configuration
-- Verify the scopes you're requesting
-- Review LinkedIn Developer Portal for API changes
-- Consider applying for LinkedIn Partner Program for longer-lived tokens
-
-Check your app's products in the LinkedIn Developer Portal to determine which type you have.
+- Programmatic refresh is available only to approved LinkedIn Partner Program apps.
+- Standard apps should expect re-authorization when access tokens expire.
+- Token expiration is taken from LinkedIn's returned `expires_in` value (no hardcoded lifetime).
+- Enable partner refresh with `LINKEDIN_ENABLE_PROGRAMMATIC_REFRESH=true`.
 
 ## Installation
 
@@ -280,11 +247,11 @@ LinkedIn.batch_get_posts ~account_id ~post_urns
         Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
-### Search Posts (FINDER Pattern)
+### Search Posts (Author Finder)
 
 ```ocaml
-(* Search posts by keywords *)
-LinkedIn.search_posts ~account_id ~keywords:"OCaml" ~start:0 ~count:10
+(* Search posts by author (or omit author to use current authenticated member) *)
+LinkedIn.search_posts ~account_id ~author:"urn:li:person:abc123" ~start:0 ~count:10
   (function
     | Ok collection ->
         Printf.printf "Found %d posts\n" (List.length collection.elements);
@@ -294,15 +261,22 @@ LinkedIn.search_posts ~account_id ~keywords:"OCaml" ~start:0 ~count:10
     | Error err -> 
         Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
 
-(* Use scroller for search *)
+(* Use scroller for author-based search *)
 let search_scroller = LinkedIn.create_search_scroller 
-  ~account_id ~keywords:"functional programming" ~page_size:5 () in
+  ~account_id ~author:"urn:li:person:abc123" ~page_size:5 () in
 
 search_scroller.scroll_next
   (function
     | Ok page -> (* Handle search results *) ()
     | Error err -> 
         Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
+
+(* Keyword search on ugcPosts is intentionally rejected *)
+LinkedIn.search_posts ~account_id ~keywords:"ocaml"
+  (function
+    | Ok _ -> ()
+    | Error err ->
+        Printf.eprintf "Expected limitation: %s\n" (Social_core.Error_types.error_to_string err))
 ```
 
 ### Engagement APIs
@@ -373,7 +347,7 @@ The LinkedIn provider uses these scopes depending on features:
 - `w_member_social` - Post as individual member
 
 ### Reading Features (Profile, Posts)
-- `r_liteprofile` - Read profile data (legacy, prefer `profile`)
+- `profile` - OpenID profile data via userinfo endpoint
 - `r_member_social` - Read member's posts and social activity
 
 ### Engagement Features (Likes, Comments)
@@ -573,7 +547,7 @@ Fetch a single post by its URN.
 ```ocaml
 val get_post :
   account_id:string ->
-  post_urn:string ->
+  post_urn:string ->          (* Required; must be trimmed and not contain ',', '(' or ')' *)
   ((post_info, Error_types.error) result -> unit) ->  (* on_result *)
   unit
 ```
@@ -584,8 +558,8 @@ Fetch user's posts with pagination support.
 ```ocaml
 val get_posts :
   account_id:string ->
-  ?start:int ->              (* Starting index (default: 0) *)
-  ?count:int ->              (* Number to fetch (default: 10, max: 50) *)
+  ?start:int ->              (* Starting index (default: 0, clamped to >= 0) *)
+  ?count:int ->              (* Number to fetch (default: 10, normalized to 1..50) *)
   ((post_info collection_response, Error_types.error) result -> unit) ->  (* on_result *)
   unit
 ```
@@ -607,6 +581,8 @@ val batch_get_posts :
 ```
 
 Batch operations are more efficient than multiple individual requests. Useful when you have specific post URNs to fetch.
+Input notes:
+- `post_urns` must be non-blank, trimmed, and must not contain `,`, `(`, or `)` (Rest.li list encoding guardrails)
 
 ### Pagination Helper
 
@@ -616,7 +592,7 @@ Create a scroller for convenient page navigation.
 ```ocaml
 val create_posts_scroller :
   account_id:string ->
-  ?page_size:int ->           (* Posts per page (default: 10) *)
+  ?page_size:int ->           (* Posts per page (default: 10, minimum: 1) *)
   unit ->
   post_info scroller
 ```
@@ -648,20 +624,22 @@ scroller.scroll_back handle_result;
 ### Search Functions
 
 #### `search_posts`
-Search for posts using the FINDER pattern with flexible criteria.
+Search for posts using author-based finder criteria.
 
 ```ocaml
 val search_posts :
   account_id:string ->
-  ?keywords:string ->        (* Search keywords *)
-  ?author:string ->          (* Filter by author URN *)
-  ?start:int ->              (* Starting index (default: 0) *)
-  ?count:int ->              (* Results per page (default: 10, max: 50) *)
+  ?keywords:string ->        (* Currently unsupported for ugcPosts; returns error if set *)
+  ?author:string ->          (* Filter by author URN; must be trimmed and Rest.li-safe *)
+  ?start:int ->              (* Starting index (default: 0, clamped to >= 0) *)
+  ?count:int ->              (* Results per page (default: 10, normalized to 1..50) *)
   ((post_info collection_response, Error_types.error) result -> unit) ->  (* on_result *)
   unit
 ```
 
-More flexible than `get_posts` as it supports keyword search and filtering.
+Current behavior:
+- Supports author filtering (`authors=List(...)` finder shape)
+- Rejects keyword finder search because this is not supported by the LinkedIn `ugcPosts` finder contract
 
 #### `create_search_scroller`
 Create a scroller for search results.
@@ -669,9 +647,9 @@ Create a scroller for search results.
 ```ocaml
 val create_search_scroller :
   account_id:string ->
-  ?keywords:string ->
+  ?keywords:string ->        (* Currently unsupported for ugcPosts; returns error if set *)
   ?author:string ->
-  ?page_size:int ->
+  ?page_size:int ->          (* Results per page (default: 10, minimum: 1) *)
   unit ->
   post_info scroller
 ```
@@ -684,7 +662,7 @@ Add a like/reaction to a post.
 ```ocaml
 val like_post :
   account_id:string ->
-  post_urn:string ->
+  post_urn:string ->          (* Required; must be trimmed and not contain ',', '(' or ')' *)
   ((unit, Error_types.error) result -> unit) ->  (* on_result *)
   unit
 ```
@@ -695,7 +673,7 @@ Remove a like/reaction from a post.
 ```ocaml
 val unlike_post :
   account_id:string ->
-  post_urn:string ->
+  post_urn:string ->          (* Required; must be trimmed and not contain ',', '(' or ')' *)
   ((unit, Error_types.error) result -> unit) ->  (* on_result *)
   unit
 ```
@@ -706,8 +684,8 @@ Add a comment to a post.
 ```ocaml
 val comment_on_post :
   account_id:string ->
-  post_urn:string ->
-  text:string ->
+  post_urn:string ->          (* Required; must be trimmed and not contain ',', '(' or ')' *)
+  text:string ->              (* Required; blank/whitespace-only text is rejected *)
   ((string, Error_types.error) result -> unit) ->  (* on_result: Ok returns comment_id *)
   unit
 ```
@@ -718,9 +696,9 @@ Fetch comments on a post with pagination.
 ```ocaml
 val get_post_comments :
   account_id:string ->
-  post_urn:string ->
-  ?start:int ->
-  ?count:int ->
+  post_urn:string ->          (* Required; must be trimmed and not contain ',', '(' or ')' *)
+  ?start:int ->              (* Starting index (default: 0, clamped to >= 0) *)
+  ?count:int ->              (* Results per page (default: 10, normalized to 1..100) *)
   ((comment_info collection_response, Error_types.error) result -> unit) ->  (* on_result *)
   unit
 ```
@@ -731,7 +709,7 @@ Get engagement statistics for a post.
 ```ocaml
 val get_post_engagement :
   account_id:string ->
-  post_urn:string ->
+  post_urn:string ->          (* Required; must be trimmed and not contain ',', '(' or ')' *)
   ((engagement_info, Error_types.error) result -> unit) ->  (* on_result *)
   unit
 ```
@@ -752,7 +730,7 @@ Returns metrics including:
 - URLs are automatically converted to link previews
 
 ### Images
-- Maximum file size: 10 MB
+- Maximum file size: 8 MB
 - Supported formats: JPEG, PNG, GIF
 - Maximum resolution: 7680 × 4320
 - Maximum count: 9 images per post
@@ -796,24 +774,6 @@ Common error messages:
 - `"Token refresh failed"` - OAuth refresh failed (check credentials)
 - `"LinkedIn API error (XXX)"` - API returned an error (see status code)
 - `"Programmatic refresh not enabled"` - Standard app trying to use refresh (expected)
-
-## Testing
-
-Run the test suite:
-
-```bash
-cd packages/social-linkedin-v2
-dune test
-```
-
-Tests include:
-- OAuth URL generation
-- Token exchange
-- Person URN retrieval
-- Media upload registration
-- Content validation
-- Token refresh (both standard and partner apps)
-- Health status updates
 
 ## Development
 

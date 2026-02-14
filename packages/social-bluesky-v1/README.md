@@ -11,8 +11,8 @@ Bluesky AT Protocol v1 client for OCaml.
 - ✅ Delete posts
 - ✅ Full thread support with proper reply chains
 - ✅ Quote posts with optional media
-- ✅ Media upload (blobs) - up to 4 images
-- ✅ Video upload validation (50MB, 60s max)
+- ✅ Media upload (up to 4 images; video uses `app.bsky.video.uploadVideo` first with blob fallback)
+- ✅ Video upload validation (50MB size limit, duration check when duration metadata is available)
 
 ### Rich Text
 - ✅ URL detection and linking
@@ -53,18 +53,18 @@ Bluesky AT Protocol v1 client for OCaml.
 - ✅ Session management
 - ✅ Health status tracking
 
-## Authentication (Not OAuth)
+## Authentication (Current Provider Model)
 
-**Bluesky does not use OAuth.** Instead, it uses app passwords via the AT Protocol.
+This provider currently authenticates with app passwords via AT Protocol session endpoints.
 
 ### How It Works
 
 | Property | Value |
 |----------|-------|
 | Auth method | App passwords |
-| OAuth | Not used |
-| Token lifetime | App passwords never expire |
-| Session tokens | Short-lived, auto-refreshed |
+| OAuth | Not used by this provider implementation |
+| App password lifetime | User-managed (can be revoked/rotated) |
+| Session tokens | Short-lived, minted via `createSession` on each API call |
 
 ### Setup
 
@@ -88,7 +88,7 @@ Since Bluesky uses app passwords instead of OAuth, there are no scopes to reques
 - ✅ Content length validation (300 chars)
 - ✅ Media size validation (1MB images, 50MB video)
 - ✅ Media type validation
-- ✅ Video duration validation (60s max)
+- ✅ Video duration validation (60s max, when duration metadata is available)
 
 ## Usage
 

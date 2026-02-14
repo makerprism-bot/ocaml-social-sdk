@@ -3,3 +3,4 @@ _build/
 .merlin
 *.opam
 !*.opam.template
+dev-tools.locks/

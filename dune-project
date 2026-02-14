@@ -90,7 +90,8 @@
   (social-core (= :version))
   yojson
   uri
-  ptime))
+  ptime
+  digestif))
 
 (package
  (name social-instagram-graph-v21)

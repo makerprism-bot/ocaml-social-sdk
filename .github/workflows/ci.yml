@@ -44,3 +44,25 @@ jobs:
 
       - name: Run tests
         run: dune runtest
+
+      - name: Verify package metadata in isolation
+        run: |
+          for pkg in \
+            social-core \
+            social-lwt \
+            social-twitter-v2 \
+            social-bluesky-v1 \
+            social-linkedin-v2 \
+            social-mastodon-v1 \
+            social-facebook-graph-v21 \
+            social-instagram-graph-v21 \
+            social-youtube-data-v3 \
+            social-pinterest-v5 \
+            social-tiktok-v1 \
+            social-reddit-v1 \
+            social-threads-v1
+          do
+            echo "Checking $pkg"
+            dune pkg lock --only-packages="$pkg"
+            dune build --only-packages="$pkg" @pkg-install
+          done

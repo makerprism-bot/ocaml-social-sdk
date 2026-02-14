@@ -289,6 +289,42 @@ let test_validate_body_valid () =
   | Ok () -> print_endline "✓ Body validation - valid passes"
   | Error e -> failwith ("Valid body should pass: " ^ e)
 
+let test_validate_media_video_too_large () =
+  let media : Platform_types.post_media = {
+    media_type = Platform_types.Video;
+    mime_type = "video/mp4";
+    file_size_bytes = (1024 * 1024 * 1024) + 1;
+    width = Some 1920;
+    height = Some 1080;
+    duration_seconds = Some 30.0;
+    alt_text = None;
+  } in
+  match Reddit.validate_media ~media with
+  | Error [Error_types.Media_too_large _] ->
+      print_endline "✓ Video validation - oversized video rejected"
+  | Error errs ->
+      failwith ("Unexpected video size validation result: " ^ String.concat ", " (List.map Error_types.validation_error_to_string errs))
+  | Ok () ->
+      failwith "Oversized video should fail validation"
+
+let test_validate_media_video_too_long () =
+  let media : Platform_types.post_media = {
+    media_type = Platform_types.Video;
+    mime_type = "video/mp4";
+    file_size_bytes = 1024 * 1024;
+    width = Some 1920;
+    height = Some 1080;
+    duration_seconds = Some 901.0;
+    alt_text = None;
+  } in
+  match Reddit.validate_media ~media with
+  | Error [Error_types.Video_too_long _] ->
+      print_endline "✓ Video validation - overlong video rejected"
+  | Error errs ->
+      failwith ("Unexpected video duration validation result: " ^ String.concat ", " (List.map Error_types.validation_error_to_string errs))
+  | Ok () ->
+      failwith "Overlong video should fail validation"
+
 (** {1 Post Submission Tests} *)
 
 let test_submit_self_post () =
@@ -851,6 +887,544 @@ let test_post_single_link () =
         print_endline "✓ post_single as link post")
       (fun err -> failwith ("post_single failed: " ^ err)))
 
+let test_post_single_video_uses_native_video_flow () =
+  Mock_config.setup_valid_credentials ();
+
+  let video_download_response = {
+    status = 200;
+    body = "fake_video_binary";
+    headers = [ ("content-type", "video/mp4") ];
+  } in
+  let upload_lease_response = {
+    status = 200;
+    body = {|{
+      "args": {
+        "action": "https://reddit-upload.s3.amazonaws.com",
+        "fields": [
+          {"name": "key", "value": "uploads/video_key.mp4"},
+          {"name": "x-amz-algorithm", "value": "AWS4-HMAC-SHA256"}
+        ],
+        "asset": {
+          "asset_id": "asset_video_123",
+          "websocket_url": "wss://reddit.example/ws/asset_video_123"
+        }
+      }
+    }|};
+    headers = [];
+  } in
+  let s3_upload_response = { status = 204; body = ""; headers = [] } in
+  let submit_response = {
+    status = 200;
+    body = {|{
+      "json": {
+        "errors": [],
+        "data": {"id": "vid123", "name": "t3_vid123", "url": "..."}
+      }
+    }|};
+    headers = [];
+  } in
+
+  Mock_http.set_responses [
+    video_download_response;
+    upload_lease_response;
+    s3_upload_response;
+    submit_response;
+  ];
+
+  Reddit.post_single
+    ~account_id:"test_account"
+    ~subreddit:"test"
+    ~title:"Video Post"
+    ~media_urls:["https://cdn.example.com/video.mp4"]
+    ()
+    (handle_outcome
+      (fun post_id ->
+        assert (post_id = "vid123");
+        let chronological = List.rev !Mock_http.requests in
+        assert (List.length chronological = 4);
+
+        let (m1, u1, _, _) = List.nth chronological 0 in
+        assert (m1 = "GET");
+        assert (u1 = "https://cdn.example.com/video.mp4");
+
+        let (m2, u2, _, b2) = List.nth chronological 1 in
+        assert (m2 = "POST");
+        assert (string_contains u2 "/api/media/asset.json");
+        assert (string_contains b2 "mimetype=video%2Fmp4");
+
+        let (m3, u3, _, _) = List.nth chronological 2 in
+        assert (m3 = "POST_MULTIPART");
+        assert (u3 = "https://reddit-upload.s3.amazonaws.com");
+
+        let (m4, u4, _, b4) = List.nth chronological 3 in
+        assert (m4 = "POST");
+        assert (string_contains u4 "/api/submit");
+        assert (string_contains b4 "kind=video");
+        assert (string_contains b4 "url=https");
+        assert (string_contains b4 "video_key.mp4");
+        print_endline "✓ post_single video uses native upload + submit flow")
+      (fun err -> failwith ("Native video flow failed: " ^ err)))
+
+let test_post_single_unknown_extension_video_uses_native_flow () =
+  Mock_config.setup_valid_credentials ();
+
+  let video_download_response = {
+    status = 200;
+    body = "fake_video_binary";
+    headers = [ ("content-type", "video/mp4") ];
+  } in
+  let upload_lease_response = {
+    status = 200;
+    body = {|{
+      "args": {
+        "action": "https://reddit-upload.s3.amazonaws.com",
+        "fields": [
+          {"name": "key", "value": "uploads/video_key_noext.mp4"}
+        ],
+        "asset": {
+          "asset_id": "asset_video_456"
+        }
+      }
+    }|};
+    headers = [];
+  } in
+  let s3_upload_response = { status = 204; body = ""; headers = [] } in
+  let submit_response = {
+    status = 200;
+    body = {|{
+      "json": {
+        "errors": [],
+        "data": {"id": "vid456", "name": "t3_vid456", "url": "..."}
+      }
+    }|};
+    headers = [];
+  } in
+
+  Mock_http.set_responses [
+    video_download_response;
+    upload_lease_response;
+    s3_upload_response;
+    submit_response;
+  ];
+
+  Reddit.post_single
+    ~account_id:"test_account"
+    ~subreddit:"test"
+    ~title:"Video without extension"
+    ~media_urls:["https://cdn.example.com/asset?id=123"]
+    ()
+    (handle_outcome
+      (fun post_id ->
+        assert (post_id = "vid456");
+        let chronological = List.rev !Mock_http.requests in
+        assert (List.length chronological = 4);
+        let (_, _, _, submit_body) = List.nth chronological 3 in
+        assert (string_contains submit_body "kind=video");
+        print_endline "✓ post_single routes unknown extension media via native video flow")
+      (fun err -> failwith ("Unknown-extension video flow failed: " ^ err)))
+
+let test_post_single_video_content_type_with_charset_is_supported () =
+  Mock_config.setup_valid_credentials ();
+
+  let video_download_response = {
+    status = 200;
+    body = "fake_video_binary";
+    headers = [ ("content-type", "video/mp4; charset=binary") ];
+  } in
+  let upload_lease_response = {
+    status = 200;
+    body = {|{
+      "args": {
+        "action": "https://reddit-upload.s3.amazonaws.com",
+        "fields": [
+          {"name": "key", "value": "uploads/video_charset.mp4"}
+        ],
+        "asset": {
+          "asset_id": "asset_video_charset"
+        }
+      }
+    }|};
+    headers = [];
+  } in
+  let s3_upload_response = { status = 204; body = ""; headers = [] } in
+  let submit_response = {
+    status = 200;
+    body = {|{
+      "json": {
+        "errors": [],
+        "data": {"id": "vidcharset", "name": "t3_vidcharset", "url": "..."}
+      }
+    }|};
+    headers = [];
+  } in
+
+  Mock_http.set_responses [
+    video_download_response;
+    upload_lease_response;
+    s3_upload_response;
+    submit_response;
+  ];
+
+  Reddit.post_single
+    ~account_id:"test_account"
+    ~subreddit:"test"
+    ~title:"Video with content-type params"
+    ~media_urls:["https://cdn.example.com/video-param"]
+    ()
+    (handle_outcome
+      (fun post_id ->
+        assert (post_id = "vidcharset");
+        let chronological = List.rev !Mock_http.requests in
+        let (_, _, _, lease_body) = List.nth chronological 1 in
+        assert (string_contains lease_body "mimetype=video%2Fmp4");
+        print_endline "✓ post_single supports video content-type with parameters")
+      (fun err -> failwith ("Video content-type normalization failed: " ^ err)))
+
+let test_post_single_unknown_extension_image_falls_back_to_image_flow () =
+  Mock_config.setup_valid_credentials ();
+
+  let image_download_response = {
+    status = 200;
+    body = "fake_image_binary";
+    headers = [ ("content-type", "image/jpeg") ];
+  } in
+  let image_submit_response = {
+    status = 200;
+    body = {|{
+      "json": {
+        "errors": [],
+        "data": {"id": "img456", "name": "t3_img456", "url": "..."}
+      }
+    }|};
+    headers = [];
+  } in
+
+  Mock_http.set_responses [
+    image_download_response;
+    image_submit_response;
+  ];
+
+  Reddit.post_single
+    ~account_id:"test_account"
+    ~subreddit:"test"
+    ~title:"Image without extension"
+    ~media_urls:["https://cdn.example.com/asset?id=img"]
+    ()
+    (handle_outcome
+      (fun post_id ->
+        assert (post_id = "img456");
+        let chronological = List.rev !Mock_http.requests in
+        assert (List.length chronological = 2);
+        let (m1, _, _, _) = List.nth chronological 0 in
+        assert (m1 = "GET");
+        let (m2, u2, _, b2) = List.nth chronological 1 in
+        assert (m2 = "POST");
+        assert (string_contains u2 "/api/submit");
+        assert (string_contains b2 "kind=image");
+        print_endline "✓ post_single falls back to image flow for unknown extension image media")
+      (fun err -> failwith ("Unknown-extension image fallback failed: " ^ err)))
+
+let test_post_single_unknown_extension_non_image_fails_without_fallback () =
+  Mock_config.setup_valid_credentials ();
+
+  let non_media_download_response = {
+    status = 200;
+    body = "fake_pdf_binary";
+    headers = [ ("content-type", "application/pdf") ];
+  } in
+
+  Mock_http.set_responses [ non_media_download_response ];
+
+  Reddit.post_single
+    ~account_id:"test_account"
+    ~subreddit:"test"
+    ~title:"Unsupported media type"
+    ~media_urls:["https://cdn.example.com/asset?id=pdf"]
+    ()
+    (fun outcome ->
+      match outcome with
+      | Error_types.Failure (Error_types.Validation_error [Error_types.Media_unsupported_format fmt]) ->
+          assert (fmt = "application/pdf");
+          let chronological = List.rev !Mock_http.requests in
+          assert (List.length chronological = 1);
+          print_endline "✓ post_single unknown extension non-image fails without image fallback"
+      | Error_types.Failure err ->
+          failwith ("Unexpected error for unsupported unknown-extension media: " ^ Error_types.error_to_string err)
+      | Error_types.Success _ ->
+          failwith "Unsupported unknown-extension media should not succeed"
+      | Error_types.Partial_success _ ->
+          failwith "Unsupported unknown-extension media should not partially succeed")
+
+let test_post_single_video_with_thumbnail_uses_poster_flow () =
+  Mock_config.setup_valid_credentials ();
+
+  let video_download_response = {
+    status = 200;
+    body = "fake_video_binary";
+    headers = [ ("content-type", "video/mp4") ];
+  } in
+  let video_upload_lease_response = {
+    status = 200;
+    body = {|{
+      "args": {
+        "action": "https://reddit-upload.s3.amazonaws.com",
+        "fields": [
+          {"name": "key", "value": "uploads/video_with_thumb.mp4"}
+        ],
+        "asset": {
+          "asset_id": "asset_video_789"
+        }
+      }
+    }|};
+    headers = [];
+  } in
+  let video_s3_upload_response = { status = 204; body = ""; headers = [] } in
+  let poster_download_response = {
+    status = 200;
+    body = "fake_poster_binary";
+    headers = [ ("content-type", "image/jpeg") ];
+  } in
+  let poster_upload_lease_response = {
+    status = 200;
+    body = {|{
+      "args": {
+        "action": "https://reddit-upload.s3.amazonaws.com",
+        "fields": [
+          {"name": "key", "value": "uploads/poster_for_video.jpg"}
+        ],
+        "asset": {
+          "asset_id": "asset_poster_789"
+        }
+      }
+    }|};
+    headers = [];
+  } in
+  let poster_s3_upload_response = { status = 204; body = ""; headers = [] } in
+  let submit_response = {
+    status = 200;
+    body = {|{
+      "json": {
+        "errors": [],
+        "data": {"id": "vid789", "name": "t3_vid789", "url": "..."}
+      }
+    }|};
+    headers = [];
+  } in
+
+  Mock_http.set_responses [
+    video_download_response;
+    video_upload_lease_response;
+    video_s3_upload_response;
+    poster_download_response;
+    poster_upload_lease_response;
+    poster_s3_upload_response;
+    submit_response;
+  ];
+
+  Reddit.post_single
+    ~account_id:"test_account"
+    ~subreddit:"test"
+    ~title:"Video with thumbnail"
+    ~media_urls:["https://cdn.example.com/video.mp4"; "https://cdn.example.com/poster.jpg"]
+    ()
+    (handle_outcome
+      (fun post_id ->
+        assert (post_id = "vid789");
+        let chronological = List.rev !Mock_http.requests in
+        assert (List.length chronological = 7);
+        let (m4, u4, _, _) = List.nth chronological 3 in
+        assert (m4 = "GET");
+        assert (u4 = "https://cdn.example.com/poster.jpg");
+        let (_, submit_url, _, submit_body) = List.nth chronological 6 in
+        assert (string_contains submit_url "/api/submit");
+        assert (string_contains submit_body "kind=video");
+        assert (string_contains submit_body "video_poster_url=https");
+        assert (string_contains submit_body "poster_for_video.jpg");
+        print_endline "✓ post_single video with thumbnail uploads and submits poster URL")
+      (fun err -> failwith ("Video thumbnail flow failed: " ^ err)))
+
+let test_post_single_video_with_unknown_extension_thumbnail_uses_poster_flow () =
+  Mock_config.setup_valid_credentials ();
+
+  let video_download_response = {
+    status = 200;
+    body = "fake_video_binary";
+    headers = [ ("content-type", "video/mp4") ];
+  } in
+  let video_upload_lease_response = {
+    status = 200;
+    body = {|{
+      "args": {
+        "action": "https://reddit-upload.s3.amazonaws.com",
+        "fields": [
+          {"name": "key", "value": "uploads/video_unknown_thumb.mp4"}
+        ],
+        "asset": {
+          "asset_id": "asset_video_100"
+        }
+      }
+    }|};
+    headers = [];
+  } in
+  let video_s3_upload_response = { status = 204; body = ""; headers = [] } in
+  let poster_download_response = {
+    status = 200;
+    body = "fake_poster_binary";
+    headers = [ ("content-type", "image/png; charset=binary") ];
+  } in
+  let poster_upload_lease_response = {
+    status = 200;
+    body = {|{
+      "args": {
+        "action": "https://reddit-upload.s3.amazonaws.com",
+        "fields": [
+          {"name": "key", "value": "uploads/poster_unknown_ext.png"}
+        ],
+        "asset": {
+          "asset_id": "asset_poster_100"
+        }
+      }
+    }|};
+    headers = [];
+  } in
+  let poster_s3_upload_response = { status = 204; body = ""; headers = [] } in
+  let submit_response = {
+    status = 200;
+    body = {|{
+      "json": {
+        "errors": [],
+        "data": {"id": "vid100", "name": "t3_vid100", "url": "..."}
+      }
+    }|};
+    headers = [];
+  } in
+
+  Mock_http.set_responses [
+    video_download_response;
+    video_upload_lease_response;
+    video_s3_upload_response;
+    poster_download_response;
+    poster_upload_lease_response;
+    poster_s3_upload_response;
+    submit_response;
+  ];
+
+  Reddit.post_single
+    ~account_id:"test_account"
+    ~subreddit:"test"
+    ~title:"Video with unknown-extension thumbnail"
+    ~media_urls:["https://cdn.example.com/video.mp4"; "https://cdn.example.com/asset?id=poster"]
+    ()
+    (handle_outcome
+      (fun post_id ->
+        assert (post_id = "vid100");
+        let chronological = List.rev !Mock_http.requests in
+        assert (List.length chronological = 7);
+        let (m4, u4, _, _) = List.nth chronological 3 in
+        assert (m4 = "GET");
+        assert (u4 = "https://cdn.example.com/asset?id=poster");
+        let (_, submit_url, _, submit_body) = List.nth chronological 6 in
+        assert (string_contains submit_url "/api/submit");
+        assert (string_contains submit_body "video_poster_url=https");
+        assert (string_contains submit_body "poster_unknown_ext.png");
+        print_endline "✓ post_single accepts unknown-extension thumbnail and validates by content-type")
+      (fun err -> failwith ("Unknown-extension thumbnail flow failed: " ^ err)))
+
+let test_post_single_video_with_invalid_thumbnail_still_posts () =
+  Mock_config.setup_valid_credentials ();
+
+  let video_download_response = {
+    status = 200;
+    body = "fake_video_binary";
+    headers = [ ("content-type", "video/mp4") ];
+  } in
+  let video_upload_lease_response = {
+    status = 200;
+    body = {|{
+      "args": {
+        "action": "https://reddit-upload.s3.amazonaws.com",
+        "fields": [
+          {"name": "key", "value": "uploads/video_no_thumb.mp4"}
+        ],
+        "asset": {
+          "asset_id": "asset_video_200"
+        }
+      }
+    }|};
+    headers = [];
+  } in
+  let video_s3_upload_response = { status = 204; body = ""; headers = [] } in
+  let invalid_poster_download_response = {
+    status = 200;
+    body = "fake_pdf_binary";
+    headers = [ ("content-type", "application/pdf") ];
+  } in
+  let submit_response = {
+    status = 200;
+    body = {|{
+      "json": {
+        "errors": [],
+        "data": {"id": "vid200", "name": "t3_vid200", "url": "..."}
+      }
+    }|};
+    headers = [];
+  } in
+
+  Mock_http.set_responses [
+    video_download_response;
+    video_upload_lease_response;
+    video_s3_upload_response;
+    invalid_poster_download_response;
+    submit_response;
+  ];
+
+  Reddit.post_single
+    ~account_id:"test_account"
+    ~subreddit:"test"
+    ~title:"Video should post without invalid thumbnail"
+    ~media_urls:["https://cdn.example.com/video.mp4"; "https://cdn.example.com/not-an-image"]
+    ()
+    (handle_outcome
+      (fun post_id ->
+        assert (post_id = "vid200");
+        let chronological = List.rev !Mock_http.requests in
+        assert (List.length chronological = 5);
+        let (_, submit_url, _, submit_body) = List.nth chronological 4 in
+        assert (string_contains submit_url "/api/submit");
+        assert (string_contains submit_body "kind=video");
+        assert (not (string_contains submit_body "video_poster_url="));
+        print_endline "✓ invalid thumbnail does not block video post")
+      (fun err -> failwith ("Invalid thumbnail should not block post: " ^ err)))
+
+let test_post_single_media_takes_precedence_over_url () =
+  Mock_config.setup_valid_credentials ();
+
+  let response_body = {|{
+    "json": {
+      "errors": [],
+      "data": {"id": "img999", "name": "t3_img999", "url": "..."}
+    }
+  }|} in
+
+  Mock_http.set_response { status = 200; body = response_body; headers = [] };
+
+  Reddit.post_single
+    ~account_id:"test_account"
+    ~subreddit:"test"
+    ~title:"Media Wins"
+    ~url:"https://example.com/article"
+    ~media_urls:["https://cdn.example.com/photo.jpg"]
+    ()
+    (handle_outcome
+      (fun _ ->
+        let (_, _, _, body) = List.hd !Mock_http.requests in
+        assert (string_contains body "kind=image");
+        assert (string_contains body "url=https");
+        assert (string_contains body "photo.jpg");
+        assert (not (string_contains body "kind=link"));
+        print_endline "✓ post_single prefers media over link URL")
+      (fun err -> failwith ("post_single precedence failed: " ^ err)))
+
 (** {1 Token Refresh Tests} *)
 
 let test_token_refresh_expired () =
@@ -1052,6 +1626,8 @@ let () =
   test_validate_title_valid ();
   test_validate_body_too_long ();
   test_validate_body_valid ();
+  test_validate_media_video_too_large ();
+  test_validate_media_video_too_long ();
   
   print_endline "\n--- Post Submission Tests ---";
   test_submit_self_post ();
@@ -1084,6 +1660,15 @@ let () =
   print_endline "\n--- post_single Tests ---";
   test_post_single_self ();
   test_post_single_link ();
+  test_post_single_video_uses_native_video_flow ();
+  test_post_single_unknown_extension_video_uses_native_flow ();
+  test_post_single_video_content_type_with_charset_is_supported ();
+  test_post_single_unknown_extension_image_falls_back_to_image_flow ();
+  test_post_single_unknown_extension_non_image_fails_without_fallback ();
+  test_post_single_video_with_thumbnail_uses_poster_flow ();
+  test_post_single_video_with_unknown_extension_thumbnail_uses_poster_flow ();
+  test_post_single_video_with_invalid_thumbnail_still_posts ();
+  test_post_single_media_takes_precedence_over_url ();
   
   print_endline "\n--- Token Refresh Tests ---";
   test_token_refresh_expired ();
@@ -1100,15 +1685,15 @@ let () =
   print_endline "\n=== All tests passed! ===";
   print_endline "\nTest Coverage Summary:";
   print_endline "  - OAuth 2.0 with Basic Auth (4 tests)";
-  print_endline "  - Content validation (5 tests)";
+  print_endline "  - Content validation (7 tests)";
   print_endline "  - Post submission (4 tests)";
   print_endline "  - Subreddit operations (3 tests)";
   print_endline "  - User operations (1 test)";
   print_endline "  - Error handling (9 tests)";
   print_endline "  - Crosspost (1 test)";
-  print_endline "  - post_single interface (2 tests)";
+  print_endline "  - post_single interface (11 tests)";
   print_endline "  - Token refresh (2 tests)";
   print_endline "  - Header verification (2 tests)";
   print_endline "  - Credentials handling (2 tests)";
   print_endline "";
-  print_endline "Total: 35 test functions\n"
+  print_endline "Total: 46 test functions\n"

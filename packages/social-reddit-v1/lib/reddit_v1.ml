@@ -90,6 +90,7 @@ type media_upload = {
   asset_id: string;               (** Asset ID from Reddit *)
   websocket_url: string option;   (** WebSocket URL for upload status (videos) *)
   upload_url: string;             (** S3 presigned URL for upload *)
+  upload_fields: (string * string) list; (** S3 form fields returned by Reddit *)
 }
 
 (** {1 OAuth Module} *)
@@ -953,10 +954,38 @@ module Make (Config : CONFIG) = struct
                 let open Yojson.Basic.Util in
                 let json = Yojson.Basic.from_string response.body in
                 let args = json |> member "args" in
+                let action_url = args |> member "action" |> to_string in
+                let upload_url =
+                  if String.length action_url > 1 && String.sub action_url 0 2 = "//" then
+                    "https:" ^ action_url
+                  else
+                    action_url
+                in
+                let upload_fields =
+                  try
+                    args
+                    |> member "fields"
+                    |> to_list
+                    |> List.map (fun f ->
+                      (f |> member "name" |> to_string, f |> member "value" |> to_string)
+                    )
+                  with _ -> []
+                in
+                let asset_id =
+                  try args |> member "asset" |> member "asset_id" |> to_string
+                  with _ -> json |> member "asset" |> member "asset_id" |> to_string
+                in
+                let websocket_url =
+                  try Some (args |> member "asset" |> member "websocket_url" |> to_string)
+                  with _ ->
+                    try Some (json |> member "asset" |> member "websocket_url" |> to_string)
+                    with _ -> None
+                in
                 let upload : media_upload = {
-                  asset_id = args |> member "asset" |> member "asset_id" |> to_string;
-                  websocket_url = (try Some (args |> member "asset" |> member "websocket_url" |> to_string) with _ -> None);
-                  upload_url = args |> member "action" |> to_string;
+                  asset_id;
+                  websocket_url;
+                  upload_url;
+                  upload_fields;
                 } in
                 on_result (Error_types.Success upload)
               with e ->
@@ -989,6 +1018,224 @@ module Make (Config : CONFIG) = struct
         else
           on_result (Error_types.Failure (Error_types.Internal_error (Printf.sprintf "S3 upload failed (%d): %s" response.status response.body))))
       (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err)))
+
+  let infer_filename_from_url media_url default_name =
+    let stop_at ch default =
+      try String.index media_url ch with Not_found -> default
+    in
+    let stop_q = stop_at '?' (String.length media_url) in
+    let stop_h = stop_at '#' (String.length media_url) in
+    let stop = min stop_q stop_h in
+    let trimmed = String.sub media_url 0 stop in
+    try
+      let idx = String.rindex trimmed '/' in
+      let candidate = String.sub trimmed (idx + 1) (String.length trimmed - idx - 1) in
+      if String.length candidate = 0 then default_name else candidate
+    with Not_found ->
+      if String.length trimmed = 0 then default_name else trimmed
+
+  let uploaded_media_url lease =
+    match List.assoc_opt "key" lease.upload_fields with
+    | Some key when String.length key > 0 ->
+        let base =
+          if String.length lease.upload_url > 0 && lease.upload_url.[String.length lease.upload_url - 1] = '/' then
+            String.sub lease.upload_url 0 (String.length lease.upload_url - 1)
+          else
+            lease.upload_url
+        in
+        base ^ "/" ^ key
+    | _ -> lease.upload_url
+
+  let normalize_content_type content_type =
+    let lowered = String.lowercase_ascii content_type in
+    let without_params =
+      try
+        let idx = String.index lowered ';' in
+        String.sub lowered 0 idx
+      with Not_found -> lowered
+    in
+    String.trim without_params
+
+  let download_media_url ~url on_result =
+    Config.Http.get ~headers:[] url
+      (fun response ->
+        if response.status >= 200 && response.status < 300 then
+          let mimetype =
+            List.assoc_opt "content-type" response.headers
+            |> Option.value ~default:"application/octet-stream"
+            |> normalize_content_type
+          in
+          on_result (Error_types.Success (response.body, mimetype))
+        else
+          on_result (Error_types.Failure (Error_types.Api_error {
+            status_code = response.status;
+            message = Printf.sprintf "Failed to download media URL (%d)" response.status;
+            platform = Platform_types.Reddit;
+            raw_response = Some response.body;
+            request_id = None;
+          })))
+      (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err)))
+
+  (** Submit a native video post by uploading media then posting kind=video *)
+  let submit_video_post ~account_id ~subreddit ~title ~video_url
+      ?thumbnail_url ?flair_id ?flair_text ?(nsfw=false) ?(spoiler=false) () on_result =
+    let submit_video_request ~access_token ~posted_video_url ?video_poster_url () =
+      let api_url = api_base ^ "/api/submit" in
+      let base_params = [
+        ("api_type", "json");
+        ("kind", "video");
+        ("sr", subreddit);
+        ("title", title);
+        ("url", posted_video_url);
+        ("nsfw", string_of_bool nsfw);
+        ("spoiler", string_of_bool spoiler);
+      ] in
+      let form_params =
+        match video_poster_url with
+        | Some poster -> ("video_poster_url", poster) :: base_params
+        | None -> base_params
+      in
+      let form_params = match flair_id with
+        | Some id -> ("flair_id", id) :: form_params
+        | None -> form_params
+      in
+      let form_params = match flair_text with
+        | Some text -> ("flair_text", text) :: form_params
+        | None -> form_params
+      in
+      let body = List.map (fun (k, v) ->
+        Printf.sprintf "%s=%s" k (Uri.pct_encode v)
+      ) form_params |> String.concat "&" in
+      let headers = [
+        ("Authorization", "Bearer " ^ access_token);
+        ("User-Agent", user_agent);
+        ("Content-Type", "application/x-www-form-urlencoded");
+      ] in
+      Config.Http.post ~headers ~body api_url
+        (fun response ->
+          if response.status >= 200 && response.status < 300 then
+            try
+              let open Yojson.Basic.Util in
+              let json = Yojson.Basic.from_string response.body in
+              let errors =
+                try json |> member "json" |> member "errors" |> to_list
+                with _ -> []
+              in
+              if List.length errors > 0 then
+                on_result (Error_types.Failure (parse_api_error ~status_code:200 ~response_body:response.body))
+              else
+                let data = json |> member "json" |> member "data" in
+                let post_id = data |> member "id" |> to_string in
+                on_result (Error_types.Success post_id)
+            with e ->
+              on_result (Error_types.Failure (Error_types.Internal_error (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))))
+          else
+            on_result (Error_types.Failure (parse_api_error ~status_code:response.status ~response_body:response.body)))
+        (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err)))
+    in
+
+    let upload_thumbnail_if_any on_success =
+      match thumbnail_url with
+      | None -> on_success None
+      | Some poster_url when String.length poster_url = 0 -> on_success None
+      | Some poster_url ->
+          download_media_url ~url:poster_url
+            (fun poster_dl_outcome ->
+              match poster_dl_outcome with
+              | Error_types.Failure _ -> on_success None
+              | Error_types.Partial_success _ ->
+                  on_success None
+              | Error_types.Success (poster_content, poster_mimetype) ->
+                  if not (String.starts_with ~prefix:"image/" poster_mimetype) then
+                    on_success None
+                  else
+                    let poster_media : Platform_types.post_media = {
+                      media_type = Platform_types.Image;
+                      mime_type = poster_mimetype;
+                      file_size_bytes = String.length poster_content;
+                      width = None;
+                      height = None;
+                      duration_seconds = None;
+                      alt_text = None;
+                    } in
+                    match validate_media ~media:poster_media with
+                    | Error _ -> on_success None
+                    | Ok () ->
+                        let poster_filename = infer_filename_from_url poster_url "poster.jpg" in
+                        get_media_upload_lease ~account_id ~filename:poster_filename ~mimetype:poster_mimetype
+                          (fun poster_lease_outcome ->
+                            match poster_lease_outcome with
+                            | Error_types.Failure _ -> on_success None
+                            | Error_types.Partial_success _ ->
+                                on_success None
+                            | Error_types.Success poster_lease ->
+                                upload_media_to_s3
+                                  ~upload_url:poster_lease.upload_url
+                                  ~upload_fields:poster_lease.upload_fields
+                                  ~media_content:poster_content
+                                  ~mimetype:poster_mimetype
+                                  (fun poster_upload_outcome ->
+                                    match poster_upload_outcome with
+                                    | Error_types.Failure _ -> on_success None
+                                    | Error_types.Partial_success _ ->
+                                        on_success None
+                                    | Error_types.Success () ->
+                                        on_success (Some (uploaded_media_url poster_lease)))))
+    in
+
+    match validate_post ~title ~media_count:1 () with
+    | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+    | Ok () ->
+        ensure_valid_token ~account_id
+          (fun access_token ->
+            download_media_url ~url:video_url
+              (fun video_dl_outcome ->
+                match video_dl_outcome with
+                | Error_types.Failure err -> on_result (Error_types.Failure err)
+                | Error_types.Partial_success _ ->
+                    on_result (Error_types.Failure (Error_types.Internal_error "Unexpected partial success while downloading video"))
+                | Error_types.Success (video_content, video_mimetype) ->
+                    if not (String.starts_with ~prefix:"video/" video_mimetype) then
+                      on_result (Error_types.Failure (Error_types.Validation_error [
+                        Error_types.Media_unsupported_format video_mimetype
+                      ]))
+                    else
+                      let video_media : Platform_types.post_media = {
+                        media_type = Platform_types.Video;
+                        mime_type = video_mimetype;
+                        file_size_bytes = String.length video_content;
+                        width = None;
+                        height = None;
+                        duration_seconds = None;
+                        alt_text = None;
+                      } in
+                      match validate_media ~media:video_media with
+                      | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+                      | Ok () ->
+                          let video_filename = infer_filename_from_url video_url "video.mp4" in
+                          get_media_upload_lease ~account_id ~filename:video_filename ~mimetype:video_mimetype
+                            (fun lease_outcome ->
+                              match lease_outcome with
+                              | Error_types.Failure err -> on_result (Error_types.Failure err)
+                              | Error_types.Partial_success _ ->
+                                  on_result (Error_types.Failure (Error_types.Internal_error "Unexpected partial success while requesting video upload lease"))
+                              | Error_types.Success video_lease ->
+                                  upload_media_to_s3
+                                    ~upload_url:video_lease.upload_url
+                                    ~upload_fields:video_lease.upload_fields
+                                    ~media_content:video_content
+                                    ~mimetype:video_mimetype
+                                    (fun upload_outcome ->
+                                      match upload_outcome with
+                                      | Error_types.Failure err -> on_result (Error_types.Failure err)
+                                      | Error_types.Partial_success _ ->
+                                          on_result (Error_types.Failure (Error_types.Internal_error "Unexpected partial success while uploading video to S3"))
+                                      | Error_types.Success () ->
+                                          let posted_video_url = uploaded_media_url video_lease in
+                                          upload_thumbnail_if_any
+                                            (fun video_poster_url ->
+                                              submit_video_request ~access_token ~posted_video_url ?video_poster_url ())))))
+          (fun err -> on_result (Error_types.Failure err))
   
   (** Submit an image post to a subreddit *)
   let submit_image_post ~account_id ~subreddit ~title ~image_url
@@ -1137,7 +1384,7 @@ module Make (Config : CONFIG) = struct
       This function automatically determines the post type based on parameters:
       - If body is provided without url/media: self-post
       - If url is provided without media: link post  
-      - If media_urls is provided: image post (first image)
+      - If media_urls is provided: image or video post (first media URL)
       
       @param account_id Account identifier
       @param subreddit Subreddit to post to (without r/ prefix)
@@ -1150,16 +1397,81 @@ module Make (Config : CONFIG) = struct
       @param nsfw Mark post as NSFW
       @param spoiler Mark post as spoiler
   *)
+  let string_ends_with ~suffix s =
+    let s_len = String.length s in
+    let suffix_len = String.length suffix in
+    s_len >= suffix_len && String.sub s (s_len - suffix_len) suffix_len = suffix
+
+  let strip_url_suffixes url =
+    let stop_at ch default =
+      try String.index url ch with Not_found -> default
+    in
+    let stop_q = stop_at '?' (String.length url) in
+    let stop_h = stop_at '#' (String.length url) in
+    let stop = min stop_q stop_h in
+    String.sub url 0 stop
+
+  let is_likely_video_url url =
+    let path = strip_url_suffixes url |> String.lowercase_ascii in
+    let video_exts = [".mp4"; ".mov"; ".webm"; ".m4v"; ".avi"; ".mkv"] in
+    List.exists (fun ext -> string_ends_with ~suffix:ext path) video_exts
+
+  let is_likely_image_url url =
+    let path = strip_url_suffixes url |> String.lowercase_ascii in
+    let image_exts = [".jpg"; ".jpeg"; ".png"; ".gif"; ".webp"] in
+    List.exists (fun ext -> string_ends_with ~suffix:ext path) image_exts
+
   let post_single ~account_id ~subreddit ~title ?body ?url ?(media_urls=[]) 
       ?flair_id ?flair_text ?(nsfw=false) ?(spoiler=false) () on_result =
     let media_count = List.length media_urls in
+    let submit_as_image ~image_url =
+      submit_image_post ~account_id ~subreddit ~title ~image_url
+        ?flair_id ?flair_text ~nsfw ~spoiler () on_result
+    in
+    let submit_as_video ~video_url ?thumbnail_url () =
+      submit_video_post ~account_id ~subreddit ~title ~video_url ?thumbnail_url
+        ?flair_id ?flair_text ~nsfw ~spoiler () on_result
+    in
+    let has_image_content_type_unsupported errs =
+      List.exists (function
+        | Error_types.Media_unsupported_format fmt ->
+            let lowered = String.lowercase_ascii fmt in
+            String.starts_with ~prefix:"image/" lowered
+        | _ -> false
+      ) errs
+    in
     
     (* Determine post type based on parameters *)
     if media_count > 0 then
-      (* Image post *)
-      let image_url = List.hd media_urls in
-      submit_image_post ~account_id ~subreddit ~title ~image_url
-        ?flair_id ?flair_text ~nsfw ~spoiler () on_result
+      (* Media post *)
+      let media_url = List.hd media_urls in
+      if is_likely_video_url media_url then
+        let thumbnail_url =
+          if media_count > 1 then
+            Some (List.nth media_urls 1)
+          else
+            None
+        in
+        submit_as_video ~video_url:media_url ?thumbnail_url ()
+      else if is_likely_image_url media_url then
+        submit_as_image ~image_url:media_url
+      else
+        (* Unknown extension: try native video flow first, fallback to image URL post
+           only when media type is explicitly non-video. *)
+        let thumbnail_url =
+          if media_count > 1 then
+            Some (List.nth media_urls 1)
+          else
+            None
+        in
+        submit_video_post ~account_id ~subreddit ~title ~video_url:media_url
+          ?thumbnail_url
+          ?flair_id ?flair_text ~nsfw ~spoiler ()
+          (fun outcome ->
+            match outcome with
+            | Error_types.Failure (Error_types.Validation_error errs) when has_image_content_type_unsupported errs ->
+                submit_as_image ~image_url:media_url
+            | _ -> on_result outcome)
     else match url with
     | Some link_url when String.length link_url > 0 ->
         (* Link post *)

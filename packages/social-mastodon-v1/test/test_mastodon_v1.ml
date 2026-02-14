@@ -128,7 +128,10 @@ module Mock_config = struct
   
   let decrypt _data on_success _on_error =
     on_success {|{"access_token":"test_token"}|}
-  
+
+  let sleep ~seconds:_ on_success _on_error =
+    on_success ()
+
   let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error =
     on_success ()
 end

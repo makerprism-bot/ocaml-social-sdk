@@ -330,20 +330,75 @@ let () =
      | None -> "never expires")                             (* never expires *)
 ```
 
+### Read: Home Timeline and Status Lookup
+
+```ocaml
+Mastodon.get_home_timeline
+  ~account_id:"mastodon-account"
+  ~limit:20
+  (function
+    | Ok statuses -> Printf.printf "Fetched %d statuses\n" (List.length statuses)
+    | Error err -> Printf.printf "Error: %s\n" (Error_types.error_to_string err)
+  )
+
+Mastodon.get_status
+  ~account_id:"mastodon-account"
+  ~status_id:"109999999999999999"
+  (function
+    | Ok status -> Printf.printf "Status %s: %s\n" status.id status.content
+    | Error err -> Printf.printf "Error: %s\n" (Error_types.error_to_string err)
+  )
+
+Mastodon.search_accounts
+  ~account_id:"mastodon-account"
+  ~query:"ocaml"
+  ~limit:10
+  (function
+    | Ok accounts -> Printf.printf "Found %d accounts\n" (List.length accounts)
+    | Error err -> Printf.printf "Error: %s\n" (Error_types.error_to_string err)
+  )
+
+Mastodon.get_notifications
+  ~account_id:"mastodon-account"
+  ~limit:20
+  ~exclude_types:["follow"]
+  (function
+    | Ok notifications -> Printf.printf "Fetched %d notifications\n" (List.length notifications)
+    | Error err -> Printf.printf "Error: %s\n" (Error_types.error_to_string err)
+  )
+
+Mastodon.get_instance_limits
+  ~account_id:"mastodon-account"
+  (function
+    | Ok limits ->
+        Printf.printf "max chars: %d, max media: %d\n" limits.max_status_chars limits.max_media_attachments
+    | Error err -> Printf.printf "Error: %s\n" (Error_types.error_to_string err)
+  )
+```
+
 ## Not Yet Implemented
 
-- Fetch instance configuration
-- Timeline reading
-- Account operations (follow, unfollow, etc.)
-- Notifications
-- Search
+- Timeline reading (partial; home/public/tag timelines and single status lookup are implemented)
+- Account operations (partial; follow/unfollow/block/unblock/mute/unmute, follow request list/approve/reject, account read operations including followers/following, account lookup by acct, and featured tags reads are implemented)
+- Notifications (partial; fetch/list and dismiss/clear are implemented)
+- Search (partial; status/account/hashtag search and combined search payload parsing are implemented)
 - Streaming API
-- Filters
-- Lists
-- Direct messages
+- Filters (partial; list/create/update/delete via `/api/v2/filters` are implemented)
+- Lists (partial; list enumeration/timeline, list members/account-lists reads, and list management operations are implemented)
+- Direct messages (partial; conversation list/read/remove are implemented via `/api/v1/conversations`)
 - And many more...
 
 See the [full Mastodon API documentation](https://docs.joinmastodon.org/methods/) for complete API coverage.
+
+## Integration Note
+
+If you instantiate `Social_mastodon_v1.Make` with a custom config module, implement:
+
+```ocaml
+val sleep : seconds:float -> (unit -> unit) -> (string -> unit) -> unit
+```
+
+This is used by media processing polling to avoid hardcoded runtime assumptions.
 
 ## Status
 

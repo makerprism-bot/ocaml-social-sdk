@@ -1,3 +1,54 @@
 (test
  (name test_mastodon_v1)
+ (modules test_mastodon_v1)
+ (libraries social_mastodon_v1 social-core str))
+
+(test
+ (name test_mastodon_oauth_contract)
+ (modules test_mastodon_oauth_contract)
+ (libraries social_mastodon_v1 social-core uri yojson))
+
+(test
+ (name test_mastodon_video_contract)
+ (modules test_mastodon_video_contract)
+ (libraries social_mastodon_v1 social-core))
+
+(test
+ (name test_mastodon_error_contract)
+ (modules test_mastodon_error_contract)
+ (libraries social_mastodon_v1 social-core str))
+
+(test
+ (name test_mastodon_read_contract)
+ (modules test_mastodon_read_contract)
+ (libraries social_mastodon_v1 social-core str uri))
+
+(test
+ (name test_mastodon_account_ops_contract)
+ (modules test_mastodon_account_ops_contract)
+ (libraries social_mastodon_v1 social-core yojson str uri))
+
+(test
+ (name test_mastodon_instance_limits_contract)
+ (modules test_mastodon_instance_limits_contract)
+ (libraries social_mastodon_v1 social-core))
+
+(test
+ (name test_mastodon_offline_differential)
+ (modules test_mastodon_offline_differential)
+ (libraries social_mastodon_v1 social-core str))
+
+(test
+ (name test_mastodon_list_ops_contract)
+ (modules test_mastodon_list_ops_contract)
+ (libraries social_mastodon_v1 social-core str yojson uri))
+
+(test
+ (name test_mastodon_filters_contract)
+ (modules test_mastodon_filters_contract)
+ (libraries social_mastodon_v1 social-core yojson))
+
+(test
+ (name test_mastodon_conversations_contract)
+ (modules test_mastodon_conversations_contract)
  (libraries social_mastodon_v1 social-core str))

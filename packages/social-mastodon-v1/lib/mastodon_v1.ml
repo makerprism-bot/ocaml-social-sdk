@@ -6,6 +6,39 @@
 
 open Social_core
 
+let redact_sensitive_text text =
+  let replace_json_field field input =
+    let pattern = Printf.sprintf "\"%s\"[ \t\r\n]*:[ \t\r\n]*\"[^\"]*\"" field in
+    let replacement = Printf.sprintf {|"%s":"[REDACTED]"|} field in
+    Str.global_replace (Str.regexp pattern) replacement input
+  in
+  let replace_form_field field input =
+    let pattern = Printf.sprintf {|%s=[^&[:space:]]+|} field in
+    let replacement = Printf.sprintf "%s=[REDACTED]" field in
+    Str.global_replace (Str.regexp pattern) replacement input
+  in
+  text
+  |> replace_json_field "access_token"
+  |> replace_json_field "refresh_token"
+  |> replace_json_field "client_secret"
+  |> replace_json_field "token"
+  |> replace_form_field "access_token"
+  |> replace_form_field "refresh_token"
+  |> replace_form_field "client_secret"
+  |> replace_form_field "token"
+
+let header_value_case_insensitive headers key =
+  let target = String.lowercase_ascii key in
+  headers
+  |> List.find_map (fun (k, v) ->
+         if String.equal (String.lowercase_ascii k) target then Some v else None)
+
+let parse_positive_int value =
+  try
+    let parsed = int_of_string value in
+    if parsed >= 0 then Some parsed else None
+  with _ -> None
+
 (** OAuth 2.0 module for Mastodon
     
     Mastodon uses standard OAuth 2.0 with PKCE support.
@@ -200,21 +233,10 @@ module OAuth = struct
             with e ->
               on_error (Printf.sprintf "Failed to parse app registration: %s" (Printexc.to_string e))
           else
-            on_error (Printf.sprintf "App registration failed (%d): %s" response.status response.body))
+            on_error (Printf.sprintf "App registration failed (%d): %s" response.status (redact_sensitive_text response.body)))
         on_error
     
-    (** Exchange authorization code for access token
-        
-        @param instance_url The Mastodon instance URL
-        @param client_id OAuth 2.0 Client ID (from register_app)
-        @param client_secret OAuth 2.0 Client Secret (from register_app)
-        @param redirect_uri Registered callback URL (must match authorization request)
-        @param code Authorization code from callback
-        @param code_verifier Optional PKCE code verifier (if PKCE was used in authorization)
-        @param on_success Continuation receiving credentials
-        @param on_error Continuation receiving error message
-    *)
-    let exchange_code ~instance_url ~client_id ~client_secret ~redirect_uri ~code ?code_verifier on_success on_error =
+    let exchange_code_impl ~instance_url ~client_id ~client_secret ~redirect_uri ~code ?code_verifier on_success on_error =
       let url = Printf.sprintf "%s%s" instance_url Metadata.token_path in
       
       let base_fields = [
@@ -243,6 +265,10 @@ module OAuth = struct
               let token_type = 
                 try json |> member "token_type" |> to_string 
                 with _ -> "Bearer" in
+              let granted_scope =
+                try Some (json |> member "scope" |> to_string)
+                with _ -> None
+              in
               
               (* Mastodon tokens don't expire *)
               let creds : credentials = {
@@ -251,11 +277,35 @@ module OAuth = struct
                 expires_at = None;  (* Never expires *)
                 token_type;
               } in
-              on_success creds
+              on_success (creds, granted_scope)
             with e ->
               on_error (Printf.sprintf "Failed to parse token response: %s" (Printexc.to_string e))
           else
-            on_error (Printf.sprintf "Token exchange failed (%d): %s" response.status response.body))
+            on_error (Printf.sprintf "Token exchange failed (%d): %s" response.status (redact_sensitive_text response.body)))
+        on_error
+
+    (** Exchange authorization code for access token
+        
+        @param instance_url The Mastodon instance URL
+        @param client_id OAuth 2.0 Client ID (from register_app)
+        @param client_secret OAuth 2.0 Client Secret (from register_app)
+        @param redirect_uri Registered callback URL (must match authorization request)
+        @param code Authorization code from callback
+        @param code_verifier Optional PKCE code verifier (if PKCE was used in authorization)
+        @param on_success Continuation receiving credentials
+        @param on_error Continuation receiving error message
+    *)
+    let exchange_code ~instance_url ~client_id ~client_secret ~redirect_uri ~code ?code_verifier on_success on_error =
+      exchange_code_impl
+        ~instance_url ~client_id ~client_secret ~redirect_uri ~code ?code_verifier
+        (fun (creds, _scope) -> on_success creds)
+        on_error
+
+    (** Exchange authorization code and include granted scope (if returned) *)
+    let exchange_code_with_scope ~instance_url ~client_id ~client_secret ~redirect_uri ~code ?code_verifier on_success on_error =
+      exchange_code_impl
+        ~instance_url ~client_id ~client_secret ~redirect_uri ~code ?code_verifier
+        on_success
         on_error
     
     (** Revoke an access token
@@ -283,7 +333,7 @@ module OAuth = struct
           if response.status >= 200 && response.status < 300 then
             on_success ()
           else
-            on_error (Printf.sprintf "Token revocation failed (%d): %s" response.status response.body))
+            on_error (Printf.sprintf "Token revocation failed (%d): %s" response.status (redact_sensitive_text response.body)))
         on_error
   end
 end
@@ -323,6 +373,92 @@ type poll = {
   hide_totals: bool; (** Hide vote counts until poll ends *)
 }
 
+type timeline_status = {
+  id: string;
+  content: string;
+  url: string option;
+  created_at: string option;
+  account_acct: string option;
+}
+
+type pagination_cursors = {
+  next_max_id: string option;
+  prev_since_id: string option;
+  prev_min_id: string option;
+}
+
+type timeline_page = {
+  items: timeline_status list;
+  cursors: pagination_cursors;
+}
+
+type account_summary = {
+  id: string;
+  acct: string;
+  username: string option;
+  display_name: string option;
+  url: string option;
+}
+
+type notification_item = {
+  id: string;
+  notification_type: string;
+  created_at: string option;
+  account: account_summary option;
+  status: timeline_status option;
+}
+
+type trend_tag = {
+  name: string;
+  url: string option;
+  usage_count: int option;
+}
+
+type trend_link = {
+  url: string;
+  title: string option;
+  description: string option;
+}
+
+type mastodon_list = {
+  id: string;
+  title: string;
+}
+
+type relationship_summary = {
+  id: string;
+  following: bool;
+  followed_by: bool;
+  blocking: bool;
+  muting: bool;
+}
+
+type search_result = {
+  statuses: timeline_status list;
+  accounts: account_summary list;
+  hashtags: trend_tag list;
+}
+
+type conversation_item = {
+  id: string;
+  unread: bool;
+  accounts: account_summary list;
+  last_status: timeline_status option;
+}
+
+type filter_keyword_rule = {
+  keyword: string;
+  whole_word: bool option;
+}
+
+type mastodon_filter = {
+  id: string;
+  title: string;
+  contexts: string list;
+  filter_action: string option;
+  expires_at: string option;
+}
+
 (** Configuration module type for Mastodon provider *)
 module type CONFIG = sig
   module Http : HTTP_CLIENT
@@ -332,21 +468,39 @@ module type CONFIG = sig
   val update_credentials : account_id:string -> credentials:credentials -> (unit -> unit) -> (string -> unit) -> unit
   val encrypt : string -> (string -> unit) -> (string -> unit) -> unit
   val decrypt : string -> (string -> unit) -> (string -> unit) -> unit
+  val sleep : seconds:float -> (unit -> unit) -> (string -> unit) -> unit
   val update_health_status : account_id:string -> status:string -> error_message:string option -> (unit -> unit) -> (string -> unit) -> unit
 end
 
 (** Make functor to create Mastodon provider with given configuration *)
 module Make (Config : CONFIG) = struct
+  module OAuth_http = OAuth.Make(Config.Http)
   
   (** {1 Platform Constants} *)
   
   let default_max_status_length = 500  (* Many instances have higher limits *)
   let max_media_per_status = 4
+
+  type instance_limits = {
+    max_status_chars: int;
+    max_media_attachments: int;
+    max_image_size_bytes: int;
+    max_video_size_bytes: int;
+  }
+
+  let default_instance_limits = {
+    max_status_chars = default_max_status_length;
+    max_media_attachments = max_media_per_status;
+    max_image_size_bytes = 10 * 1024 * 1024;
+    max_video_size_bytes = 100 * 1024 * 1024;
+  }
+
+  let instance_limits_cache : (string, instance_limits) Hashtbl.t = Hashtbl.create 8
   
   (** {1 Validation Functions} *)
   
   (** Validate a single post's content *)
-  let validate_post ~text ?(media_count=0) ?(max_length=500) () =
+  let validate_post ~text ?(media_count=0) ?(max_length=500) ?(max_media=max_media_per_status) () =
     let errors = ref [] in
     
     (* Check text length *)
@@ -355,14 +509,14 @@ module Make (Config : CONFIG) = struct
       errors := Error_types.Text_too_long { length = text_len; max = max_length } :: !errors;
     
     (* Check media count *)
-    if media_count > max_media_per_status then
-      errors := Error_types.Too_many_media { count = media_count; max = max_media_per_status } :: !errors;
+    if media_count > max_media then
+      errors := Error_types.Too_many_media { count = media_count; max = max_media } :: !errors;
     
     if !errors = [] then Ok ()
     else Error (List.rev !errors)
   
   (** Validate thread content *)
-  let validate_thread ~texts ?(media_counts=[]) ?(max_length=500) () =
+  let validate_thread ~texts ?(media_counts=[]) ?(max_length=500) ?(max_media=max_media_per_status) () =
     if List.length texts = 0 then
       Error [Error_types.Thread_empty]
     else
@@ -372,22 +526,83 @@ module Make (Config : CONFIG) = struct
           try List.nth media_counts i 
           with _ -> 0 
         in
-        match validate_post ~text ~media_count ~max_length () with
+        match validate_post ~text ~media_count ~max_length ~max_media () with
         | Error post_errors ->
             errors := Error_types.Thread_post_invalid { index = i; errors = post_errors } :: !errors
         | Ok () -> ()
       ) texts;
       if !errors = [] then Ok ()
       else Error (List.rev !errors)
-  
+
+  let resolve_instance_limits ?(force_refresh=false) ~instance_url on_success =
+    if (not force_refresh) && Hashtbl.mem instance_limits_cache instance_url then
+      on_success (Hashtbl.find instance_limits_cache instance_url)
+    else
+    let parse_v2 body =
+      let open Yojson.Basic.Util in
+      let json = Yojson.Basic.from_string body in
+      let cfg = json |> member "configuration" in
+      {
+        max_status_chars =
+          (try cfg |> member "statuses" |> member "max_characters" |> to_int
+           with _ -> default_instance_limits.max_status_chars);
+        max_media_attachments =
+          (try cfg |> member "statuses" |> member "max_media_attachments" |> to_int
+           with _ -> default_instance_limits.max_media_attachments);
+        max_image_size_bytes =
+          (try cfg |> member "media_attachments" |> member "image_size_limit" |> to_int
+           with _ -> default_instance_limits.max_image_size_bytes);
+        max_video_size_bytes =
+          (try cfg |> member "media_attachments" |> member "video_size_limit" |> to_int
+           with _ -> default_instance_limits.max_video_size_bytes);
+      }
+    in
+    let parse_v1 body =
+      let open Yojson.Basic.Util in
+      let json = Yojson.Basic.from_string body in
+      {
+        max_status_chars =
+          (try json |> member "max_toot_chars" |> to_int
+           with _ -> default_instance_limits.max_status_chars);
+        max_media_attachments = default_instance_limits.max_media_attachments;
+        max_image_size_bytes = default_instance_limits.max_image_size_bytes;
+        max_video_size_bytes = default_instance_limits.max_video_size_bytes;
+      }
+    in
+    let cache_and_return limits =
+      Hashtbl.replace instance_limits_cache instance_url limits;
+      on_success limits
+    in
+    let v1_url = Printf.sprintf "%s/api/v1/instance" instance_url in
+    let v2_url = Printf.sprintf "%s/api/v2/instance" instance_url in
+    let fallback_to_v1 () =
+      Config.Http.get v1_url
+        (fun response ->
+          if response.status >= 200 && response.status < 300 then
+            try cache_and_return (parse_v1 response.body)
+            with _ -> cache_and_return default_instance_limits
+          else
+            cache_and_return default_instance_limits)
+        (fun _ -> cache_and_return default_instance_limits)
+    in
+    Config.Http.get v2_url
+      (fun response ->
+        if response.status >= 200 && response.status < 300 then
+          try cache_and_return (parse_v2 response.body)
+          with _ -> fallback_to_v1 ()
+        else
+          fallback_to_v1 ())
+      (fun _ -> fallback_to_v1 ())
+
   (** Parse API error response and return structured Error_types.error *)
-  let parse_api_error ~status_code ~response_body =
+  let parse_api_error ~headers ~status_code ~response_body =
+    let redacted_body = redact_sensitive_text response_body in
     try
-      let json = Yojson.Basic.from_string response_body in
+      let json = Yojson.Basic.from_string redacted_body in
       let open Yojson.Basic.Util in
       let error_msg = 
         try json |> member "error" |> to_string
-        with _ -> response_body
+        with _ -> redacted_body
       in
       
       (* Map common Mastodon errors *)
@@ -396,8 +611,13 @@ module Make (Config : CONFIG) = struct
       else if status_code = 403 then
         Error_types.Auth_error (Error_types.Insufficient_permissions ["write:statuses"])
       else if status_code = 429 then
+        let retry_after_seconds =
+          match header_value_case_insensitive headers "retry-after" with
+          | Some value -> parse_positive_int value
+          | None -> None
+        in
         Error_types.Rate_limited { 
-          retry_after_seconds = Some 300;
+          retry_after_seconds = (match retry_after_seconds with Some _ as v -> v | None -> Some 300);
           limit = None;
           remaining = Some 0;
           reset_at = None;
@@ -411,15 +631,15 @@ module Make (Config : CONFIG) = struct
           status_code;
           message = error_msg;
           platform = Platform_types.Mastodon;
-          raw_response = Some response_body;
+          raw_response = Some redacted_body;
           request_id = None;
         }
     with _ ->
       Error_types.Api_error {
         status_code;
-        message = response_body;
+        message = redacted_body;
         platform = Platform_types.Mastodon;
-        raw_response = Some response_body;
+        raw_response = Some redacted_body;
         request_id = None;
       }
   
@@ -542,6 +762,78 @@ module Make (Config : CONFIG) = struct
         else
           on_error (Printf.sprintf "Media upload failed (%d): %s" response.status response.body))
       on_error
+
+  type media_processing_state =
+    | Media_ready
+    | Media_pending of int option
+    | Media_failed of string
+
+  let get_media_processing_state ~mastodon_creds ~media_id on_success on_error =
+    let url = Printf.sprintf "%s/api/v1/media/%s" mastodon_creds.instance_url media_id in
+    let headers = [
+      ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+    ] in
+    Config.Http.get ~headers url
+      (fun response ->
+        if response.status >= 200 && response.status < 300 then
+          try
+            let json = Yojson.Basic.from_string response.body in
+            let open Yojson.Basic.Util in
+            let url_ready =
+              match json |> member "url" with
+              | `String s when String.length s > 0 -> true
+              | _ -> false
+            in
+            if url_ready then
+              on_success Media_ready
+            else
+              let processing_state =
+                try Some (json |> member "meta" |> member "processing" |> member "state" |> to_string)
+                with _ -> None
+              in
+              let check_after_secs =
+                try
+                  Some (json |> member "meta" |> member "processing" |> member "check_after_secs" |> to_int)
+                with _ -> None
+              in
+              match processing_state with
+              | Some "succeeded" | Some "ready" | Some "processed" -> on_success Media_ready
+              | Some "failed" ->
+                  let error_msg =
+                    try json |> member "meta" |> member "processing" |> member "error" |> to_string
+                    with _ -> "Media processing failed"
+                  in
+                  on_success (Media_failed error_msg)
+              | Some _ -> on_success (Media_pending check_after_secs)
+              | None -> on_success Media_ready
+          with e ->
+            on_error (Printf.sprintf "Failed to parse media status: %s" (Printexc.to_string e))
+        else
+          on_error (Printf.sprintf "Media status check failed (%d): %s" response.status response.body))
+      on_error
+
+  let wait_for_media_ready ~mastodon_creds ~media_id on_success on_error =
+    let max_attempts = 30 in
+    let rec poll attempts_left =
+      if attempts_left <= 0 then
+        on_error "Media processing timed out"
+      else
+        get_media_processing_state ~mastodon_creds ~media_id
+          (function
+            | Media_ready -> on_success ()
+            | Media_failed msg -> on_error msg
+            | Media_pending check_after_secs ->
+                let wait_secs =
+                  match check_after_secs with
+                  | Some secs when secs > 0 -> secs
+                  | _ -> 1
+                in
+                Config.sleep ~seconds:(float_of_int wait_secs)
+                  (fun () -> poll (attempts_left - 1))
+                  (fun err -> on_error (Printf.sprintf "Media processing wait failed: %s" err)))
+          on_error
+    in
+    poll max_attempts
   
   (** Update media with alt text and/or focus point *)
   let update_media ~mastodon_creds ~media_id ~alt_text ~focus on_success on_error =
@@ -591,6 +883,1700 @@ module Make (Config : CONFIG) = struct
                   (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))))
           (fun err -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err))))
       (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
+
+  (** Get resolved instance limits for current account instance *)
+  let get_instance_limits ~account_id ?(force_refresh=false) on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        resolve_instance_limits ~force_refresh ~instance_url:mastodon_creds.instance_url
+          (fun limits -> on_result (Ok limits)))
+      (fun err -> on_result (Error err))
+
+  let parse_timeline_status json =
+    let open Yojson.Basic.Util in
+    let id = json |> member "id" |> to_string in
+    let content =
+      try json |> member "content" |> to_string
+      with _ -> ""
+    in
+    let url =
+      try
+        match json |> member "url" with
+        | `String v when v <> "" -> Some v
+        | _ -> None
+      with _ -> None
+    in
+    let created_at =
+      try
+        match json |> member "created_at" with
+        | `String v when v <> "" -> Some v
+        | _ -> None
+      with _ -> None
+    in
+    let account_acct =
+      try
+        match json |> member "account" |> member "acct" with
+        | `String v when v <> "" -> Some v
+        | _ -> None
+      with _ -> None
+    in
+    { id; content; url; created_at; account_acct }
+
+  let parse_account_summary json =
+    let open Yojson.Basic.Util in
+    let id =
+      try json |> member "id" |> to_string
+      with _ -> ""
+    in
+    let acct =
+      try json |> member "acct" |> to_string
+      with _ -> ""
+    in
+    let username =
+      try
+        match json |> member "username" with
+        | `String v when v <> "" -> Some v
+        | _ -> None
+      with _ -> None
+    in
+    let display_name =
+      try
+        match json |> member "display_name" with
+        | `String v when v <> "" -> Some v
+        | _ -> None
+      with _ -> None
+    in
+    let url =
+      try
+        match json |> member "url" with
+        | `String v when v <> "" -> Some v
+        | _ -> None
+      with _ -> None
+    in
+    { id; acct; username; display_name; url }
+
+  let parse_notification_item json =
+    let open Yojson.Basic.Util in
+    let id = json |> member "id" |> to_string in
+    let notification_type =
+      try json |> member "type" |> to_string
+      with _ -> "unknown"
+    in
+    let created_at =
+      try
+        match json |> member "created_at" with
+        | `String v when v <> "" -> Some v
+        | _ -> None
+      with _ -> None
+    in
+    let account =
+      try
+        match json |> member "account" with
+        | `Assoc _ as account_json -> Some (parse_account_summary account_json)
+        | _ -> None
+      with _ -> None
+    in
+    let status =
+      try
+        match json |> member "status" with
+        | `Assoc _ as status_json -> Some (parse_timeline_status status_json)
+        | _ -> None
+      with _ -> None
+    in
+    { id; notification_type; created_at; account; status }
+
+  let parse_pagination_cursors headers =
+    let parse_rel_entry entry =
+      let trimmed = String.trim entry in
+      let re = Str.regexp "<\\([^>]+\\)>;[ ]*rel=\"\\([^\"]+\\)\"" in
+      if Str.string_match re trimmed 0 then
+        let url = Str.matched_group 1 trimmed in
+        let rel = Str.matched_group 2 trimmed in
+        Some (rel, Uri.of_string url)
+      else
+        None
+    in
+    let extract_from_uri key uri = Uri.get_query_param uri key in
+    let update cursors (rel, uri) =
+      match rel with
+      | "next" ->
+          { cursors with next_max_id = (match extract_from_uri "max_id" uri with Some v -> Some v | None -> cursors.next_max_id) }
+      | "prev" ->
+          {
+            cursors with
+            prev_since_id = (match extract_from_uri "since_id" uri with Some v -> Some v | None -> cursors.prev_since_id);
+            prev_min_id = (match extract_from_uri "min_id" uri with Some v -> Some v | None -> cursors.prev_min_id);
+          }
+      | _ -> cursors
+    in
+    let empty = { next_max_id = None; prev_since_id = None; prev_min_id = None } in
+    match header_value_case_insensitive headers "link" with
+    | None -> empty
+    | Some link_header ->
+        link_header
+        |> String.split_on_char ','
+        |> List.filter_map parse_rel_entry
+        |> List.fold_left update empty
+
+  let parse_trend_tag json =
+    let open Yojson.Basic.Util in
+    let name =
+      try json |> member "name" |> to_string
+      with _ -> ""
+    in
+    let url =
+      try
+        match json |> member "url" with
+        | `String v when v <> "" -> Some v
+        | _ -> None
+      with _ -> None
+    in
+    let usage_count =
+      try
+        match json |> member "history" |> to_list with
+        | [] -> None
+        | history_items ->
+            let parse_uses item =
+              try item |> member "uses" |> to_int
+              with _ ->
+                try item |> member "uses" |> to_string |> int_of_string
+                with _ -> 0
+            in
+            let total =
+              history_items
+              |> List.fold_left
+                   (fun acc item -> acc + parse_uses item)
+                   0
+            in
+            Some total
+      with _ -> None
+    in
+    { name; url; usage_count }
+
+  let parse_trend_link json =
+    let open Yojson.Basic.Util in
+    let url =
+      try json |> member "url" |> to_string
+      with _ -> ""
+    in
+    let title =
+      try
+        match json |> member "title" with
+        | `String v when v <> "" -> Some v
+        | _ -> None
+      with _ -> None
+    in
+    let description =
+      try
+        match json |> member "description" with
+        | `String v when v <> "" -> Some v
+        | _ -> None
+      with _ -> None
+    in
+    { url; title; description }
+
+  let parse_mastodon_list json =
+    let open Yojson.Basic.Util in
+    let id =
+      try json |> member "id" |> to_string
+      with _ -> ""
+    in
+    let title =
+      try json |> member "title" |> to_string
+      with _ -> ""
+    in
+    { id; title }
+
+  let parse_relationship_summary json =
+    let open Yojson.Basic.Util in
+    let id = json |> member "id" |> to_string in
+    let following =
+      try json |> member "following" |> to_bool
+      with _ -> false
+    in
+    let followed_by =
+      try json |> member "followed_by" |> to_bool
+      with _ -> false
+    in
+    let blocking =
+      try json |> member "blocking" |> to_bool
+      with _ -> false
+    in
+    let muting =
+      try json |> member "muting" |> to_bool
+      with _ -> false
+    in
+    { id; following; followed_by; blocking; muting }
+
+  let parse_conversation_item json =
+    let open Yojson.Basic.Util in
+    let id =
+      try json |> member "id" |> to_string
+      with _ -> ""
+    in
+    let unread =
+      try json |> member "unread" |> to_bool
+      with _ -> false
+    in
+    let accounts =
+      try
+        match json |> member "accounts" with
+        | `List items -> List.map parse_account_summary items
+        | _ -> []
+      with _ -> []
+    in
+    let last_status =
+      try
+        match json |> member "last_status" with
+        | (`Assoc _ as status) -> Some (parse_timeline_status status)
+        | _ -> None
+      with _ -> None
+    in
+    { id; unread; accounts; last_status }
+
+  let parse_filter_summary json =
+    let open Yojson.Basic.Util in
+    let id =
+      try json |> member "id" |> to_string
+      with _ -> ""
+    in
+    let title =
+      try json |> member "title" |> to_string
+      with _ -> ""
+    in
+    let contexts =
+      try
+        match json |> member "context" with
+        | `List items -> List.map to_string items
+        | _ -> []
+      with _ -> []
+    in
+    let filter_action =
+      try
+        match json |> member "filter_action" with
+        | `String v when v <> "" -> Some v
+        | _ -> None
+      with _ -> None
+    in
+    let expires_at =
+      try
+        match json |> member "expires_at" with
+        | `String v when v <> "" -> Some v
+        | _ -> None
+      with _ -> None
+    in
+    { id; title; contexts; filter_action; expires_at }
+
+  (** Get a single status by id *)
+  let get_status ~account_id ~status_id on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v1/statuses/%s" mastodon_creds.instance_url status_id in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                on_result (Ok (parse_timeline_status json))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse status response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Get home timeline statuses *)
+  let get_home_timeline_with_pagination
+      ~account_id
+      ?(limit=20)
+      ?(max_id=None)
+      ?(since_id=None)
+      ?(min_id=None)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let base_url = Printf.sprintf "%s/api/v1/timelines/home" mastodon_creds.instance_url in
+        let uri = Uri.of_string base_url in
+        let query =
+          let base = [ ("limit", string_of_int limit) ] in
+          let with_max = match max_id with Some v -> ("max_id", v) :: base | None -> base in
+          let with_since = match since_id with Some v -> ("since_id", v) :: with_max | None -> with_max in
+          match min_id with Some v -> ("min_id", v) :: with_since | None -> with_since
+        in
+        let url = Uri.with_query' uri query |> Uri.to_string in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let open Yojson.Basic.Util in
+                let statuses =
+                  json
+                  |> to_list
+                  |> List.map parse_timeline_status
+                in
+                let cursors = parse_pagination_cursors response.headers in
+                on_result (Ok { items = statuses; cursors })
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse timeline response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Get home timeline statuses *)
+  let get_home_timeline
+      ~account_id
+      ?(limit=20)
+      ?max_id
+      ?since_id
+      ?min_id
+      on_result =
+    get_home_timeline_with_pagination
+      ~account_id ~limit ?max_id ?since_id ?min_id
+      (function
+        | Ok page -> on_result (Ok page.items)
+        | Error err -> on_result (Error err))
+
+  (** Get public timeline statuses *)
+  let get_public_timeline
+      ~account_id
+      ?(limit=20)
+      ?(local=false)
+      ?(max_id=None)
+      ?(since_id=None)
+      ?(min_id=None)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let base_url = Printf.sprintf "%s/api/v1/timelines/public" mastodon_creds.instance_url in
+        let uri = Uri.of_string base_url in
+        let query =
+          let base = [
+            ("limit", string_of_int limit);
+            ("local", if local then "true" else "false");
+          ] in
+          let with_max = match max_id with Some v -> ("max_id", v) :: base | None -> base in
+          let with_since = match since_id with Some v -> ("since_id", v) :: with_max | None -> with_max in
+          match min_id with Some v -> ("min_id", v) :: with_since | None -> with_since
+        in
+        let url = Uri.with_query' uri query |> Uri.to_string in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let open Yojson.Basic.Util in
+                let statuses = json |> to_list |> List.map parse_timeline_status in
+                on_result (Ok statuses)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse public timeline response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Get hashtag timeline statuses *)
+  let get_tag_timeline
+      ~account_id
+      ~tag
+      ?(limit=20)
+      ?(max_id=None)
+      ?(since_id=None)
+      ?(min_id=None)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let encoded_tag = Uri.pct_encode tag in
+        let base_url = Printf.sprintf "%s/api/v1/timelines/tag/%s" mastodon_creds.instance_url encoded_tag in
+        let uri = Uri.of_string base_url in
+        let query =
+          let base = [ ("limit", string_of_int limit) ] in
+          let with_max = match max_id with Some v -> ("max_id", v) :: base | None -> base in
+          let with_since = match since_id with Some v -> ("since_id", v) :: with_max | None -> with_max in
+          match min_id with Some v -> ("min_id", v) :: with_since | None -> with_since
+        in
+        let url = Uri.with_query' uri query |> Uri.to_string in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let open Yojson.Basic.Util in
+                let statuses = json |> to_list |> List.map parse_timeline_status in
+                on_result (Ok statuses)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse tag timeline response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Search statuses by query *)
+  let search_statuses
+      ~account_id
+      ~query
+      ?(limit=20)
+      ?(resolve=false)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let base_url = Printf.sprintf "%s/api/v2/search" mastodon_creds.instance_url in
+        let uri = Uri.of_string base_url in
+        let url =
+          Uri.with_query' uri [
+            ("q", query);
+            ("type", "statuses");
+            ("resolve", if resolve then "true" else "false");
+            ("limit", string_of_int limit);
+          ]
+          |> Uri.to_string
+        in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let open Yojson.Basic.Util in
+                let statuses =
+                  match json |> member "statuses" with
+                  | `List items -> List.map parse_timeline_status items
+                  | `Null -> []
+                  | _ -> []
+                in
+                on_result (Ok statuses)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse search response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Search across statuses, accounts, and hashtags *)
+  let search_all
+      ~account_id
+      ~query
+      ?(limit=20)
+      ?(resolve=false)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let base_url = Printf.sprintf "%s/api/v2/search" mastodon_creds.instance_url in
+        let uri = Uri.of_string base_url in
+        let url =
+          Uri.with_query' uri
+            [
+              ("q", query);
+              ("resolve", if resolve then "true" else "false");
+              ("limit", string_of_int limit);
+            ]
+          |> Uri.to_string
+        in
+        let headers =
+          [ ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token) ]
+        in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let open Yojson.Basic.Util in
+                let statuses =
+                  match json |> member "statuses" with
+                  | `List items -> List.map parse_timeline_status items
+                  | `Null -> []
+                  | _ -> []
+                in
+                let accounts =
+                  match json |> member "accounts" with
+                  | `List items -> List.map parse_account_summary items
+                  | `Null -> []
+                  | _ -> []
+                in
+                let hashtags =
+                  match json |> member "hashtags" with
+                  | `List items -> List.map parse_trend_tag items
+                  | `Null -> []
+                  | _ -> []
+                in
+                on_result (Ok { statuses; accounts; hashtags })
+              with e ->
+                on_result
+                  (Error
+                     (Error_types.Internal_error
+                        (Printf.sprintf "Failed to parse search-all response: %s"
+                           (Printexc.to_string e))))
+            else
+              on_result
+                (Error
+                   (parse_api_error ~headers:response.headers
+                      ~status_code:response.status ~response_body:response.body)))
+          (fun err ->
+            on_result
+              (Error
+                 (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Search accounts by query *)
+  let search_accounts
+      ~account_id
+      ~query
+      ?(limit=20)
+      ?(resolve=false)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let base_url = Printf.sprintf "%s/api/v1/accounts/search" mastodon_creds.instance_url in
+        let uri = Uri.of_string base_url in
+        let url =
+          Uri.with_query' uri [
+            ("q", query);
+            ("resolve", if resolve then "true" else "false");
+            ("limit", string_of_int limit);
+          ]
+          |> Uri.to_string
+        in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let accounts =
+                  match json with
+                  | `List items -> List.map parse_account_summary items
+                  | `Null -> []
+                  | _ -> []
+                in
+                on_result (Ok accounts)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse account search response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Search hashtags by query via v2 search endpoint *)
+  let search_hashtags
+      ~account_id
+      ~query
+      ?(limit=20)
+      ?(resolve=false)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let base_url = Printf.sprintf "%s/api/v2/search" mastodon_creds.instance_url in
+        let uri = Uri.of_string base_url in
+        let url =
+          Uri.with_query' uri
+            [
+              ("q", query);
+              ("type", "hashtags");
+              ("resolve", if resolve then "true" else "false");
+              ("limit", string_of_int limit);
+            ]
+          |> Uri.to_string
+        in
+        let headers =
+          [ ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token) ]
+        in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let open Yojson.Basic.Util in
+                let tags =
+                  match json |> member "hashtags" with
+                  | `List items -> List.map parse_trend_tag items
+                  | `Null -> []
+                  | _ -> []
+                in
+                on_result (Ok tags)
+              with e ->
+                on_result
+                  (Error
+                     (Error_types.Internal_error
+                        (Printf.sprintf "Failed to parse hashtag search response: %s"
+                           (Printexc.to_string e))))
+            else
+              on_result
+                (Error
+                   (parse_api_error ~headers:response.headers
+                      ~status_code:response.status ~response_body:response.body)))
+          (fun err ->
+            on_result
+              (Error
+                 (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Lookup an account by acct handle (e.g. user@instance) *)
+  let lookup_account_by_acct
+      ~account_id
+      ~acct
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let base_url = Printf.sprintf "%s/api/v1/accounts/lookup" mastodon_creds.instance_url in
+        let uri = Uri.of_string base_url in
+        let url = Uri.with_query' uri [ ("acct", acct) ] |> Uri.to_string in
+        let headers =
+          [ ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token) ]
+        in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                on_result (Ok (parse_account_summary json))
+              with e ->
+                on_result
+                  (Error
+                     (Error_types.Internal_error
+                        (Printf.sprintf "Failed to parse account lookup response: %s"
+                           (Printexc.to_string e))))
+            else
+              on_result
+                (Error
+                   (parse_api_error ~headers:response.headers
+                      ~status_code:response.status ~response_body:response.body)))
+          (fun err ->
+            on_result
+              (Error
+                 (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Get notifications *)
+  let get_notifications
+      ~account_id
+      ?(limit=20)
+      ?(max_id=None)
+      ?(since_id=None)
+      ?(min_id=None)
+      ?(exclude_types=[])
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let base_url = Printf.sprintf "%s/api/v1/notifications" mastodon_creds.instance_url in
+        let uri = Uri.of_string base_url in
+        let query =
+          [
+            ("limit", [string_of_int limit]);
+            ("max_id", (match max_id with Some v -> [v] | None -> []));
+            ("since_id", (match since_id with Some v -> [v] | None -> []));
+            ("min_id", (match min_id with Some v -> [v] | None -> []));
+            ("exclude_types[]", exclude_types);
+          ]
+        in
+        let url = Uri.with_query uri query |> Uri.to_string in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let notifications =
+                  match json with
+                  | `List items -> List.map parse_notification_item items
+                  | `Null -> []
+                  | _ -> []
+                in
+                on_result (Ok notifications)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse notifications response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Get direct-message conversations *)
+  let get_conversations
+      ~account_id
+      ?(limit=20)
+      ?(max_id=None)
+      ?(since_id=None)
+      ?(min_id=None)
+      ?(unread_only=false)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let base_url = Printf.sprintf "%s/api/v1/conversations" mastodon_creds.instance_url in
+        let uri = Uri.of_string base_url in
+        let query =
+          let base =
+            [
+              ("limit", string_of_int limit);
+              ("unread", if unread_only then "true" else "false");
+            ]
+          in
+          let with_max = match max_id with Some v -> ("max_id", v) :: base | None -> base in
+          let with_since = match since_id with Some v -> ("since_id", v) :: with_max | None -> with_max in
+          match min_id with Some v -> ("min_id", v) :: with_since | None -> with_since
+        in
+        let url = Uri.with_query' uri query |> Uri.to_string in
+        let headers =
+          [ ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token) ]
+        in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let conversations =
+                  match json with
+                  | `List items -> List.map parse_conversation_item items
+                  | `Null -> []
+                  | _ -> []
+                in
+                on_result (Ok conversations)
+              with e ->
+                on_result
+                  (Error
+                     (Error_types.Internal_error
+                        (Printf.sprintf "Failed to parse conversations response: %s"
+                           (Printexc.to_string e))))
+            else
+              on_result
+                (Error
+                   (parse_api_error ~headers:response.headers
+                      ~status_code:response.status ~response_body:response.body)))
+          (fun err ->
+            on_result
+              (Error
+                 (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Mark a conversation as read *)
+  let mark_conversation_read
+      ~account_id
+      ~conversation_id
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url =
+          Printf.sprintf "%s/api/v1/conversations/%s/read" mastodon_creds.instance_url
+            conversation_id
+        in
+        let headers =
+          [ ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token) ]
+        in
+        Config.Http.post ~headers ~body:"" url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              on_result (Ok ())
+            else
+              on_result
+                (Error
+                   (parse_api_error ~headers:response.headers
+                      ~status_code:response.status ~response_body:response.body)))
+          (fun err ->
+            on_result
+              (Error
+                 (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Remove a conversation *)
+  let remove_conversation
+      ~account_id
+      ~conversation_id
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url =
+          Printf.sprintf "%s/api/v1/conversations/%s/remove"
+            mastodon_creds.instance_url conversation_id
+        in
+        let headers =
+          [ ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token) ]
+        in
+        Config.Http.post ~headers ~body:"" url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              on_result (Ok ())
+            else
+              on_result
+                (Error
+                   (parse_api_error ~headers:response.headers
+                      ~status_code:response.status ~response_body:response.body)))
+          (fun err ->
+            on_result
+              (Error
+                 (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Get bookmarked statuses for the authorized account *)
+  let get_bookmarks
+      ~account_id
+      ?(limit=20)
+      ?(max_id=None)
+      ?(since_id=None)
+      ?(min_id=None)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let base_url = Printf.sprintf "%s/api/v1/bookmarks" mastodon_creds.instance_url in
+        let uri = Uri.of_string base_url in
+        let query =
+          let base = [ ("limit", string_of_int limit) ] in
+          let with_max = match max_id with Some v -> ("max_id", v) :: base | None -> base in
+          let with_since = match since_id with Some v -> ("since_id", v) :: with_max | None -> with_max in
+          match min_id with Some v -> ("min_id", v) :: with_since | None -> with_since
+        in
+        let url = Uri.with_query' uri query |> Uri.to_string in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let statuses =
+                  match json with
+                  | `List items -> List.map parse_timeline_status items
+                  | `Null -> []
+                  | _ -> []
+                in
+                on_result (Ok statuses)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse bookmarks response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Get favourited statuses for the authorized account *)
+  let get_favourites
+      ~account_id
+      ?(limit=20)
+      ?(max_id=None)
+      ?(since_id=None)
+      ?(min_id=None)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let base_url = Printf.sprintf "%s/api/v1/favourites" mastodon_creds.instance_url in
+        let uri = Uri.of_string base_url in
+        let query =
+          let base = [ ("limit", string_of_int limit) ] in
+          let with_max = match max_id with Some v -> ("max_id", v) :: base | None -> base in
+          let with_since = match since_id with Some v -> ("since_id", v) :: with_max | None -> with_max in
+          match min_id with Some v -> ("min_id", v) :: with_since | None -> with_since
+        in
+        let url = Uri.with_query' uri query |> Uri.to_string in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let statuses =
+                  match json with
+                  | `List items -> List.map parse_timeline_status items
+                  | `Null -> []
+                  | _ -> []
+                in
+                on_result (Ok statuses)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse favourites response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Get lists owned by the authorized account *)
+  let get_lists
+      ~account_id
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v1/lists" mastodon_creds.instance_url in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let lists =
+                  match json with
+                  | `List items -> List.map parse_mastodon_list items
+                  | `Null -> []
+                  | _ -> []
+                in
+                on_result (Ok lists)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse lists response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Get timeline for a list *)
+  let get_list_timeline
+      ~account_id
+      ~list_id
+      ?(limit=20)
+      ?(max_id=None)
+      ?(since_id=None)
+      ?(min_id=None)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let base_url = Printf.sprintf "%s/api/v1/timelines/list/%s" mastodon_creds.instance_url list_id in
+        let uri = Uri.of_string base_url in
+        let query =
+          let base = [ ("limit", string_of_int limit) ] in
+          let with_max = match max_id with Some v -> ("max_id", v) :: base | None -> base in
+          let with_since = match since_id with Some v -> ("since_id", v) :: with_max | None -> with_max in
+          match min_id with Some v -> ("min_id", v) :: with_since | None -> with_since
+        in
+        let url = Uri.with_query' uri query |> Uri.to_string in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let statuses =
+                  match json with
+                  | `List items -> List.map parse_timeline_status items
+                  | `Null -> []
+                  | _ -> []
+                in
+                on_result (Ok statuses)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse list timeline response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Get accounts in a list *)
+  let get_list_accounts
+      ~account_id
+      ~list_id
+      ?(limit=40)
+      ?(max_id=None)
+      ?(since_id=None)
+      ?(min_id=None)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let base_url = Printf.sprintf "%s/api/v1/lists/%s/accounts" mastodon_creds.instance_url list_id in
+        let uri = Uri.of_string base_url in
+        let query =
+          let base = [ ("limit", string_of_int limit) ] in
+          let with_max = match max_id with Some v -> ("max_id", v) :: base | None -> base in
+          let with_since = match since_id with Some v -> ("since_id", v) :: with_max | None -> with_max in
+          match min_id with Some v -> ("min_id", v) :: with_since | None -> with_since
+        in
+        let url = Uri.with_query' uri query |> Uri.to_string in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let accounts =
+                  match json with
+                  | `List items -> List.map parse_account_summary items
+                  | `Null -> []
+                  | _ -> []
+                in
+                on_result (Ok accounts)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse list accounts response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Get lists that include a specific account *)
+  let get_account_lists
+      ~account_id
+      ~target_account_id
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v1/accounts/%s/lists" mastodon_creds.instance_url target_account_id in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let lists =
+                  match json with
+                  | `List items -> List.map parse_mastodon_list items
+                  | `Null -> []
+                  | _ -> []
+                in
+                on_result (Ok lists)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse account lists response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Create a new list *)
+  let create_list
+      ~account_id
+      ~title
+      ?(replies_policy=None)
+      ?(exclusive=None)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v1/lists" mastodon_creds.instance_url in
+        let fields = [ ("title", `String title) ] in
+        let fields =
+          match replies_policy with
+          | Some v -> ("replies_policy", `String v) :: fields
+          | None -> fields
+        in
+        let fields =
+          match exclusive with
+          | Some v -> ("exclusive", `Bool v) :: fields
+          | None -> fields
+        in
+        let body = Yojson.Basic.to_string (`Assoc fields) in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+          ("Content-Type", "application/json");
+        ] in
+        Config.Http.post ~headers ~body url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                on_result (Ok (parse_mastodon_list json))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse create list response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Update an existing list *)
+  let update_list
+      ~account_id
+      ~list_id
+      ?(title=None)
+      ?(replies_policy=None)
+      ?(exclusive=None)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v1/lists/%s" mastodon_creds.instance_url list_id in
+        let fields = [] in
+        let fields =
+          match title with
+          | Some v -> ("title", `String v) :: fields
+          | None -> fields
+        in
+        let fields =
+          match replies_policy with
+          | Some v -> ("replies_policy", `String v) :: fields
+          | None -> fields
+        in
+        let fields =
+          match exclusive with
+          | Some v -> ("exclusive", `Bool v) :: fields
+          | None -> fields
+        in
+        let body = Yojson.Basic.to_string (`Assoc fields) in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+          ("Content-Type", "application/json");
+        ] in
+        Config.Http.put ~headers ~body url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                on_result (Ok (parse_mastodon_list json))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse update list response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Delete a list *)
+  let delete_list
+      ~account_id
+      ~list_id
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v1/lists/%s" mastodon_creds.instance_url list_id in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.delete ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              on_result (Ok ())
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Add accounts to a list *)
+  let add_accounts_to_list
+      ~account_id
+      ~list_id
+      ~target_account_ids
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v1/lists/%s/accounts" mastodon_creds.instance_url list_id in
+        let body = Yojson.Basic.to_string (`Assoc [ ("account_ids", `List (List.map (fun id -> `String id) target_account_ids)) ]) in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+          ("Content-Type", "application/json");
+        ] in
+        Config.Http.post ~headers ~body url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              on_result (Ok ())
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Remove accounts from a list *)
+  let remove_accounts_from_list
+      ~account_id
+      ~list_id
+      ~target_account_ids
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let base_url = Printf.sprintf "%s/api/v1/lists/%s/accounts" mastodon_creds.instance_url list_id in
+        let uri = Uri.of_string base_url in
+        let query = [ ("account_ids[]", target_account_ids) ] in
+        let url = Uri.with_query uri query |> Uri.to_string in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.delete ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              on_result (Ok ())
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Get filters configured for the authorized account *)
+  let get_filters
+      ~account_id
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v2/filters" mastodon_creds.instance_url in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let filters =
+                  match json with
+                  | `List items -> List.map parse_filter_summary items
+                  | `Null -> []
+                  | _ -> []
+                in
+                on_result (Ok filters)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse filters response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  let keyword_rules_to_json keywords =
+    `List
+      (List.map
+         (fun rule ->
+           let fields = [ ("keyword", `String rule.keyword) ] in
+           let fields =
+             match rule.whole_word with
+             | Some value -> ("whole_word", `Bool value) :: fields
+             | None -> fields
+           in
+           `Assoc fields)
+         keywords)
+
+  let status_rules_to_json statuses =
+    `List (List.map (fun status_id -> `Assoc [ ("status_id", `String status_id) ]) statuses)
+
+  (** Create a filter for the authorized account *)
+  let create_filter
+      ~account_id
+      ~title
+      ~contexts
+      ?(filter_action=None)
+      ?(expires_in=None)
+      ?(keywords=[])
+      ?(statuses=[])
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v2/filters" mastodon_creds.instance_url in
+        let fields = [
+          ("title", `String title);
+          ("context", `List (List.map (fun ctx -> `String ctx) contexts));
+          ("keywords_attributes", keyword_rules_to_json keywords);
+          ("statuses_attributes", status_rules_to_json statuses);
+        ] in
+        let fields =
+          match filter_action with
+          | Some value -> ("filter_action", `String value) :: fields
+          | None -> fields
+        in
+        let fields =
+          match expires_in with
+          | Some value -> ("expires_in", `Int value) :: fields
+          | None -> fields
+        in
+        let body = Yojson.Basic.to_string (`Assoc fields) in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+          ("Content-Type", "application/json");
+        ] in
+        Config.Http.post ~headers ~body url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                on_result (Ok (parse_filter_summary json))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse create filter response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Update an existing filter *)
+  let update_filter
+      ~account_id
+      ~filter_id
+      ?(title=None)
+      ?(contexts=None)
+      ?(filter_action=None)
+      ?(expires_in=None)
+      ?(keywords=None)
+      ?(statuses=None)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v2/filters/%s" mastodon_creds.instance_url filter_id in
+        let fields = [] in
+        let fields =
+          match title with
+          | Some value -> ("title", `String value) :: fields
+          | None -> fields
+        in
+        let fields =
+          match contexts with
+          | Some value -> ("context", `List (List.map (fun ctx -> `String ctx) value)) :: fields
+          | None -> fields
+        in
+        let fields =
+          match filter_action with
+          | Some value -> ("filter_action", `String value) :: fields
+          | None -> fields
+        in
+        let fields =
+          match expires_in with
+          | Some value -> ("expires_in", `Int value) :: fields
+          | None -> fields
+        in
+        let fields =
+          match keywords with
+          | Some value -> ("keywords_attributes", keyword_rules_to_json value) :: fields
+          | None -> fields
+        in
+        let fields =
+          match statuses with
+          | Some value -> ("statuses_attributes", status_rules_to_json value) :: fields
+          | None -> fields
+        in
+        let body = Yojson.Basic.to_string (`Assoc fields) in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+          ("Content-Type", "application/json");
+        ] in
+        Config.Http.put ~headers ~body url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                on_result (Ok (parse_filter_summary json))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse update filter response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Delete a filter *)
+  let delete_filter
+      ~account_id
+      ~filter_id
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v2/filters/%s" mastodon_creds.instance_url filter_id in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.delete ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              on_result (Ok ())
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Get trending tags *)
+  let get_trending_tags
+      ~account_id
+      ?(limit=10)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let base_url = Printf.sprintf "%s/api/v1/trends/tags" mastodon_creds.instance_url in
+        let url = Uri.of_string base_url |> fun u -> Uri.with_query' u [ ("limit", string_of_int limit) ] |> Uri.to_string in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let tags =
+                  match json with
+                  | `List items -> List.map parse_trend_tag items
+                  | `Null -> []
+                  | _ -> []
+                in
+                on_result (Ok tags)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse trending tags response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Get trending statuses *)
+  let get_trending_statuses
+      ~account_id
+      ?(limit=10)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let base_url = Printf.sprintf "%s/api/v1/trends/statuses" mastodon_creds.instance_url in
+        let url = Uri.of_string base_url |> fun u -> Uri.with_query' u [ ("limit", string_of_int limit) ] |> Uri.to_string in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let statuses =
+                  match json with
+                  | `List items -> List.map parse_timeline_status items
+                  | `Null -> []
+                  | _ -> []
+                in
+                on_result (Ok statuses)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse trending statuses response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Get trending links *)
+  let get_trending_links
+      ~account_id
+      ?(limit=10)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let base_url = Printf.sprintf "%s/api/v1/trends/links" mastodon_creds.instance_url in
+        let url = Uri.of_string base_url |> fun u -> Uri.with_query' u [ ("limit", string_of_int limit) ] |> Uri.to_string in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let links =
+                  match json with
+                  | `List items -> List.map parse_trend_link items
+                  | `Null -> []
+                  | _ -> []
+                in
+                on_result (Ok links)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse trending links response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Get account details by account id *)
+  let get_account
+      ~account_id
+      ~target_account_id
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v1/accounts/%s" mastodon_creds.instance_url target_account_id in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                on_result (Ok (parse_account_summary json))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse account response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Get featured hashtags for a specific account *)
+  let get_account_featured_tags
+      ~account_id
+      ~target_account_id
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v1/accounts/%s/featured_tags" mastodon_creds.instance_url target_account_id in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let tags =
+                  match json with
+                  | `List items -> List.map parse_trend_tag items
+                  | `Null -> []
+                  | _ -> []
+                in
+                on_result (Ok tags)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse featured tags response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Get statuses for a specific account *)
+  let get_account_statuses
+      ~account_id
+      ~target_account_id
+      ?(limit=20)
+      ?(exclude_replies=false)
+      ?(exclude_reblogs=false)
+      ?(max_id=None)
+      ?(since_id=None)
+      ?(min_id=None)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let base_url = Printf.sprintf "%s/api/v1/accounts/%s/statuses" mastodon_creds.instance_url target_account_id in
+        let uri = Uri.of_string base_url in
+        let query =
+          let base = [
+            ("limit", string_of_int limit);
+            ("exclude_replies", if exclude_replies then "true" else "false");
+            ("exclude_reblogs", if exclude_reblogs then "true" else "false");
+          ] in
+          let with_max = match max_id with Some v -> ("max_id", v) :: base | None -> base in
+          let with_since = match since_id with Some v -> ("since_id", v) :: with_max | None -> with_max in
+          match min_id with Some v -> ("min_id", v) :: with_since | None -> with_since
+        in
+        let url = Uri.with_query' uri query |> Uri.to_string in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let open Yojson.Basic.Util in
+                let statuses = json |> to_list |> List.map parse_timeline_status in
+                on_result (Ok statuses)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse account statuses response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Get followers for a specific account *)
+  let get_account_followers
+      ~account_id
+      ~target_account_id
+      ?(limit=40)
+      ?(max_id=None)
+      ?(since_id=None)
+      ?(min_id=None)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let base_url = Printf.sprintf "%s/api/v1/accounts/%s/followers" mastodon_creds.instance_url target_account_id in
+        let uri = Uri.of_string base_url in
+        let query =
+          let base = [ ("limit", string_of_int limit) ] in
+          let with_max = match max_id with Some v -> ("max_id", v) :: base | None -> base in
+          let with_since = match since_id with Some v -> ("since_id", v) :: with_max | None -> with_max in
+          match min_id with Some v -> ("min_id", v) :: with_since | None -> with_since
+        in
+        let url = Uri.with_query' uri query |> Uri.to_string in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let accounts =
+                  match json with
+                  | `List items -> List.map parse_account_summary items
+                  | `Null -> []
+                  | _ -> []
+                in
+                on_result (Ok accounts)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse followers response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Get following accounts for a specific account *)
+  let get_account_following
+      ~account_id
+      ~target_account_id
+      ?(limit=40)
+      ?(max_id=None)
+      ?(since_id=None)
+      ?(min_id=None)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let base_url = Printf.sprintf "%s/api/v1/accounts/%s/following" mastodon_creds.instance_url target_account_id in
+        let uri = Uri.of_string base_url in
+        let query =
+          let base = [ ("limit", string_of_int limit) ] in
+          let with_max = match max_id with Some v -> ("max_id", v) :: base | None -> base in
+          let with_since = match since_id with Some v -> ("since_id", v) :: with_max | None -> with_max in
+          match min_id with Some v -> ("min_id", v) :: with_since | None -> with_since
+        in
+        let url = Uri.with_query' uri query |> Uri.to_string in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let accounts =
+                  match json with
+                  | `List items -> List.map parse_account_summary items
+                  | `Null -> []
+                  | _ -> []
+                in
+                on_result (Ok accounts)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse following response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Get relationship status for account ids *)
+  let get_account_relationships
+      ~account_id
+      ~target_account_ids
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let base_url = Printf.sprintf "%s/api/v1/accounts/relationships" mastodon_creds.instance_url in
+        let uri = Uri.of_string base_url in
+        let query = [ ("id[]", target_account_ids) ] in
+        let url = Uri.with_query uri query |> Uri.to_string in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let open Yojson.Basic.Util in
+                let relationships = json |> to_list |> List.map parse_relationship_summary in
+                on_result (Ok relationships)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse relationships response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
   
   (** Post single status with full options
       
@@ -614,13 +2600,17 @@ module Make (Config : CONFIG) = struct
       ?(idempotency_key=None)
       ?(validate_media_before_upload=false)
       on_result =
-    (* Validate content first *)
+    (* Minimal pre-validation only; enforce instance-specific limits after resolving instance config. *)
     let media_count = List.length media_urls in
-    match validate_post ~text ~media_count ~max_length:default_max_status_length () with
+    match validate_post ~text ~media_count ~max_length:max_int ~max_media:max_int () with
     | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
     | Ok () ->
     ensure_valid_token ~account_id
       (fun mastodon_creds ->
+        resolve_instance_limits ~instance_url:mastodon_creds.instance_url (fun limits ->
+        match validate_post ~text ~media_count ~max_length:limits.max_status_chars ~max_media:limits.max_media_attachments () with
+        | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+        | Ok () ->
         (* Pair URLs with alt text - use None if alt text list is shorter *)
         let urls_with_alt = List.mapi (fun i url ->
           let alt_text = try List.nth alt_texts i with _ -> None in
@@ -654,20 +2644,20 @@ module Make (Config : CONFIG) = struct
                       if validate_media_before_upload then
                         let media_type = media_type_of_mime mime_type in
                         match media_type with
-                        | Platform_types.Image when file_size > 10 * 1024 * 1024 ->
+                        | Platform_types.Image when file_size > limits.max_image_size_bytes ->
                             Some (Error_types.Media_too_large { 
                               size_bytes = file_size; 
-                              max_bytes = 10 * 1024 * 1024 
+                              max_bytes = limits.max_image_size_bytes
                             })
-                        | Platform_types.Video when file_size > 100 * 1024 * 1024 ->
+                        | Platform_types.Video when file_size > limits.max_video_size_bytes ->
                             Some (Error_types.Media_too_large { 
                               size_bytes = file_size; 
-                              max_bytes = 100 * 1024 * 1024 
+                              max_bytes = limits.max_video_size_bytes
                             })
-                        | Platform_types.Gif when file_size > 10 * 1024 * 1024 ->
+                        | Platform_types.Gif when file_size > limits.max_image_size_bytes ->
                             Some (Error_types.Media_too_large { 
                               size_bytes = file_size; 
-                              max_bytes = 10 * 1024 * 1024 
+                              max_bytes = limits.max_image_size_bytes
                             })
                         | _ -> None
                       else
@@ -681,115 +2671,116 @@ module Make (Config : CONFIG) = struct
                         (* Upload to Mastodon with alt text *)
                         upload_media ~mastodon_creds 
                           ~media_data:media_resp.body ~mime_type ~description:alt_text ~focus:None
-                          (fun media_id -> 
-                            upload_media_seq rest (media_id :: acc) on_complete on_err)
+                          (fun media_id ->
+                            if String.starts_with ~prefix:"video/" mime_type then
+                              wait_for_media_ready ~mastodon_creds ~media_id
+                                (fun () -> upload_media_seq rest (media_id :: acc) on_complete on_err)
+                                on_err
+                            else
+                              upload_media_seq rest (media_id :: acc) on_complete on_err)
                           on_err)
                   else
                     on_err (Printf.sprintf "Failed to fetch media from %s" url))
                 on_err
         in
         
-        (* Upload media if provided (max 4) *)
-        let media_to_upload = List.filteri (fun i _ -> i < 4) urls_with_alt in
+        (* Upload media if provided (instance-specific max) *)
+        let media_to_upload = List.filteri (fun i _ -> i < limits.max_media_attachments) urls_with_alt in
         let on_media_error msg = on_result (Error_types.Failure (Error_types.Internal_error (Printf.sprintf "Media upload failed: %s" msg))) in
         upload_media_seq media_to_upload []
           (fun media_ids ->
-            (* Create status *)
-            let url = Printf.sprintf "%s/api/v1/statuses" mastodon_creds.instance_url in
-            
-            (* Build request body *)
-            let base_fields = [
-              ("status", `String text);
-              ("visibility", `String (visibility_to_string visibility));
-              ("sensitive", `Bool sensitive);
-            ] in
-            
-            let fields = match spoiler_text with
-              | Some text when String.length text > 0 -> 
-                  ("spoiler_text", `String text) :: base_fields
-              | _ -> base_fields
-            in
-            
-            let fields = match in_reply_to_id with
-              | Some id -> ("in_reply_to_id", `String id) :: fields
-              | None -> fields
-            in
-            
-            let fields = match language with
-              | Some lang -> ("language", `String lang) :: fields
-              | None -> fields
-            in
-            
-            let fields = match scheduled_at with
-              | Some datetime -> ("scheduled_at", `String datetime) :: fields
-              | None -> fields
-            in
-            
-            let fields = if List.length media_ids > 0 then
-              ("media_ids", `List (List.map (fun id -> `String id) media_ids)) :: fields
-            else
-              fields
-            in
-            
-            let fields = match poll with
-              | Some p ->
-                  let poll_json = `Assoc [
-                    ("options", `List (List.map (fun opt -> `String opt.title) p.options));
-                    ("expires_in", `Int p.expires_in);
-                    ("multiple", `Bool p.multiple);
-                    ("hide_totals", `Bool p.hide_totals);
-                  ] in
-                  ("poll", poll_json) :: fields
-              | None -> fields
-            in
-            
-            let body = Yojson.Basic.to_string (`Assoc fields) in
-            
-            (* Generate or use provided idempotency key *)
-            let idem_key = match idempotency_key with
-              | Some key -> key
-              | None -> generate_uuid ()
-            in
-            
-            let headers = [
-              ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
-              ("Content-Type", "application/json");
-              ("Idempotency-Key", idem_key);
-            ] in
-            
-            Config.Http.post ~headers ~body url
-              (fun response ->
-                if response.status >= 200 && response.status < 300 then
-                  try
-                    let json = Yojson.Basic.from_string response.body in
-                    let open Yojson.Basic.Util in
-                    (* Try to get the URL from the response *)
-                    let status_url = 
-                      try
-                        match json |> member "url" with
-                        | `Null -> raise Not_found  (* URL is null, use fallback *)
-                        | url_json -> url_json |> to_string
-                      with _ ->
-                        (* Fallback: construct URL from instance, username and status ID *)
-                        let status_id = json |> member "id" |> to_string in
-                        let username = try
-                          json |> member "account" |> member "acct" |> to_string
+             let url = Printf.sprintf "%s/api/v1/statuses" mastodon_creds.instance_url in
+             let base_fields = [
+               ("status", `String text);
+               ("visibility", `String (visibility_to_string visibility));
+               ("sensitive", `Bool sensitive);
+             ] in
+             let fields =
+               match spoiler_text with
+               | Some spoiler when String.length spoiler > 0 -> ("spoiler_text", `String spoiler) :: base_fields
+               | _ -> base_fields
+             in
+             let fields =
+               match in_reply_to_id with
+               | Some id -> ("in_reply_to_id", `String id) :: fields
+               | None -> fields
+             in
+             let fields =
+               match language with
+               | Some lang -> ("language", `String lang) :: fields
+               | None -> fields
+             in
+             let fields =
+               match scheduled_at with
+               | Some datetime -> ("scheduled_at", `String datetime) :: fields
+               | None -> fields
+             in
+             let fields =
+               if media_ids <> [] then
+                 ("media_ids", `List (List.map (fun id -> `String id) media_ids)) :: fields
+               else
+                 fields
+             in
+             let fields =
+               match poll with
+               | Some (p : poll) ->
+                   let poll_json = `Assoc [
+                     ("options", `List (List.map (fun (opt : poll_option) -> `String opt.title) p.options));
+                     ("expires_in", `Int p.expires_in);
+                     ("multiple", `Bool p.multiple);
+                     ("hide_totals", `Bool p.hide_totals);
+                   ] in
+                   ("poll", poll_json) :: fields
+               | None -> fields
+             in
+             let body = Yojson.Basic.to_string (`Assoc fields) in
+             let idem_key =
+               match idempotency_key with
+               | Some key -> key
+               | None -> generate_uuid ()
+             in
+             let headers = [
+               ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+               ("Content-Type", "application/json");
+               ("Idempotency-Key", idem_key);
+             ] in
+             Config.Http.post ~headers ~body url
+               (fun response ->
+                  if response.status >= 200 && response.status < 300 then
+                    try
+                      let json = Yojson.Basic.from_string response.body in
+                      let open Yojson.Basic.Util in
+                      let status_url =
+                        try
+                          match json |> member "url" with
+                          | `Null -> raise Not_found
+                          | url_json -> url_json |> to_string
                         with _ ->
-                          (* If we can't get username, fall back to /statuses format *)
-                          ""
-                        in
-                        if username <> "" then
-                          Printf.sprintf "%s/@%s/%s" mastodon_creds.instance_url username status_id
-                        else
-                          Printf.sprintf "%s/statuses/%s" mastodon_creds.instance_url status_id
-                    in
-                    on_result (Error_types.Success status_url)
-                  with e ->
-                    on_result (Error_types.Failure (Error_types.Internal_error (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))))
-                else
-                  on_result (Error_types.Failure (parse_api_error ~status_code:response.status ~response_body:response.body)))
-              on_media_error)
-          on_media_error)
+                          let status_id = json |> member "id" |> to_string in
+                          let username =
+                            try json |> member "account" |> member "acct" |> to_string
+                            with _ -> ""
+                          in
+                          if username <> "" then
+                            Printf.sprintf "%s/@%s/%s" mastodon_creds.instance_url username status_id
+                          else
+                            Printf.sprintf "%s/statuses/%s" mastodon_creds.instance_url status_id
+                      in
+                      on_result (Error_types.Success status_url)
+                    with e ->
+                      on_result
+                        (Error_types.Failure
+                           (Error_types.Internal_error
+                              (Printf.sprintf "Failed to parse response: %s" (Printexc.to_string e))))
+                  else
+                    on_result
+                      (Error_types.Failure
+                         (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body))
+               )
+               on_media_error
+          )
+           on_media_error)
+        )
       (fun err -> on_result (Error_types.Failure err))
   
   (** Post thread with full options
@@ -807,13 +2798,17 @@ module Make (Config : CONFIG) = struct
       ?(spoiler_text=None)
       ?(validate_media_before_upload=false)
       on_result =
-    (* Validate thread content first *)
+    (* Minimal pre-validation only; enforce instance-specific limits after resolving instance config. *)
     let media_counts = List.map List.length media_urls_per_post in
-    match validate_thread ~texts ~media_counts ~max_length:default_max_status_length () with
+    match validate_thread ~texts ~media_counts ~max_length:max_int ~max_media:max_int () with
     | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
     | Ok () ->
     ensure_valid_token ~account_id
       (fun mastodon_creds ->
+          resolve_instance_limits ~instance_url:mastodon_creds.instance_url (fun limits ->
+          match validate_thread ~texts ~media_counts ~max_length:limits.max_status_chars ~max_media:limits.max_media_attachments () with
+          | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
+          | Ok () ->
           (* Helper to determine media type from MIME type *)
           let media_type_of_mime mime_type =
             if String.starts_with ~prefix:"video/" mime_type then Platform_types.Video
@@ -847,20 +2842,20 @@ module Make (Config : CONFIG) = struct
                           if validate_media_before_upload then
                             let media_type = media_type_of_mime mime_type in
                             match media_type with
-                            | Platform_types.Image when file_size > 10 * 1024 * 1024 ->
+                            | Platform_types.Image when file_size > limits.max_image_size_bytes ->
                                 Some (Error_types.Media_too_large { 
                                   size_bytes = file_size; 
-                                  max_bytes = 10 * 1024 * 1024 
+                                  max_bytes = limits.max_image_size_bytes
                                 })
-                            | Platform_types.Video when file_size > 100 * 1024 * 1024 ->
+                            | Platform_types.Video when file_size > limits.max_video_size_bytes ->
                                 Some (Error_types.Media_too_large { 
                                   size_bytes = file_size; 
-                                  max_bytes = 100 * 1024 * 1024 
+                                  max_bytes = limits.max_video_size_bytes
                                 })
-                            | Platform_types.Gif when file_size > 10 * 1024 * 1024 ->
+                            | Platform_types.Gif when file_size > limits.max_image_size_bytes ->
                                 Some (Error_types.Media_too_large { 
                                   size_bytes = file_size; 
-                                  max_bytes = 10 * 1024 * 1024 
+                                  max_bytes = limits.max_image_size_bytes
                                 })
                             | _ -> None
                           else
@@ -873,13 +2868,19 @@ module Make (Config : CONFIG) = struct
                         | None ->
                             upload_media ~mastodon_creds 
                               ~media_data:media_resp.body ~mime_type ~description:alt_text ~focus:None
-                              (fun media_id -> upload_seq rest (media_id :: acc))
+                              (fun media_id ->
+                                if String.starts_with ~prefix:"video/" mime_type then
+                                  wait_for_media_ready ~mastodon_creds ~media_id
+                                    (fun () -> upload_seq rest (media_id :: acc))
+                                    on_err
+                                else
+                                  upload_seq rest (media_id :: acc))
                               on_err)
                       else
                         on_err (Printf.sprintf "Failed to fetch media from %s" url))
                     on_err
             in
-            let media_to_upload = List.filteri (fun i _ -> i < 4) urls_with_alt in
+            let media_to_upload = List.filteri (fun i _ -> i < limits.max_media_attachments) urls_with_alt in
             upload_seq media_to_upload []
           in
           
@@ -1002,6 +3003,7 @@ module Make (Config : CONFIG) = struct
           in
           
           post_statuses_seq posts_with_media_and_alt 0 None [])
+          )
       (fun err -> on_result (Error_types.Failure err))
   
   (** Validate content for Mastodon 
@@ -1043,9 +3045,9 @@ module Make (Config : CONFIG) = struct
       Error "Poll must have at least 2 options"
     else if List.length poll.options > 4 then
       Error "Poll can have at most 4 options"
-    else if List.exists (fun opt -> String.length opt.title = 0) poll.options then
+    else if List.exists (fun (opt : poll_option) -> String.length opt.title = 0) poll.options then
       Error "Poll options cannot be empty"
-    else if List.exists (fun opt -> String.length opt.title > 50) poll.options then
+    else if List.exists (fun (opt : poll_option) -> String.length opt.title > 50) poll.options then
       Error "Poll option exceeds 50 character limit"
     else if poll.expires_in < 300 then
       Error "Poll must be open for at least 5 minutes"
@@ -1068,7 +3070,7 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               on_success ()
             else
-              on_error (parse_api_error ~status_code:response.status ~response_body:response.body))
+              on_error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body))
           (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
       (fun err -> on_error err)
   
@@ -1119,9 +3121,9 @@ module Make (Config : CONFIG) = struct
         in
         
         let fields = match poll with
-          | Some p ->
+          | Some (p : poll) ->
               let poll_json = `Assoc [
-                ("options", `List (List.map (fun opt -> `String opt.title) p.options));
+                ("options", `List (List.map (fun (opt : poll_option) -> `String opt.title) p.options));
                 ("expires_in", `Int p.expires_in);
                 ("multiple", `Bool p.multiple);
                 ("hide_totals", `Bool p.hide_totals);
@@ -1147,7 +3149,7 @@ module Make (Config : CONFIG) = struct
               with e ->
                 on_error (Error_types.Internal_error (Printf.sprintf "Failed to parse edit response: %s" (Printexc.to_string e)))
             else
-              on_error (parse_api_error ~status_code:response.status ~response_body:response.body))
+              on_error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body))
           (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
       (fun err -> on_error err)
   
@@ -1165,7 +3167,8 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               on_result (Ok ())
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body))
+          )
           (fun err -> on_result (Error (Error_types.Internal_error err))))
       (fun err -> on_result (Error err))
   
@@ -1183,7 +3186,8 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               on_result (Ok ())
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body))
+          )
           (fun err -> on_result (Error (Error_types.Internal_error err))))
       (fun err -> on_result (Error err))
   
@@ -1209,7 +3213,8 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               on_result (Ok ())
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body))
+          )
           (fun err -> on_result (Error (Error_types.Internal_error err))))
       (fun err -> on_result (Error err))
   
@@ -1227,7 +3232,8 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               on_result (Ok ())
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body))
+          )
           (fun err -> on_result (Error (Error_types.Internal_error err))))
       (fun err -> on_result (Error err))
   
@@ -1245,7 +3251,8 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               on_result (Ok ())
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body))
+          )
           (fun err -> on_result (Error (Error_types.Internal_error err))))
       (fun err -> on_result (Error err))
   
@@ -1263,7 +3270,292 @@ module Make (Config : CONFIG) = struct
             if response.status >= 200 && response.status < 300 then
               on_result (Ok ())
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body))
+          )
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error err))
+
+  (** Follow an account *)
+  let follow_account
+      ~account_id
+      ~target_account_id
+      ?(reblogs=true)
+      ?(notify=false)
+      ?(languages=[])
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v1/accounts/%s/follow" mastodon_creds.instance_url target_account_id in
+        let body_json = `Assoc [
+          ("reblogs", `Bool reblogs);
+          ("notify", `Bool notify);
+          ("languages", `List (List.map (fun l -> `String l) languages));
+        ] in
+        let body = Yojson.Basic.to_string body_json in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+          ("Content-Type", "application/json");
+        ] in
+        Config.Http.post ~headers ~body url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                on_result (Ok (parse_relationship_summary json))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse follow response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error err))
+
+  (** Unfollow an account *)
+  let unfollow_account
+      ~account_id
+      ~target_account_id
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v1/accounts/%s/unfollow" mastodon_creds.instance_url target_account_id in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.post ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                on_result (Ok (parse_relationship_summary json))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse unfollow response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error err))
+
+  (** Block an account *)
+  let block_account
+      ~account_id
+      ~target_account_id
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v1/accounts/%s/block" mastodon_creds.instance_url target_account_id in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.post ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                on_result (Ok (parse_relationship_summary json))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse block response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error err))
+
+  (** Unblock an account *)
+  let unblock_account
+      ~account_id
+      ~target_account_id
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v1/accounts/%s/unblock" mastodon_creds.instance_url target_account_id in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.post ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                on_result (Ok (parse_relationship_summary json))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse unblock response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error err))
+
+  (** Mute an account *)
+  let mute_account
+      ~account_id
+      ~target_account_id
+      ?(notifications=true)
+      ?(duration=None)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v1/accounts/%s/mute" mastodon_creds.instance_url target_account_id in
+        let body_fields =
+          let base = [ ("notifications", `Bool notifications) ] in
+          match duration with
+          | Some days -> ("duration", `Int days) :: base
+          | None -> base
+        in
+        let body = Yojson.Basic.to_string (`Assoc body_fields) in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+          ("Content-Type", "application/json");
+        ] in
+        Config.Http.post ~headers ~body url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                on_result (Ok (parse_relationship_summary json))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse mute response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error err))
+
+  (** Unmute an account *)
+  let unmute_account
+      ~account_id
+      ~target_account_id
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v1/accounts/%s/unmute" mastodon_creds.instance_url target_account_id in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.post ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                on_result (Ok (parse_relationship_summary json))
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse unmute response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error err))
+
+  (** Dismiss a single notification *)
+  let dismiss_notification
+      ~account_id
+      ~notification_id
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v1/notifications/%s/dismiss" mastodon_creds.instance_url notification_id in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.post ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              on_result (Ok ())
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error err))
+
+  (** Clear all notifications *)
+  let clear_notifications
+      ~account_id
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v1/notifications/clear" mastodon_creds.instance_url in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.post ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              on_result (Ok ())
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error err))
+
+  (** Get pending follow requests *)
+  let get_follow_requests
+      ~account_id
+      ?(limit=40)
+      ?(max_id=None)
+      ?(since_id=None)
+      ?(min_id=None)
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let base_url = Printf.sprintf "%s/api/v1/follow_requests" mastodon_creds.instance_url in
+        let uri = Uri.of_string base_url in
+        let query =
+          let base = [ ("limit", string_of_int limit) ] in
+          let with_max = match max_id with Some v -> ("max_id", v) :: base | None -> base in
+          let with_since = match since_id with Some v -> ("since_id", v) :: with_max | None -> with_max in
+          match min_id with Some v -> ("min_id", v) :: with_since | None -> with_since
+        in
+        let url = Uri.with_query' uri query |> Uri.to_string in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let accounts =
+                  match json with
+                  | `List items -> List.map parse_account_summary items
+                  | `Null -> []
+                  | _ -> []
+                in
+                on_result (Ok accounts)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse follow requests response: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error err))
+
+  (** Authorize a follow request *)
+  let authorize_follow_request
+      ~account_id
+      ~target_account_id
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v1/follow_requests/%s/authorize" mastodon_creds.instance_url target_account_id in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.post ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              on_result (Ok ())
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error err))
+
+  (** Reject a follow request *)
+  let reject_follow_request
+      ~account_id
+      ~target_account_id
+      on_result =
+    ensure_valid_token ~account_id
+      (fun mastodon_creds ->
+        let url = Printf.sprintf "%s/api/v1/follow_requests/%s/reject" mastodon_creds.instance_url target_account_id in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" mastodon_creds.access_token);
+        ] in
+        Config.Http.post ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              on_result (Ok ())
+            else
+              on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body)))
           (fun err -> on_result (Error (Error_types.Internal_error err))))
       (fun err -> on_result (Error err))
   
@@ -1293,7 +3585,8 @@ module Make (Config : CONFIG) = struct
           with e ->
             on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse app registration: %s" (Printexc.to_string e))))
         else
-          on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+          on_result (Error (parse_api_error ~headers:response.headers ~status_code:response.status ~response_body:response.body))
+      )
       (fun err -> on_result (Error (Error_types.Internal_error err)))
   
   (** Generate PKCE code verifier (43-128 characters)
@@ -1310,79 +3603,69 @@ module Make (Config : CONFIG) = struct
   
   (** Get OAuth authorization URL with PKCE support *)
   let get_oauth_url ~instance_url ~client_id ~redirect_uri ~scopes ?(state=None) ?(code_challenge=None) () =
-    let state_param = match state with
-      | Some s -> Printf.sprintf "&state=%s" s
-      | None -> ""
+    let scope_list =
+      scopes
+      |> String.split_on_char ' '
+      |> List.filter (fun s -> String.length s > 0)
     in
-    let pkce_params = match code_challenge with
-      | Some challenge -> 
-          Printf.sprintf "&code_challenge=%s&code_challenge_method=S256" challenge
-      | None -> ""
-    in
-    Printf.sprintf "%s/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code&scope=%s%s%s"
-      instance_url client_id redirect_uri scopes state_param pkce_params
+    OAuth.get_authorization_url
+      ~instance_url
+      ~client_id
+      ~redirect_uri
+      ~scopes:scope_list
+      ?state
+      ?code_challenge
+      ()
+
+  (** Verify OAuth callback state to prevent CSRF *)
+  let verify_oauth_state ~expected_state ~returned_state =
+    String.equal expected_state returned_state
   
   (** Exchange authorization code for access token with optional PKCE verifier *)
   let exchange_code ~instance_url ~client_id ~client_secret ~redirect_uri ~code ?(code_verifier=None) on_result =
-    let url = Printf.sprintf "%s/oauth/token" instance_url in
-    
-    let base_fields = [
-      ("client_id", `String client_id);
-      ("client_secret", `String client_secret);
-      ("redirect_uri", `String redirect_uri);
-      ("grant_type", `String "authorization_code");
-      ("code", `String code);
-      ("scope", `String "read write follow");
-    ] in
-    
-    (* Add code_verifier if using PKCE *)
-    let fields = match code_verifier with
-      | Some verifier -> ("code_verifier", `String verifier) :: base_fields
-      | None -> base_fields
-    in
-    
-    let body_json = `Assoc fields in
-    let body = Yojson.Basic.to_string body_json in
-    
-    let headers = [("Content-Type", "application/json")] in
-    
-    Config.Http.post ~headers ~body url
-      (fun response ->
-        if response.status >= 200 && response.status < 300 then
+    OAuth_http.exchange_code_with_scope
+      ~instance_url
+      ~client_id
+      ~client_secret
+      ~redirect_uri
+      ~code
+      ?code_verifier
+      (fun (core_creds, granted_scope_opt) ->
+        let requested_scopes = ["follow"; "read"; "write"] in
+        let granted_scopes_opt =
+          match granted_scope_opt with
+          | Some granted_scope ->
+              let scopes =
+                granted_scope
+                |> String.split_on_char ' '
+                |> List.filter (fun s -> s <> "")
+              in
+              if scopes = [] then None else Some scopes
+          | None -> None
+        in
+        (match granted_scopes_opt with
+         | None -> on_result (Ok core_creds)
+         | Some granted_scopes ->
+             let missing = List.filter (fun req -> not (List.mem req granted_scopes)) requested_scopes in
+             if missing <> [] then
+               on_result (Error (Error_types.Auth_error (Error_types.Insufficient_permissions missing)))
+             else
+               on_result (Ok core_creds)))
+      (fun err ->
+        if String.starts_with ~prefix:"Token exchange failed (" err then
           try
-            let json = Yojson.Basic.from_string response.body in
-            let open Yojson.Basic.Util in
-            let access_token = json |> member "access_token" |> to_string in
-            let token_type = try json |> member "token_type" |> to_string with _ -> "Bearer" in
-            
-            (* Validate granted scopes match requested *)
-            let granted_scope = try json |> member "scope" |> to_string with _ -> "" in
-            let granted_scopes = String.split_on_char ' ' granted_scope 
-              |> List.filter (fun s -> s <> "") 
-              |> List.sort String.compare in
-            let requested_scopes = ["follow"; "read"; "write"] |> List.sort String.compare in
-            
-            (* Check if all requested scopes were granted *)
-            let all_granted = List.for_all (fun req -> List.mem req granted_scopes) requested_scopes in
-            
-            if not all_granted then (
-              let missing = List.filter (fun req -> not (List.mem req granted_scopes)) requested_scopes in
-              on_result (Error (Error_types.Auth_error (Error_types.Insufficient_permissions missing)))
-            ) else (
-              (* Return raw credentials - let the caller wrap with instance_url *)
-              let core_creds = {
-                access_token;  (* Return actual token, not JSON-wrapped *)
-                refresh_token = None;
-                expires_at = None;
-                token_type;
-              } in
-              on_result (Ok core_creds)
-            )
-          with e ->
-            on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse token response: %s" (Printexc.to_string e))))
+            let lparen = String.index err '(' in
+            let rparen = String.index err ')' in
+            let status_str = String.sub err (lparen + 1) (rparen - lparen - 1) in
+            let status_code = int_of_string status_str in
+            let body_start = rparen + 3 in
+            let body_len = max 0 (String.length err - body_start) in
+            let response_body = String.sub err body_start body_len in
+            on_result (Error (parse_api_error ~headers:[] ~status_code ~response_body))
+          with _ ->
+            on_result (Error (Error_types.Internal_error err))
         else
-          on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
-      (fun err -> on_result (Error (Error_types.Internal_error err)))
+          on_result (Error (Error_types.Internal_error err)))
   
   (** Revoke access token on logout/disconnect *)
   let revoke_token ~account_id on_result =

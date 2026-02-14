@@ -273,6 +273,879 @@ let test_get_person_urn () =
       print_endline "✓ Get person URN")
     (fun err -> failwith ("Get person URN failed: " ^ err))
 
+(** Test: get_organization_access fetches approved organization roles *)
+let test_get_organization_access () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 200;
+    body =
+      {|{"elements":[{"role":"CONTENT_ADMINISTRATOR","state":"APPROVED","organizationTarget":"urn:li:organization:999"}]}|};
+    headers = [];
+  };
+
+  LinkedIn.get_organization_access ~account_id:"test_account"
+    (handle_result
+      (fun orgs ->
+        assert (List.length orgs = 1);
+        let org = List.hd orgs in
+        assert (org.organization_urn = "urn:li:organization:999");
+        assert (org.organization_id = Some "999");
+        assert (org.role = Some "CONTENT_ADMINISTRATOR");
+        assert (org.state = Some "APPROVED");
+        let requests = !Mock_http.requests in
+        (match requests with
+        | (_, url, headers, _) :: _ ->
+            assert (string_contains url "/rest/organizationAcls");
+            assert (string_contains url "q=roleAssignee");
+            assert (find_header headers "X-RestLi-Method" = Some "FINDER");
+            assert (find_header headers "Linkedin-Version" = Some "202601")
+        | [] -> failwith "No requests recorded for get_organization_access");
+        print_endline "✓ Get organization access")
+      (fun err -> failwith ("Get organization access failed: " ^ err)))
+
+(** Test: get_organization_access parser tolerates malformed/partial ACL elements *)
+let test_get_organization_access_parsing_resilience () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 200;
+    body =
+      {|{"elements":[
+        {"role":"ADMINISTRATOR","state":"APPROVED","organization":"urn:li:organization:111"},
+        {"role":"ANALYST","state":"APPROVED","organizationTarget":"urn:li:organization:222"},
+        {"role":"ADMINISTRATOR","state":"APPROVED","organization":"urn:li:organizationBrand:444"},
+        {"role":"ADMINISTRATOR","state":"APPROVED","organization":"  urn:li:organization:556  "},
+        {"role":"ADMINISTRATOR","state":"APPROVED","organization":"company:bad","organizationTarget":"urn:li:organization:557"},
+        {"role":"ADMINISTRATOR","state":"APPROVED","organization":"company:555"},
+        {"role":"ADMINISTRATOR","state":"APPROVED"},
+        {"organization":"urn:li:organization:333"}
+      ]}|};
+    headers = [];
+  };
+
+  LinkedIn.get_organization_access ~account_id:"test_account"
+    (handle_result
+      (fun orgs ->
+        assert (List.length orgs = 6);
+        let has_111 = List.exists (fun o -> o.organization_urn = "urn:li:organization:111") orgs in
+        let has_222 = List.exists (fun o -> o.organization_urn = "urn:li:organization:222") orgs in
+        let has_333 = List.exists (fun o -> o.organization_urn = "urn:li:organization:333") orgs in
+        let has_556 = List.exists (fun o -> o.organization_urn = "urn:li:organization:556") orgs in
+        let has_557 = List.exists (fun o -> o.organization_urn = "urn:li:organization:557") orgs in
+        let has_invalid = List.exists (fun o -> o.organization_urn = "company:555") orgs in
+        let brand = List.find_opt (fun o -> o.organization_urn = "urn:li:organizationBrand:444") orgs in
+        assert has_111;
+        assert has_222;
+        assert has_333;
+        assert has_556;
+        assert has_557;
+        assert (not has_invalid);
+        (match brand with
+        | Some b -> assert (b.organization_id = Some "444")
+        | None -> failwith "Missing organizationBrand entry");
+        print_endline "✓ Get organization access parsing resilience")
+      (fun err -> failwith ("Organization access parsing resilience failed: " ^ err)))
+
+(** Test: get_organization_access paginates beyond first 100 entries *)
+let test_get_organization_access_pagination () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_responses [
+    {
+      status = 200;
+      body =
+        {|{"paging":{"start":0,"count":100,"total":101},"elements":[{"role":"ADMINISTRATOR","state":"APPROVED","organization":"urn:li:organization:100"}]}|};
+      headers = [];
+    };
+    {
+      status = 200;
+      body =
+        {|{"paging":{"start":100,"count":100,"total":101},"elements":[{"role":"ADMINISTRATOR","state":"APPROVED","organization":"urn:li:organization:101"}]}|};
+      headers = [];
+    };
+  ];
+
+  LinkedIn.get_organization_access ~account_id:"test_account"
+    (handle_result
+      (fun orgs ->
+        assert (List.length orgs = 2);
+        (match orgs with
+        | first :: second :: _ ->
+            assert (first.organization_urn = "urn:li:organization:100");
+            assert (second.organization_urn = "urn:li:organization:101")
+        | _ -> failwith "Expected two organizations in order");
+        let has_100 = List.exists (fun o -> o.organization_urn = "urn:li:organization:100") orgs in
+        let has_101 = List.exists (fun o -> o.organization_urn = "urn:li:organization:101") orgs in
+        assert has_100;
+        assert has_101;
+        let requests = List.rev !Mock_http.requests in
+        (match requests with
+        | [(_, url1, _, _); (_, url2, _, _)] ->
+            assert (string_contains url1 "start=0");
+            assert (string_contains url2 "start=100")
+        | _ -> failwith "Expected two paged requests for organization access");
+        print_endline "✓ Get organization access pagination")
+      (fun err -> failwith ("Get organization access pagination failed: " ^ err)))
+
+(** Test: get_organization_access ignores blank role filter *)
+let test_get_organization_access_blank_role_filter () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"elements":[]}|};
+    headers = [];
+  };
+
+  LinkedIn.get_organization_access ~account_id:"test_account" ~role:""
+    (handle_result
+      (fun _orgs ->
+        let requests = !Mock_http.requests in
+        (match requests with
+        | (_, url, _, _) :: _ ->
+            assert (not (string_contains url "role="));
+            print_endline "✓ Get organization access ignores blank role filter"
+        | [] -> failwith "No requests recorded")
+      )
+      (fun err -> failwith ("Get organization access blank role filter failed: " ^ err)))
+
+(** Test: get_organization_access trims surrounding whitespace in role/state filters *)
+let test_get_organization_access_trims_role_state_filters () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"elements":[]}|};
+    headers = [];
+  };
+
+  LinkedIn.get_organization_access ~account_id:"test_account" ~role:" ADMINISTRATOR " ~acl_state:" APPROVED "
+    (handle_result
+      (fun _orgs ->
+        let requests = !Mock_http.requests in
+        (match requests with
+        | (_, url, _, _) :: _ ->
+            assert (string_contains url "role=ADMINISTRATOR");
+            assert (string_contains url "state=APPROVED");
+            print_endline "✓ Get organization access trims role/state filters"
+        | [] -> failwith "No requests recorded")
+      )
+      (fun err -> failwith ("Get organization access trim role/state filters failed: " ^ err)))
+
+(** Test: get_organization_access normalizes role/state filters to uppercase *)
+let test_get_organization_access_uppercases_role_state_filters () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"elements":[]}|};
+    headers = [];
+  };
+
+  LinkedIn.get_organization_access ~account_id:"test_account" ~role:"administrator" ~acl_state:"approved"
+    (handle_result
+      (fun _orgs ->
+        let requests = !Mock_http.requests in
+        (match requests with
+        | (_, url, _, _) :: _ ->
+            assert (string_contains url "role=ADMINISTRATOR");
+            assert (string_contains url "state=APPROVED");
+            print_endline "✓ Get organization access uppercases role/state filters"
+        | [] -> failwith "No requests recorded")
+      )
+      (fun err -> failwith ("Get organization access uppercase role/state filters failed: " ^ err)))
+
+(** Test: get_organization_access falls back to default Linkedin-Version header when env is invalid *)
+let test_get_organization_access_invalid_version_fallback () =
+  Mock_config.reset ();
+  Mock_config.set_env "LINKEDIN_VERSION" "bad-version";
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"elements":[]}|};
+    headers = [];
+  };
+
+  LinkedIn.get_organization_access ~account_id:"test_account"
+    (handle_result
+      (fun _orgs ->
+        let requests = !Mock_http.requests in
+        (match requests with
+        | (_, _, headers, _) :: _ ->
+            assert (find_header headers "Linkedin-Version" = Some "202601");
+            print_endline "✓ Get organization access invalid version falls back"
+        | [] -> failwith "No requests recorded")
+      )
+      (fun err -> failwith ("Get organization access invalid version fallback failed: " ^ err)))
+
+(** Test: get_organization_access uses valid configured Linkedin-Version header *)
+let test_get_organization_access_valid_version_header () =
+  Mock_config.reset ();
+  Mock_config.set_env "LINKEDIN_VERSION" "202602";
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"elements":[]}|};
+    headers = [];
+  };
+
+  LinkedIn.get_organization_access ~account_id:"test_account"
+    (handle_result
+      (fun _orgs ->
+        let requests = !Mock_http.requests in
+        (match requests with
+        | (_, _, headers, _) :: _ ->
+            assert (find_header headers "Linkedin-Version" = Some "202602");
+            print_endline "✓ Get organization access uses valid configured version"
+        | [] -> failwith "No requests recorded")
+      )
+      (fun err -> failwith ("Get organization access valid version header failed: " ^ err)))
+
+(** Test: get_organization_access invalid month in LINKEDIN_VERSION falls back *)
+let test_get_organization_access_invalid_month_version_fallback () =
+  Mock_config.reset ();
+  Mock_config.set_env "LINKEDIN_VERSION" "202613";
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"elements":[]}|};
+    headers = [];
+  };
+
+  LinkedIn.get_organization_access ~account_id:"test_account"
+    (handle_result
+      (fun _orgs ->
+        let requests = !Mock_http.requests in
+        (match requests with
+        | (_, _, headers, _) :: _ ->
+            assert (find_header headers "Linkedin-Version" = Some "202601");
+            print_endline "✓ Get organization access invalid month falls back"
+        | [] -> failwith "No requests recorded")
+      )
+      (fun err -> failwith ("Get organization access invalid month fallback failed: " ^ err)))
+
+(** Test: get_organization_access rejects dotted LINKEDIN_VERSION and falls back *)
+let test_get_organization_access_dotted_version_fallback () =
+  Mock_config.reset ();
+  Mock_config.set_env "LINKEDIN_VERSION" "202601.01";
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"elements":[]}|};
+    headers = [];
+  };
+
+  LinkedIn.get_organization_access ~account_id:"test_account"
+    (handle_result
+      (fun _orgs ->
+        let requests = !Mock_http.requests in
+        (match requests with
+        | (_, _, headers, _) :: _ ->
+            assert (find_header headers "Linkedin-Version" = Some "202601");
+            print_endline "✓ Get organization access dotted version falls back"
+        | [] -> failwith "No requests recorded")
+      )
+      (fun err -> failwith ("Get organization access dotted version fallback failed: " ^ err)))
+
+(** Test: get_organization_access deduplicates organizations across multiple role entries *)
+let test_get_organization_access_deduplicates_by_org () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 200;
+    body =
+      {|{"elements":[
+        {"role":"ADMINISTRATOR","state":"APPROVED","organization":"urn:li:organization:123"},
+        {"role":"CONTENT_ADMINISTRATOR","state":"APPROVED","organization":"urn:li:organization:123"},
+        {"role":"ANALYST","state":"APPROVED","organization":"urn:li:organization:999"}
+      ]}|};
+    headers = [];
+  };
+
+  LinkedIn.get_organization_access ~account_id:"test_account"
+    (handle_result
+      (fun orgs ->
+        assert (List.length orgs = 2);
+        let count_123 = List.length (List.filter (fun o -> o.organization_urn = "urn:li:organization:123") orgs) in
+        assert (count_123 = 1);
+        print_endline "✓ Get organization access deduplicates by organization")
+      (fun err -> failwith ("Get organization access dedupe failed: " ^ err)))
+
+(** Test: get_organization_access stops when paging does not advance *)
+let test_get_organization_access_non_advancing_paging_stops () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_responses [
+    {
+      status = 200;
+      body =
+        {|{"paging":{"start":0,"count":100,"total":300},"elements":[{"role":"ADMINISTRATOR","state":"APPROVED","organization":"urn:li:organization:1"}]}|};
+      headers = [];
+    };
+    {
+      status = 200;
+      body =
+        {|{"paging":{"start":0,"count":100,"total":300},"elements":[{"role":"ADMINISTRATOR","state":"APPROVED","organization":"urn:li:organization:2"}]}|};
+      headers = [];
+    };
+  ];
+
+  LinkedIn.get_organization_access ~account_id:"test_account"
+    (handle_result
+      (fun orgs ->
+        assert (List.length orgs = 2);
+        let requests = List.rev !Mock_http.requests in
+        (match requests with
+        | [ (_, url1, _, _); (_, url2, _, _) ] ->
+            assert (string_contains url1 "start=0");
+            assert (string_contains url2 "start=100")
+        | _ -> failwith "Expected exactly two requests for non-advancing paging");
+        print_endline "✓ Get organization access stops on non-advancing paging")
+      (fun err -> failwith ("Get organization access non-advancing paging failed: " ^ err)))
+
+(** Test: pagination fallback uses raw element count, not filtered valid count *)
+let test_get_organization_access_pagination_fallback_uses_raw_count () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  let invalid_elements =
+    List.init 99 (fun _ -> "{\"organization\":\"company:bad\"}")
+    |> String.concat ","
+  in
+  let page1_body =
+    "{" ^
+    "\"elements\":[{" ^
+      "\"role\":\"ADMINISTRATOR\",\"state\":\"APPROVED\",\"organization\":\"urn:li:organization:1000\"}," ^
+      invalid_elements ^
+    "]}"
+  in
+  let page2_body =
+    {|{"elements":[{"role":"ADMINISTRATOR","state":"APPROVED","organization":"urn:li:organization:1001"}]}|}
+  in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_responses [
+    { status = 200; body = page1_body; headers = [] };
+    { status = 200; body = page2_body; headers = [] };
+  ];
+
+  LinkedIn.get_organization_access ~account_id:"test_account"
+    (handle_result
+      (fun orgs ->
+        assert (List.length orgs = 2);
+        let has_1000 = List.exists (fun o -> o.organization_urn = "urn:li:organization:1000") orgs in
+        let has_1001 = List.exists (fun o -> o.organization_urn = "urn:li:organization:1001") orgs in
+        assert has_1000;
+        assert has_1001;
+        let requests = List.rev !Mock_http.requests in
+        (match requests with
+        | [ (_, url1, _, _); (_, url2, _, _) ] ->
+            assert (string_contains url1 "start=0");
+            assert (string_contains url2 "start=100")
+        | _ -> failwith "Expected pagination fallback to issue second request");
+        print_endline "✓ Get organization access fallback pagination uses raw count")
+      (fun err -> failwith ("Get organization access fallback pagination failed: " ^ err)))
+
+(** Test: fallback pagination has max-page safety guard when paging metadata is absent *)
+let test_get_organization_access_pagination_fallback_has_page_cap () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  let invalid_elements =
+    List.init 99 (fun _ -> "{\"organization\":\"company:bad\"}")
+    |> String.concat ","
+  in
+  let page_body =
+    "{" ^
+    "\"elements\":[{" ^
+      "\"role\":\"ADMINISTRATOR\",\"state\":\"APPROVED\",\"organization\":\"urn:li:organization:2000\"}," ^
+      invalid_elements ^
+    "]}"
+  in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_responses (List.init 15 (fun _ -> { status = 200; body = page_body; headers = [] }));
+
+  LinkedIn.get_organization_access ~account_id:"test_account"
+    (handle_result
+      (fun orgs ->
+        assert (List.length orgs = 1);
+        let requests = !Mock_http.requests in
+        assert (List.length requests = 15);
+        print_endline "✓ Get organization access fallback pagination has page cap")
+      (fun err -> failwith ("Get organization access fallback page cap failed: " ^ err)))
+
+(** Test: get_organization_access prefers approved admin role on duplicate org entries *)
+let test_get_organization_access_prefers_admin_approved () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 200;
+    body =
+      {|{"elements":[
+        {"role":"ANALYST","state":"REQUESTED","organization":"urn:li:organization:777"},
+        {"role":"ADMINISTRATOR","state":"APPROVED","organization":"urn:li:organization:777"}
+      ]}|};
+    headers = [];
+  };
+
+  LinkedIn.get_organization_access ~account_id:"test_account"
+    (handle_result
+      (fun orgs ->
+        assert (List.length orgs = 1);
+        let only = List.hd orgs in
+        assert (only.organization_urn = "urn:li:organization:777");
+        assert (only.role = Some "ADMINISTRATOR");
+        assert (only.state = Some "APPROVED");
+        print_endline "✓ Get organization access prefers approved administrator on duplicates")
+      (fun err -> failwith ("Get organization access preference failed: " ^ err)))
+
+(** Test: duplicate preference logic is case-insensitive for role/state values *)
+let test_get_organization_access_preference_case_insensitive () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 200;
+    body =
+      {|{"elements":[
+        {"role":"analyst","state":"requested","organization":"urn:li:organization:888"},
+        {"role":"administrator","state":"approved","organization":"urn:li:organization:888"}
+      ]}|};
+    headers = [];
+  };
+
+  LinkedIn.get_organization_access ~account_id:"test_account"
+    (handle_result
+      (fun orgs ->
+        assert (List.length orgs = 1);
+        let only = List.hd orgs in
+        assert (only.organization_urn = "urn:li:organization:888");
+        assert (only.role = Some "administrator");
+        assert (only.state = Some "approved");
+        print_endline "✓ Get organization access preference is case-insensitive")
+      (fun err -> failwith ("Get organization access case-insensitive preference failed: " ^ err)))
+
+(** Test: duplicate preference logic tolerates surrounding whitespace in role/state values *)
+let test_get_organization_access_preference_trims_role_state () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 200;
+    body =
+      {|{"elements":[
+        {"role":" ANALYST ","state":" REQUESTED ","organization":"urn:li:organization:889"},
+        {"role":" ADMINISTRATOR ","state":" APPROVED ","organization":"urn:li:organization:889"}
+      ]}|};
+    headers = [];
+  };
+
+  LinkedIn.get_organization_access ~account_id:"test_account"
+    (handle_result
+      (fun orgs ->
+        assert (List.length orgs = 1);
+        let only = List.hd orgs in
+        assert (only.organization_urn = "urn:li:organization:889");
+        assert (only.role = Some "ADMINISTRATOR");
+        assert (only.state = Some "APPROVED");
+        print_endline "✓ Get organization access preference trims role/state for ranking")
+      (fun err -> failwith ("Get organization access trim preference failed: " ^ err)))
+
+(** Test: duplicate preference keeps first entry on equal role/state rank *)
+let test_get_organization_access_preference_stable_on_tie () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 200;
+    body =
+      {|{"elements":[
+        {"role":"ADMINISTRATOR","state":"APPROVED","organization":"urn:li:organization:990"},
+        {"role":"administrator","state":"approved","organization":"urn:li:organization:990"}
+      ]}|};
+    headers = [];
+  };
+
+  LinkedIn.get_organization_access ~account_id:"test_account"
+    (handle_result
+      (fun orgs ->
+        assert (List.length orgs = 1);
+        let only = List.hd orgs in
+        assert (only.organization_urn = "urn:li:organization:990");
+        assert (only.role = Some "ADMINISTRATOR");
+        assert (only.state = Some "APPROVED");
+        print_endline "✓ Get organization access preference stable on ties")
+      (fun err -> failwith ("Get organization access tie preference failed: " ^ err)))
+
+(** Test: select_preferred_organization_access returns None for empty input *)
+let test_select_preferred_organization_access_empty () =
+  let selected = LinkedIn.select_preferred_organization_access [] in
+  assert (selected = None);
+  print_endline "✓ select_preferred_organization_access returns None for empty list"
+
+(** Test: select_preferred_organization_access chooses approved administrator first *)
+let test_select_preferred_organization_access_ranking () =
+  let organizations =
+    [
+      {
+        organization_urn = "urn:li:organization:1";
+        organization_id = Some "1";
+        role = Some "ANALYST";
+        state = Some "REQUESTED";
+      };
+      {
+        organization_urn = "urn:li:organization:2";
+        organization_id = Some "2";
+        role = Some "CONTENT_ADMINISTRATOR";
+        state = Some "APPROVED";
+      };
+      {
+        organization_urn = "urn:li:organization:3";
+        organization_id = Some "3";
+        role = Some "ADMINISTRATOR";
+        state = Some "APPROVED";
+      };
+    ]
+  in
+  let selected = LinkedIn.select_preferred_organization_access organizations in
+  match selected with
+  | Some org ->
+      assert (org.organization_urn = "urn:li:organization:3");
+      print_endline "✓ select_preferred_organization_access applies role/state ranking"
+  | None -> failwith "Expected preferred organization selection"
+
+(** Test: get_preferred_organization_access returns top-ranked org *)
+let test_get_preferred_organization_access () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response {
+    status = 200;
+    body =
+      {|{"elements":[
+        {"role":"ANALYST","state":"APPROVED","organization":"urn:li:organization:100"},
+        {"role":"ADMINISTRATOR","state":"APPROVED","organization":"urn:li:organization:200"}
+      ]}|};
+    headers = [];
+  };
+
+  LinkedIn.get_preferred_organization_access ~account_id:"test_account"
+    (handle_result
+      (fun selected ->
+        match selected with
+        | Some org ->
+            assert (org.organization_urn = "urn:li:organization:200");
+            print_endline "✓ Get preferred organization access"
+        | None -> failwith "Expected preferred organization access")
+      (fun err -> failwith ("Get preferred organization access failed: " ^ err)))
+
+(** Test: get_preferred_organization_access returns None when no orgs are available *)
+let test_get_preferred_organization_access_none () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response { status = 200; body = {|{"elements":[]}|}; headers = [] };
+
+  LinkedIn.get_preferred_organization_access ~account_id:"test_account"
+    (handle_result
+      (fun selected ->
+        assert (selected = None);
+        print_endline "✓ Get preferred organization access returns None when empty")
+      (fun err -> failwith ("Get preferred organization access empty failed: " ^ err)))
+
 (** Test: Get person URN rejects malformed subject identifier *)
 let test_get_person_urn_rejects_malformed_subject () =
   Mock_config.reset ();
@@ -461,7 +1334,7 @@ let test_register_upload () =
   
   LinkedIn.register_upload 
     ~access_token:"test_token"
-    ~person_urn:"urn:li:person:test"
+    ~owner_urn:"urn:li:person:test"
     ~media_type:"image"
     (fun (asset, upload_url) ->
       assert (asset = "urn:li:digitalmediaAsset:test123");
@@ -2436,6 +3309,197 @@ let test_post_single_insufficient_permissions_error () =
       | Error_types.Partial_success _ -> failwith "Expected permission failure"
       | Error_types.Failure err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
 
+(** Test: post_single can publish as organization when author_urn is provided *)
+let test_post_single_with_organization_author () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_responses [
+    { status = 200; body = "image_data"; headers = [] };
+    {
+      status = 200;
+      body =
+        {|{"value":{"asset":"urn:li:digitalmediaAsset:img123","uploadMechanism":{"com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest":{"uploadUrl":"https://upload.linkedin.com/test"}}}}|};
+      headers = [];
+    };
+    { status = 201; body = ""; headers = [] };
+    { status = 201; body = {|{"id":"urn:li:share:orgpost123"}|}; headers = [] };
+  ];
+
+  LinkedIn.post_single
+    ~account_id:"test_account"
+    ~author_urn:"urn:li:organization:2414183"
+    ~text:"Organization post"
+    ~media_urls:["https://example.com/org-image.jpg"]
+    (handle_outcome
+      (fun post_id ->
+        assert (post_id = "urn:li:share:orgpost123");
+        let requests = List.rev !Mock_http.requests in
+        let register_request =
+          List.find_opt (fun (method_, url, _, _) ->
+            method_ = "POST" && string_contains url "registerUpload") requests
+        in
+        let post_request =
+          List.find_opt (fun (method_, url, _, _) ->
+            method_ = "POST" && string_contains url "ugcPosts") requests
+        in
+        (match register_request with
+        | Some (_, _, _, body) -> assert (string_contains body "urn:li:organization:2414183")
+        | None -> failwith "No register upload request found");
+        (match post_request with
+        | Some (_, _, _, body) -> assert (string_contains body "urn:li:organization:2414183")
+        | None -> failwith "No post request found");
+        print_endline "✓ Post single supports organization author")
+      (fun err -> failwith ("Organization author post failed: " ^ err)))
+
+(** Test: post_single maps 403 to organization write scope for organization author *)
+let test_post_single_org_insufficient_permissions_error () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_response { status = 403; body = {|{"message":"Not enough permissions"}|}; headers = [] };
+
+  LinkedIn.post_single
+    ~account_id:"test_account"
+    ~author_urn:"urn:li:organization:2414183"
+    ~text:"Organization post"
+    ~media_urls:[]
+    (function
+      | Error_types.Failure (Error_types.Auth_error (Error_types.Insufficient_permissions scopes)) ->
+          assert (List.mem "w_organization_social" scopes);
+          print_endline "✓ Post single org author maps 403 to organization scope"
+      | Error_types.Success _ -> failwith "Expected permission failure"
+      | Error_types.Partial_success _ -> failwith "Expected permission failure"
+      | Error_types.Failure err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: post_single rejects malformed explicit author_urn *)
+let test_post_single_rejects_malformed_author_urn () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+
+  LinkedIn.post_single
+    ~account_id:"test_account"
+    ~author_urn:"urn:li:company:123"
+    ~text:"Invalid author urn post"
+    ~media_urls:[]
+    (function
+      | Error_types.Failure (Error_types.Internal_error msg) ->
+          assert (string_contains msg "author URN");
+          print_endline "✓ Post single rejects malformed explicit author URN"
+      | Error_types.Success _ -> failwith "Expected validation failure"
+      | Error_types.Partial_success _ -> failwith "Expected validation failure"
+      | Error_types.Failure err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: malformed explicit author_urn fails before any network request *)
+let test_post_single_malformed_author_urn_short_circuits_network () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+
+  LinkedIn.post_single
+    ~account_id:"test_account"
+    ~author_urn:"urn:li:company:123"
+    ~text:"Invalid author urn post"
+    ~media_urls:[]
+    (function
+      | Error_types.Failure (Error_types.Internal_error _) ->
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Post single malformed explicit author URN short-circuits network"
+      | Error_types.Success _ -> failwith "Expected validation failure"
+      | Error_types.Partial_success _ -> failwith "Expected validation failure"
+      | Error_types.Failure err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: explicit author_urn with surrounding whitespace is rejected before network *)
+let test_post_single_rejects_whitespace_author_urn_short_circuits_network () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+
+  LinkedIn.post_single
+    ~account_id:"test_account"
+    ~author_urn:" urn:li:organization:2414183 "
+    ~text:"Invalid author urn post"
+    ~media_urls:[]
+    (function
+      | Error_types.Failure (Error_types.Internal_error msg) ->
+          assert (string_contains msg "whitespace");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Post single rejects whitespace explicit author URN before network"
+      | Error_types.Success _ -> failwith "Expected validation failure"
+      | Error_types.Partial_success _ -> failwith "Expected validation failure"
+      | Error_types.Failure err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
 (** Test: OAuth URL contains all required parameters *)
 let test_oauth_url_parameters () =
   Mock_config.reset ();
@@ -2456,6 +3520,213 @@ let test_oauth_url_parameters () =
       assert (string_contains url "openid" || string_contains url "profile" || string_contains url "email");
       print_endline "✓ OAuth URL parameters complete")
     (fun err -> failwith ("OAuth URL parameters test failed: " ^ err))
+
+(** Test: OAuth URL can include organization scopes for page linking *)
+let test_oauth_url_with_organization_scopes () =
+  Mock_config.reset ();
+  Mock_config.set_env "LINKEDIN_CLIENT_ID" "test_client_id";
+
+  LinkedIn.get_oauth_url ~include_organization_scopes:true
+    ~redirect_uri:"https://example.com/callback" ~state:"state123"
+    (fun url ->
+      assert (string_contains url "w_organization_social");
+      assert (string_contains url "r_organization_admin");
+      print_endline "✓ OAuth URL includes organization scopes")
+    (fun err -> failwith ("OAuth URL with organization scopes failed: " ^ err))
+
+(** Test: exchange_code_and_get_organizations returns approved org access entries *)
+let test_exchange_code_and_get_organizations () =
+  Mock_config.reset ();
+  Mock_config.set_env "LINKEDIN_CLIENT_ID" "test_client";
+  Mock_config.set_env "LINKEDIN_CLIENT_SECRET" "test_secret";
+
+  Mock_http.set_responses [
+    {
+      status = 200;
+      body =
+        {|{"access_token":"token123","refresh_token":"refresh123","expires_in":5184000}|};
+      headers = [];
+    };
+    {
+      status = 200;
+      body =
+        {|{"elements":[{"role":"ADMINISTRATOR","state":"APPROVED","organization":"urn:li:organization:2414183"}]}|};
+      headers = [];
+    };
+  ];
+
+  LinkedIn.exchange_code_and_get_organizations
+    ~code:"test_code" ~redirect_uri:"https://example.com/callback"
+    (fun (creds, orgs) ->
+      assert (creds.access_token = "token123");
+      assert (List.length orgs = 1);
+      let org = List.hd orgs in
+      assert (org.organization_urn = "urn:li:organization:2414183");
+      assert (org.organization_id = Some "2414183");
+      assert (org.role = Some "ADMINISTRATOR");
+      assert (org.state = Some "APPROVED");
+      print_endline "✓ Exchange code and get organizations")
+    (fun err -> failwith ("exchange_code_and_get_organizations failed: " ^ err))
+
+(** Test: exchange_code_and_get_organizations normalizes role and acl_state filters *)
+let test_exchange_code_and_get_organizations_filter_normalization () =
+  Mock_config.reset ();
+  Mock_config.set_env "LINKEDIN_CLIENT_ID" "test_client";
+  Mock_config.set_env "LINKEDIN_CLIENT_SECRET" "test_secret";
+
+  Mock_http.set_responses [
+    {
+      status = 200;
+      body =
+        {|{"access_token":"token123","refresh_token":"refresh123","expires_in":5184000}|};
+      headers = [];
+    };
+    {
+      status = 200;
+      body = {|{"elements":[]}|};
+      headers = [];
+    };
+  ];
+
+  LinkedIn.exchange_code_and_get_organizations
+    ~code:"test_code"
+    ~redirect_uri:"https://example.com/callback"
+    ~role:" administrator "
+    ~acl_state:" approved "
+    (fun (_creds, _orgs) ->
+      let requests = List.rev !Mock_http.requests in
+      match requests with
+      | [ (_, _token_url, _, _); (_, acl_url, _, _) ] ->
+          assert (string_contains acl_url "role=ADMINISTRATOR");
+          assert (string_contains acl_url "state=APPROVED");
+          print_endline "✓ Exchange code and organizations normalizes role/state filters"
+      | _ -> failwith "Expected token request followed by ACL request")
+    (fun err -> failwith ("exchange_code_and_get_organizations filter normalization failed: " ^ err))
+
+(** Test: exchange_code_and_get_preferred_organization returns ranked preferred org *)
+let test_exchange_code_and_get_preferred_organization () =
+  Mock_config.reset ();
+  Mock_config.set_env "LINKEDIN_CLIENT_ID" "test_client";
+  Mock_config.set_env "LINKEDIN_CLIENT_SECRET" "test_secret";
+
+  Mock_http.set_responses [
+    {
+      status = 200;
+      body =
+        {|{"access_token":"token123","refresh_token":"refresh123","expires_in":5184000}|};
+      headers = [];
+    };
+    {
+      status = 200;
+      body =
+        {|{"elements":[
+          {"role":"ANALYST","state":"APPROVED","organization":"urn:li:organization:100"},
+          {"role":"ADMINISTRATOR","state":"APPROVED","organization":"urn:li:organization:200"}
+        ]}|};
+      headers = [];
+    };
+  ];
+
+  LinkedIn.exchange_code_and_get_preferred_organization
+    ~code:"test_code"
+    ~redirect_uri:"https://example.com/callback"
+    (fun (creds, selected) ->
+      assert (creds.access_token = "token123");
+      (match selected with
+      | Some org -> assert (org.organization_urn = "urn:li:organization:200")
+      | None -> failwith "Expected preferred organization");
+      print_endline "✓ Exchange code and get preferred organization")
+    (fun err -> failwith ("exchange_code_and_get_preferred_organization failed: " ^ err))
+
+(** Test: exchange_code_and_get_preferred_organization returns None when ACLs empty *)
+let test_exchange_code_and_get_preferred_organization_none () =
+  Mock_config.reset ();
+  Mock_config.set_env "LINKEDIN_CLIENT_ID" "test_client";
+  Mock_config.set_env "LINKEDIN_CLIENT_SECRET" "test_secret";
+
+  Mock_http.set_responses [
+    {
+      status = 200;
+      body =
+        {|{"access_token":"token123","refresh_token":"refresh123","expires_in":5184000}|};
+      headers = [];
+    };
+    {
+      status = 200;
+      body = {|{"elements":[]}|};
+      headers = [];
+    };
+  ];
+
+  LinkedIn.exchange_code_and_get_preferred_organization
+    ~code:"test_code"
+    ~redirect_uri:"https://example.com/callback"
+    (fun (_creds, selected) ->
+      assert (selected = None);
+      print_endline "✓ Exchange code and get preferred organization returns None when empty")
+    (fun err -> failwith ("exchange_code_and_get_preferred_organization empty failed: " ^ err))
+
+(** Test: exchange_code_and_get_preferred_organization surfaces ACL insufficient-permissions context *)
+let test_exchange_code_and_get_preferred_organization_acl_403 () =
+  Mock_config.reset ();
+  Mock_config.set_env "LINKEDIN_CLIENT_ID" "test_client";
+  Mock_config.set_env "LINKEDIN_CLIENT_SECRET" "test_secret";
+
+  Mock_http.set_responses [
+    {
+      status = 200;
+      body =
+        {|{"access_token":"token123","refresh_token":"refresh123","expires_in":5184000}|};
+      headers = [];
+    };
+    {
+      status = 403;
+      body = {|{"message":"Forbidden"}|};
+      headers = [];
+    };
+  ];
+
+  LinkedIn.exchange_code_and_get_preferred_organization
+    ~code:"test_code"
+    ~redirect_uri:"https://example.com/callback"
+    (fun _ -> failwith "Expected ACL permission error")
+    (fun err ->
+      assert (string_contains err "permission" || string_contains err "403");
+      assert (string_contains err "r_organization_admin");
+      print_endline "✓ Exchange preferred organization maps ACL 403 to org scope hint")
+
+(** Test: exchange_code_and_get_preferred_organization surfaces ACL rate-limit context *)
+let test_exchange_code_and_get_preferred_organization_acl_429 () =
+  Mock_config.reset ();
+  Mock_config.set_env "LINKEDIN_CLIENT_ID" "test_client";
+  Mock_config.set_env "LINKEDIN_CLIENT_SECRET" "test_secret";
+
+  Mock_http.set_responses [
+    {
+      status = 200;
+      body =
+        {|{"access_token":"token123","refresh_token":"refresh123","expires_in":5184000}|};
+      headers = [];
+    };
+    {
+      status = 429;
+      body = {|{"message":"Too many requests"}|};
+      headers = [];
+    };
+  ];
+
+  LinkedIn.exchange_code_and_get_preferred_organization
+    ~code:"test_code"
+    ~redirect_uri:"https://example.com/callback"
+    (fun _ -> failwith "Expected ACL rate-limit error")
+    (fun err ->
+      let err_lc = String.lowercase_ascii err in
+      assert (
+        string_contains err_lc "rate"
+        || string_contains err_lc "429"
+        || string_contains err_lc "too many"
+      );
+      print_endline "✓ Exchange preferred organization maps ACL 429 to rate-limit")
 
 (** Test: OAuth URL encoding *)
 let test_oauth_url_encoding () =
@@ -3518,7 +4789,7 @@ let test_register_upload_headers () =
   
   LinkedIn.register_upload 
     ~access_token:"test_token"
-    ~person_urn:"urn:li:person:test"
+    ~owner_urn:"urn:li:person:test"
     ~media_type:"image"
     (fun (_asset, _upload_url) ->
       let requests = !Mock_http.requests in
@@ -3737,7 +5008,7 @@ let test_register_video_upload () =
   
   LinkedIn.register_upload 
     ~access_token:"test_token"
-    ~person_urn:"urn:li:person:test"
+    ~owner_urn:"urn:li:person:test"
     ~media_type:"video"
     (fun (asset, _upload_url) ->
       assert (asset = "urn:li:digitalmediaAsset:videotest123");
@@ -3844,6 +5115,7 @@ let () =
   print_endline "--- OAuth Flow Tests ---";
   test_oauth_url ();
   test_oauth_url_parameters ();
+  test_oauth_url_with_organization_scopes ();
   test_oauth_url_encoding ();
   test_oauth_url_rejects_whitespace_state ();
   test_oauth_url_rejects_redirect_mismatch ();
@@ -3853,6 +5125,12 @@ let () =
   test_validate_oauth_state_whitespace_rejected ();
   test_oauth_scope_validation ();
   test_token_exchange ();
+  test_exchange_code_and_get_organizations ();
+  test_exchange_code_and_get_organizations_filter_normalization ();
+  test_exchange_code_and_get_preferred_organization ();
+  test_exchange_code_and_get_preferred_organization_none ();
+  test_exchange_code_and_get_preferred_organization_acl_403 ();
+  test_exchange_code_and_get_preferred_organization_acl_429 ();
   test_exchange_code_rejects_whitespace_code ();
   test_token_exchange_invalid ();
   test_token_exchange_missing_fields ();
@@ -3867,6 +5145,28 @@ let () =
   
   print_endline "\n--- API Operation Tests ---";
   test_get_person_urn ();
+  test_get_organization_access ();
+  test_get_organization_access_parsing_resilience ();
+  test_get_organization_access_pagination ();
+  test_get_organization_access_blank_role_filter ();
+  test_get_organization_access_trims_role_state_filters ();
+  test_get_organization_access_uppercases_role_state_filters ();
+  test_get_organization_access_invalid_version_fallback ();
+  test_get_organization_access_valid_version_header ();
+  test_get_organization_access_invalid_month_version_fallback ();
+  test_get_organization_access_dotted_version_fallback ();
+  test_get_organization_access_deduplicates_by_org ();
+  test_get_organization_access_non_advancing_paging_stops ();
+  test_get_organization_access_pagination_fallback_uses_raw_count ();
+  test_get_organization_access_pagination_fallback_has_page_cap ();
+  test_get_organization_access_prefers_admin_approved ();
+  test_get_organization_access_preference_case_insensitive ();
+  test_get_organization_access_preference_trims_role_state ();
+  test_get_organization_access_preference_stable_on_tie ();
+  test_select_preferred_organization_access_empty ();
+  test_select_preferred_organization_access_ranking ();
+  test_get_preferred_organization_access ();
+  test_get_preferred_organization_access_none ();
   test_get_person_urn_rejects_malformed_subject ();
   test_get_person_urn_rejects_whitespace_subject ();
   test_get_person_urn_rejects_empty_subject ();
@@ -3940,6 +5240,11 @@ let () =
   test_get_post_engagement_rejects_malformed_delimiter_urn ();
   test_post_with_url_preview ();
   test_post_single_insufficient_permissions_error ();
+  test_post_single_with_organization_author ();
+  test_post_single_org_insufficient_permissions_error ();
+  test_post_single_rejects_malformed_author_urn ();
+  test_post_single_malformed_author_urn_short_circuits_network ();
+  test_post_single_rejects_whitespace_author_urn_short_circuits_network ();
   
   print_endline "\n--- Alt-Text Tests ---";
   test_post_with_alt_text ();

@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Scroller `page_size` normalized to a minimum of `1`.
   - Scroller `scroll_back` corrected to move back one page and preserve position on failed back requests.
   - Post URN validation tightened across post-targeting endpoints (required, trimmed, delimiter-safe).
+  - `post_single` now validates explicit `author_urn` before token/network work (fail-fast on malformed URNs).
+  - `LINKEDIN_VERSION` for organization ACL requests is now strictly validated as `YYYYMM` with safe fallback.
+  - Organization ACL filter arg is named `acl_state` (not `state`) to avoid confusion with OAuth CSRF state.
+  - Added preferred-organization helpers for account-linking UX (`select_preferred_organization_access`, `get_preferred_organization_access`).
+  - Added `exchange_code_and_get_preferred_organization` for one-step account linking plus default author selection.
 - Error handling:
   - API raw-response redaction added for sensitive fields (`access_token`, `refresh_token`, `client_secret`) and non-JSON payloads.
   - `get_person_urn` hardened with strict `sub` validation and status-specific error hints for 401/403/429.
@@ -37,6 +42,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Pagination normalization and malformed-input rejection paths.
   - Scope-aware 403 mapping assertions across read/write endpoints.
   - `get_person_urn` parse/error branches and redaction behavior.
+  - Organization ACL version-header fallback behavior for dotted/invalid formats.
+  - Explicit invalid `author_urn` short-circuit behavior (no network calls).
+  - Explicit whitespace `author_urn` rejection before any network/token calls.
+
+### Documentation
+
+- Added end-to-end account linking examples for organization/page onboarding:
+  - OAuth URL generation with organization scopes
+  - OAuth callback exchange + organization access discovery
+  - Refreshing organization access for a linked account
+  - Posting as selected organization/page author URN
+  - Recommended account-linking recipe for persisting credentials and default author selection.
+
+### Tests
+
+- Added OAuth-linking contract coverage for `exchange_code_and_get_preferred_organization` error mapping:
+  - ACL `403` -> insufficient permissions context with org scope hints
+  - ACL `429` -> rate-limit context
 
 ### Added
 

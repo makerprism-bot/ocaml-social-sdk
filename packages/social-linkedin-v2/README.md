@@ -127,7 +127,7 @@ let post_to_linkedin account_id =
 let post_with_image account_id =
   let text = "Check out this image!" in
   
-  LinkedIn.post_single ~account_id ~text ~media_urls:["path/to/image.jpg"]
+  LinkedIn.post_single ~account_id ~text ~media_urls:["https://cdn.example.com/image.jpg"]
     (function
       | Social_core.Error_types.Success post_id ->
           Printf.printf "Posted with image: %s\n" post_id
@@ -135,6 +135,152 @@ let post_with_image account_id =
           Printf.printf "Posted: %s (with %d warnings)\n" post_id (List.length warnings)
       | Social_core.Error_types.Failure err ->
           Printf.eprintf "Error: %s\n" (Social_core.Error_types.error_to_string err))
+```
+
+### Account Linking Examples
+
+#### Person + organization scope consent URL
+
+```ocaml
+let start_linkedin_linking () =
+  LinkedIn.get_oauth_url
+    ~include_organization_scopes:true
+    ~redirect_uri:"https://myapp.com/callback"
+    ~state:"csrf_token_123"
+    (fun url ->
+      (* Redirect user to LinkedIn consent screen *)
+      Printf.printf "Redirect user to: %s\n" url)
+    (fun err -> Printf.eprintf "OAuth URL error: %s\n" err)
+```
+
+#### OAuth callback: link account and fetch page/org access
+
+```ocaml
+let complete_linkedin_linking ~account_id ~code =
+  LinkedIn.exchange_code_and_get_organizations
+    ~code
+    ~redirect_uri:"https://myapp.com/callback"
+    ~acl_state:"APPROVED"
+    (fun (credentials, organizations) ->
+      (* 1) Persist OAuth credentials for this account_id *)
+      Db.save_linkedin_credentials account_id credentials;
+
+      (* 2) Store available author URNs for org/page posting UI *)
+      Db.replace_linkedin_org_access account_id organizations;
+      List.iter
+        (fun org ->
+          Printf.printf "Org access: %s role=%s state=%s\n"
+            org.organization_urn
+            (Option.value org.role ~default:"unknown")
+            (Option.value org.state ~default:"unknown"))
+        organizations;
+
+      (* 3) Optionally preselect one author_urn for future posts *)
+      (match LinkedIn.select_preferred_organization_access organizations with
+      | Some preferred ->
+          Db.set_default_linkedin_author account_id preferred.organization_urn
+      | None -> ());
+
+      ())
+    (fun err -> Printf.eprintf "Linking failed: %s\n" err)
+```
+
+#### OAuth callback: link account and fetch one preferred author candidate
+
+```ocaml
+let complete_linkedin_linking_with_default ~account_id ~code =
+  LinkedIn.exchange_code_and_get_preferred_organization
+    ~code
+    ~redirect_uri:"https://myapp.com/callback"
+    ~acl_state:"APPROVED"
+    (fun (credentials, preferred_opt) ->
+      Db.save_linkedin_credentials account_id credentials;
+      (match preferred_opt with
+      | Some preferred ->
+          Db.set_default_linkedin_author account_id preferred.organization_urn
+      | None -> ()))
+    (fun err -> Printf.eprintf "Linking failed: %s\n" err)
+```
+
+#### Refresh org/page access for a linked account
+
+```ocaml
+let refresh_linkedin_org_access account_id =
+  LinkedIn.get_organization_access ~account_id ~acl_state:"APPROVED"
+    (function
+      | Ok organizations ->
+          Printf.printf "Found %d organizations\n" (List.length organizations)
+      | Error err ->
+          Printf.eprintf "Organization access fetch failed: %s\n"
+            (Social_core.Error_types.error_to_string err))
+```
+
+#### Fetch one best org/page author candidate
+
+```ocaml
+let refresh_default_linkedin_author account_id =
+  LinkedIn.get_preferred_organization_access ~account_id ~acl_state:"APPROVED"
+    (function
+      | Ok (Some preferred) ->
+          Db.set_default_linkedin_author account_id preferred.organization_urn
+      | Ok None ->
+          Printf.printf "No eligible organization access found\n"
+      | Error err ->
+          Printf.eprintf "Preferred org fetch failed: %s\n"
+            (Social_core.Error_types.error_to_string err))
+```
+
+#### Post as selected organization/page
+
+```ocaml
+let post_as_organization ~account_id ~organization_urn ~text =
+  LinkedIn.post_single
+    ~account_id
+    ~author_urn:organization_urn
+    ~text
+    ~media_urls:[]
+    (function
+      | Social_core.Error_types.Success post_id ->
+          Printf.printf "Posted as org: %s\n" post_id
+      | Social_core.Error_types.Partial_success { result = post_id; warnings } ->
+          Printf.printf "Posted as org: %s (warnings=%d)\n"
+            post_id (List.length warnings)
+      | Social_core.Error_types.Failure err ->
+          Printf.eprintf "Org post failed: %s\n"
+            (Social_core.Error_types.error_to_string err))
+```
+
+#### Account linking checklist
+
+- Persist OAuth credentials returned by `exchange_code` or `exchange_code_and_get_organizations`.
+- Persist discovered `organization_access_info` entries for account settings UI.
+- Persist a default `author_urn` for posting (via `select_preferred_organization_access` or user choice).
+- Re-sync organization access periodically or on reconnect with `get_organization_access`.
+- If no eligible org/page remains, fall back to person posting by omitting `author_urn`.
+- On 403 posting errors, guide re-consent with `include_organization_scopes:true` and verify product access.
+
+#### Account linking recipe (recommended flow)
+
+```ocaml
+let link_linkedin_account ~account_id ~code =
+  LinkedIn.exchange_code_and_get_preferred_organization
+    ~code
+    ~redirect_uri:"https://myapp.com/callback"
+    ~acl_state:"APPROVED"
+    (fun (credentials, preferred_opt) ->
+      (* Persist credentials first *)
+      Db.save_linkedin_credentials account_id credentials;
+
+      (* Resolve default author URN *)
+      match preferred_opt with
+      | Some preferred ->
+          Db.set_default_linkedin_author account_id preferred.organization_urn
+      | None ->
+          (* Keep default unset and allow person posting fallback *)
+          Db.clear_default_linkedin_author account_id)
+    (fun err ->
+      (* Retry/backoff for 429, re-consent for 403 org scope failures *)
+      Printf.eprintf "LinkedIn link flow failed: %s\n" err)
 ```
 
 ### Get User Profile
@@ -357,7 +503,13 @@ The LinkedIn provider uses these scopes depending on features:
 ### Advanced Features
 For posting to company pages, you need:
 - `w_organization_social` - Post as organization
+- `r_organization_admin` - Discover org/page access via organization ACLs
 - Community Management API access
+
+Organization/page onboarding helpers are available:
+- `get_oauth_url ~include_organization_scopes:true ...`
+- `exchange_code_and_get_organizations` to exchange OAuth code and list organization access
+- `get_organization_access` to refresh discoverable organizations for a linked account
 
 **Recommended Scope Set for Full Functionality:**
 ```
@@ -376,6 +528,9 @@ LINKEDIN_REDIRECT_URI=https://yourapp.com/callback
 
 # Optional - only if you have LinkedIn Partner Program access
 LINKEDIN_ENABLE_PROGRAMMATIC_REFRESH=true
+
+# Optional - LinkedIn version header used for /rest organization ACL APIs (YYYYMM)
+LINKEDIN_VERSION=202601
 ```
 
 ## API Reference
@@ -453,6 +608,13 @@ type comment_info = {
   text: string;
   created_at: string option;
 }
+
+type organization_access_info = {
+  organization_urn: string;
+  organization_id: string option;
+  role: string option;
+  state: string option;
+}
 ```
 
 ### Authentication Functions
@@ -462,6 +624,7 @@ Generate OAuth authorization URL.
 
 ```ocaml
 val get_oauth_url : 
+  ?include_organization_scopes:bool ->
   redirect_uri:string -> 
   state:string -> 
   (string -> 'a) ->  (* on_success *)
@@ -481,6 +644,67 @@ val exchange_code :
   'a
 ```
 
+#### `exchange_code_and_get_organizations`
+Exchange authorization code and immediately fetch organization/page access entries.
+
+```ocaml
+val exchange_code_and_get_organizations :
+  code:string ->
+  redirect_uri:string ->
+  ?role:string ->
+  ?acl_state:string ->
+  ((credentials * organization_access_info list) -> 'a) ->
+  (string -> 'a) ->
+  'a
+```
+
+#### `exchange_code_and_get_preferred_organization`
+Exchange authorization code and return one preferred organization/page access candidate.
+
+```ocaml
+val exchange_code_and_get_preferred_organization :
+  code:string ->
+  redirect_uri:string ->
+  ?role:string ->
+  ?acl_state:string ->
+  ((credentials * organization_access_info option) -> 'a) ->
+  (string -> 'a) ->
+  'a
+```
+
+#### `get_organization_access`
+Fetch organization/page access entries for an already linked account.
+
+```ocaml
+val get_organization_access :
+  account_id:string ->
+  ?role:string ->
+  ?acl_state:string ->
+  ((organization_access_info list, Error_types.error) result -> unit) ->
+  unit
+```
+
+#### `select_preferred_organization_access`
+Select one preferred organization entry from a list using provider ranking (state, then role).
+
+```ocaml
+val select_preferred_organization_access :
+  organization_access_info list ->
+  organization_access_info option
+```
+
+#### `get_preferred_organization_access`
+Fetch organization/page access entries and return one preferred candidate.
+
+```ocaml
+val get_preferred_organization_access :
+  account_id:string ->
+  ?role:string ->
+  ?acl_state:string ->
+  ((organization_access_info option, Error_types.error) result -> unit) ->
+  unit
+```
+
 #### `post_single`
 Post to LinkedIn with optional media. Uses structured error handling with the `outcome` type.
 
@@ -489,6 +713,7 @@ val post_single :
   account_id:string -> 
   text:string -> 
   media_urls:string list ->
+  ?author_urn:string ->
   ?alt_texts:string list ->
   (string Social_core.Error_types.outcome -> unit) ->  (* on_result *)
   unit
@@ -502,6 +727,7 @@ val post_thread :
   account_id:string -> 
   texts:string list -> 
   media_urls_per_post:string list list ->
+  ?author_urn:string ->
   ?alt_texts_per_post:string list list ->
   (Social_core.Error_types.thread_result Social_core.Error_types.outcome -> unit) ->  (* on_result *)
   unit

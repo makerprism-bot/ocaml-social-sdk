@@ -391,6 +391,13 @@ type comment_info = {
   created_at: string option;
 }
 
+type organization_access_info = {
+  organization_urn: string;
+  organization_id: string option;
+  role: string option;
+  state: string option;
+}
+
 (** Configuration module type for LinkedIn provider *)
 module type CONFIG = sig
   module Http : HTTP_CLIENT
@@ -477,6 +484,90 @@ module Make (Config : CONFIG) = struct
       Some (Printf.sprintf "%s contains invalid delimiter characters" field_name)
     else
       None
+
+  let is_valid_linkedin_version version =
+    let is_digit c = c >= '0' && c <= '9' in
+    let month_in_range mm =
+      try
+        let m = int_of_string mm in
+        m >= 1 && m <= 12
+      with _ -> false
+    in
+    let len = String.length version in
+    len = 6
+    && String.for_all is_digit version
+    && month_in_range (String.sub version 4 2)
+
+  let linkedin_version_header () =
+    let configured = Config.get_env "LINKEDIN_VERSION" |> Option.value ~default:"" |> String.trim in
+    if configured = "" then "202601"
+    else if is_valid_linkedin_version configured then configured
+    else "202601"
+
+  let is_person_urn urn = String.starts_with ~prefix:"urn:li:person:" urn
+  let is_organization_urn urn = String.starts_with ~prefix:"urn:li:organization:" urn
+  let is_organization_brand_urn urn = String.starts_with ~prefix:"urn:li:organizationBrand:" urn
+
+  let validate_author_urn value =
+    match validate_required_urn ~field_name:"LinkedIn author URN" value with
+    | Some err -> Some err
+    | None ->
+        if is_person_urn value || is_organization_urn value || is_organization_brand_urn value then None
+        else Some "LinkedIn author URN must be a person, organization, or organizationBrand URN"
+
+  let normalize_optional_filter value_opt =
+    match value_opt with
+    | None -> None
+    | Some raw ->
+        let trimmed = String.trim raw in
+        if trimmed = "" then None else Some trimmed
+
+  let normalize_acl_role_filter value_opt =
+    normalize_optional_filter value_opt |> Option.map String.uppercase_ascii
+
+  let normalize_acl_state_filter value_opt =
+    normalize_optional_filter value_opt |> Option.map String.uppercase_ascii
+
+  let take_first_n n items =
+    let rec loop remaining acc = function
+      | _ when remaining <= 0 -> List.rev acc
+      | [] -> List.rev acc
+      | x :: xs -> loop (remaining - 1) (x :: acc) xs
+    in
+    loop n [] items
+
+  let role_rank = function
+    | Some role ->
+        (match String.uppercase_ascii (String.trim role) with
+        | "ADMINISTRATOR" -> 5
+        | "CONTENT_ADMINISTRATOR" -> 4
+        | "DIRECT_SPONSORED_CONTENT_POSTER" -> 3
+        | "CURATOR" -> 2
+        | "ANALYST" -> 1
+        | _ -> 0)
+    | None -> 0
+
+  let state_rank = function
+    | Some state ->
+        (match String.uppercase_ascii (String.trim state) with
+        | "APPROVED" -> 3
+        | "REQUESTED" -> 2
+        | "REJECTED" -> 1
+        | "REVOKED" -> 0
+        | _ -> 0)
+    | None -> 0
+
+  let choose_preferred_org_access a b =
+    let a_state = state_rank a.state and b_state = state_rank b.state in
+    if a_state <> b_state then if a_state > b_state then a else b
+    else
+      let a_role = role_rank a.role and b_role = role_rank b.role in
+      if a_role > b_role then a else b
+
+  let select_preferred_organization_access organizations =
+    match organizations with
+    | [] -> None
+    | first :: rest -> Some (List.fold_left choose_preferred_org_access first rest)
 
   let normalize_start start = max 0 start
   let normalize_count ~max_count count = min max_count (max 1 count)
@@ -593,6 +684,147 @@ module Make (Config : CONFIG) = struct
           | None, None -> "API error"
         with _ -> "API error")
         ~raw_response:redacted_body ()
+
+  let strip_urn_prefix ~prefix urn =
+    if String.starts_with ~prefix urn then
+      Some (String.sub urn (String.length prefix) (String.length urn - String.length prefix))
+    else None
+
+  let organization_id_of_urn urn =
+    match strip_urn_prefix ~prefix:"urn:li:organization:" urn with
+    | Some id -> Some id
+    | None -> strip_urn_prefix ~prefix:"urn:li:organizationBrand:" urn
+
+  let parse_organization_accesses_from_body body =
+    let json = Yojson.Basic.from_string body in
+    let open Yojson.Basic.Util in
+    let elements =
+      try json |> member "elements" |> to_list
+      with _ -> []
+    in
+    List.filter_map
+      (fun elem ->
+        try
+          let normalize_urn_opt = function
+            | Some urn ->
+                let trimmed = String.trim urn in
+                if trimmed = "" then None else Some trimmed
+            | None -> None
+          in
+          let organization_opt = elem |> member "organization" |> to_string_option |> normalize_urn_opt in
+          let organization_target_opt = elem |> member "organizationTarget" |> to_string_option |> normalize_urn_opt in
+          let valid_organization_urn_opt =
+            let is_valid urn = is_organization_urn urn || is_organization_brand_urn urn in
+            match organization_opt, organization_target_opt with
+            | Some urn, _ when is_valid urn -> Some urn
+            | _, Some urn when is_valid urn -> Some urn
+            | _ -> None
+          in
+          match valid_organization_urn_opt with
+          | None -> None
+          | Some organization_urn ->
+              let role = elem |> member "role" |> to_string_option |> normalize_optional_filter in
+              let state = elem |> member "state" |> to_string_option |> normalize_optional_filter in
+              Some
+                {
+                  organization_urn;
+                  organization_id = organization_id_of_urn organization_urn;
+                  role;
+                  state;
+                }
+        with _ -> None)
+      elements
+
+  let fetch_organization_accesses_by_token ?role ?state ~access_token on_result =
+    let page_size = 100 in
+    let max_items = 1000 in
+    let max_pages = (max_items / page_size) + 5 in
+    let headers =
+      [
+        ("Authorization", Printf.sprintf "Bearer %s" access_token);
+        ("X-Restli-Protocol-Version", "2.0.0");
+        ("Linkedin-Version", linkedin_version_header ());
+        ("X-RestLi-Method", "FINDER");
+      ]
+    in
+    let build_url start =
+      let params =
+        [
+          ("q", "roleAssignee");
+          ("count", string_of_int page_size);
+          ("start", string_of_int start);
+        ]
+        @
+        (match role with Some r -> [ ("role", r) ] | None -> [])
+        @
+        (match state with Some s -> [ ("state", s) ] | None -> [])
+      in
+      let query_string = Uri.encoded_of_query (List.map (fun (k, v) -> (k, [ v ])) params) in
+      Printf.sprintf "https://api.linkedin.com/rest/organizationAcls?%s" query_string
+    in
+    let rec fetch_page ~start ~acc ~pages_fetched =
+      Config.Http.get ~headers (build_url start)
+        (fun response ->
+          if response.status >= 200 && response.status < 300 then
+            try
+              let page_accesses = parse_organization_accesses_from_body response.body in
+              let merged =
+                List.fold_left
+                  (fun seen item ->
+                    let rec replace_or_add acc_seen = function
+                      | [] -> List.rev (item :: acc_seen)
+                      | existing :: rest when existing.organization_urn = item.organization_urn ->
+                          let preferred = choose_preferred_org_access item existing in
+                          List.rev_append acc_seen (preferred :: rest)
+                      | existing :: rest -> replace_or_add (existing :: acc_seen) rest
+                    in
+                    replace_or_add [] seen)
+                  acc page_accesses
+              in
+              let merged_count = List.length merged in
+              let json = Yojson.Basic.from_string response.body in
+              let open Yojson.Basic.Util in
+              let raw_elements_count =
+                try json |> member "elements" |> to_list |> List.length
+                with _ -> List.length page_accesses
+              in
+              let next_start =
+                try
+                  let paging = json |> member "paging" in
+                  let paging_start = paging |> member "start" |> to_int in
+                  let paging_count = paging |> member "count" |> to_int in
+                  let page_total = paging |> member "total" |> to_int_option in
+                  let candidate = paging_start + paging_count in
+                  match page_total with
+                  | Some total when candidate >= total -> None
+                  | _ when paging_count <= 0 -> None
+                  | _ -> Some candidate
+                with _ ->
+                  if raw_elements_count < page_size then None
+                  else Some (start + page_size)
+              in
+              let pages_fetched = pages_fetched + 1 in
+              if merged_count >= max_items then on_result (Ok (take_first_n max_items merged))
+              else if pages_fetched >= max_pages then on_result (Ok merged)
+              else
+                match next_start with
+                | Some ns when ns > start -> fetch_page ~start:ns ~acc:merged ~pages_fetched
+                | Some _ -> on_result (Ok merged)
+                | None -> on_result (Ok merged)
+            with e ->
+              on_result
+                (Error
+                   (Error_types.Internal_error
+                      (Printf.sprintf "Failed to parse organization access response: %s"
+                         (Printexc.to_string e))))
+          else
+            on_result
+              (Error
+                 (parse_api_error ~required_scopes:[ "r_organization_admin" ]
+                    ~status_code:response.status ~body:response.body)))
+        (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err))))
+    in
+    fetch_page ~start:0 ~acc:[] ~pages_fetched:0
   
   (** Refresh OAuth 2.0 access token (PARTNER PROGRAM ONLY)
       
@@ -789,7 +1021,7 @@ module Make (Config : CONFIG) = struct
       on_error
   
   (** Register image upload with LinkedIn *)
-  let register_upload ~access_token ~person_urn ~media_type on_success on_error =
+  let register_upload ~access_token ~owner_urn ~media_type on_success on_error =
     let recipe = match media_type with
       | "video" -> "urn:li:digitalmediaRecipe:feedshare-video"
       | _ -> "urn:li:digitalmediaRecipe:feedshare-image"
@@ -799,7 +1031,7 @@ module Make (Config : CONFIG) = struct
     let register_body = `Assoc [
       ("registerUploadRequest", `Assoc [
         ("recipes", `List [`String recipe]);
-        ("owner", `String person_urn);
+        ("owner", `String owner_urn);
         ("serviceRelationships", `List [
           `Assoc [
             ("relationshipType", `String "OWNER");
@@ -852,7 +1084,7 @@ module Make (Config : CONFIG) = struct
       on_error
   
   (** Upload image or video to LinkedIn with optional alt text *)
-  let upload_media ~access_token ~person_urn ~media_url ~media_type ~alt_text ?(validate_before_upload=false) ~on_validation_error on_success on_error =
+  let upload_media ~access_token ~owner_urn ~media_url ~media_type ~alt_text ?(validate_before_upload=false) ~on_validation_error on_success on_error =
     (* Download media from URL *)
     Config.Http.get ~headers:[] media_url
       (fun media_response ->
@@ -887,7 +1119,7 @@ module Make (Config : CONFIG) = struct
           (match validation_result with
           | Error errs -> on_validation_error errs
           | Ok () ->
-              register_upload ~access_token ~person_urn ~media_type
+              register_upload ~access_token ~owner_urn ~media_type
                 (fun (asset_urn, upload_url) ->
                   upload_binary ~access_token ~upload_url ~media_data:media_response.body
                     (fun () -> on_success (asset_urn, alt_text))
@@ -912,23 +1144,40 @@ module Make (Config : CONFIG) = struct
       @param account_id The account identifier
       @param text The post text (max 3000 characters)
       @param media_urls List of media URLs to attach (max 9)
+      @param author_urn Optional explicit author URN. When omitted, uses current person URN.
+             Supported formats: urn:li:person:*, urn:li:organization:*, urn:li:organizationBrand:*
       @param alt_texts Optional alt text for each media item
       @param validate_media_before_upload When true, validates media size after download
              but before upload. LinkedIn limits: 200MB video, 10min duration, 8MB images.
              Default: false
       @param on_result Callback receiving the outcome with post ID
   *)
-  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) ?(validate_media_before_upload=false) on_result =
+  let post_single ~account_id ~text ~media_urls ?author_urn ?(alt_texts=[]) ?(validate_media_before_upload=false) on_result =
     (* Validate before making any API calls *)
     let media_count = List.length media_urls in
-    match validate_post ~text ~media_count () with
-    | Error errs ->
+    let author_validation =
+      match author_urn with
+      | None -> Ok None
+      | Some explicit_author ->
+          (match validate_author_urn explicit_author with
+          | Some err -> Error err
+          | None -> Ok (Some explicit_author))
+    in
+    match validate_post ~text ~media_count (), author_validation with
+    | Error errs, _ ->
         on_result (Error_types.Failure (Error_types.Validation_error errs))
-    | Ok () ->
+    | _, Error err ->
+        on_result (Error_types.Failure (Error_types.Internal_error err))
+    | Ok (), Ok validated_author_urn ->
         ensure_valid_token ~account_id
           (fun access_token ->
-            get_person_urn ~access_token
-              (fun person_urn ->
+            let resolve_author_urn on_success_author on_error_author =
+              match validated_author_urn with
+              | Some explicit_author -> on_success_author explicit_author
+              | None -> get_person_urn ~access_token on_success_author on_error_author
+            in
+            resolve_author_urn
+              (fun resolved_author_urn ->
                 (* Upload all media items first *)
                 let rec upload_all_media urls_with_alt acc on_complete on_err =
                   match urls_with_alt with
@@ -943,7 +1192,7 @@ module Make (Config : CONFIG) = struct
                         Filename.check_suffix lower ".avi"
                       in
                       let media_type = if is_video_url url then "video" else "image" in
-                      upload_media ~access_token ~person_urn 
+                      upload_media ~access_token ~owner_urn:resolved_author_urn
                         ~media_url:url 
                         ~media_type
                         ~alt_text
@@ -966,13 +1215,13 @@ module Make (Config : CONFIG) = struct
                   (url, alt_text)
                 ) media_urls in
                 
-                upload_all_media urls_with_alt [] 
+                upload_all_media urls_with_alt []
                   (fun uploaded_media ->
                     (* Extract URL from text for link preview *)
                     let text_url = extract_first_url text in
-                    
+
                     (* Determine share media category and build specific content *)
-                    let specific_content = 
+                    let specific_content =
                       match uploaded_media, text_url with
                       | [], Some url ->
                           (* URL found, no uploaded media - use ARTICLE for rich link preview *)
@@ -994,53 +1243,66 @@ module Make (Config : CONFIG) = struct
                           ]
                       | uploaded_media, _ ->
                           (* Has uploaded media - use existing media handling logic *)
-                          let category = match uploaded_media with
+                          let category =
+                            match uploaded_media with
                             | first :: _ -> if first.media_type = "video" then "VIDEO" else "IMAGE"
                             | [] -> "NONE"
                           in
-                          let media_json = `List (List.map (fun media ->
-                            let base_fields = [
-                              ("status", `String "READY");
-                              ("media", `String media.asset_urn);
-                            ] in
-                            (* Add description (alt text) if available *)
-                            let with_description = match media.alt_text with
-                              | Some alt when String.length alt > 0 ->
-                                  base_fields @ [("description", `Assoc [("text", `String alt)])]
-                              | _ -> base_fields
-                            in
-                            `Assoc with_description
-                          ) uploaded_media) in
+                          let media_json =
+                            `List
+                              (List.map
+                                 (fun media ->
+                                   let base_fields =
+                                     [
+                                       ("status", `String "READY");
+                                       ("media", `String media.asset_urn);
+                                     ]
+                                   in
+                                   let with_description =
+                                     match media.alt_text with
+                                     | Some alt when String.length alt > 0 ->
+                                         base_fields
+                                         @ [("description", `Assoc [("text", `String alt)])]
+                                     | _ -> base_fields
+                                   in
+                                   `Assoc with_description)
+                                 uploaded_media)
+                          in
                           [
                             ("shareCommentary", `Assoc [("text", `String text)]);
                             ("shareMediaCategory", `String category);
                             ("media", media_json);
                           ]
                     in
-                    
-                    let post_body = `Assoc [
-                      ("author", `String person_urn);
-                      ("lifecycleState", `String "PUBLISHED");
-                      ("specificContent", `Assoc [
-                        ("com.linkedin.ugc.ShareContent", `Assoc specific_content)
-                      ]);
-                      ("visibility", `Assoc [
-                        ("com.linkedin.ugc.MemberNetworkVisibility", `String "PUBLIC")
-                      ])
-                    ] in
-                    
+
+                    let post_body =
+                      `Assoc
+                        [
+                          ("author", `String resolved_author_urn);
+                          ("lifecycleState", `String "PUBLISHED");
+                          ("specificContent", `Assoc [
+                            ("com.linkedin.ugc.ShareContent", `Assoc specific_content)
+                          ]);
+                          ("visibility", `Assoc [
+                            ("com.linkedin.ugc.MemberNetworkVisibility", `String "PUBLIC")
+                          ]);
+                        ]
+                    in
+
                     let url = Printf.sprintf "%s/ugcPosts" linkedin_api_base in
                     let body = Yojson.Basic.to_string post_body in
-                    let headers = [
-                      ("Authorization", Printf.sprintf "Bearer %s" access_token);
-                      ("Content-Type", "application/json");
-                      ("X-Restli-Protocol-Version", "2.0.0");
-                    ] in
-                    
+                    let headers =
+                      [
+                        ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                        ("Content-Type", "application/json");
+                        ("X-Restli-Protocol-Version", "2.0.0");
+                      ]
+                    in
+
                     Config.Http.post ~headers ~body url
                       (fun response ->
                         if response.status >= 200 && response.status < 300 then
-                          let post_id = 
+                          let post_id =
                             try
                               let json = Yojson.Basic.from_string response.body in
                               json |> Yojson.Basic.Util.member "id" |> Yojson.Basic.Util.to_string
@@ -1048,26 +1310,38 @@ module Make (Config : CONFIG) = struct
                           in
                           on_result (Error_types.Success post_id)
                         else
-                          on_result (Error_types.Failure (parse_api_error 
-                            ~required_scopes:["w_member_social"] ~status_code:response.status ~body:response.body)))
-                      (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
-                        (Error_types.Connection_failed err)))))
-                   (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
-                     (Error_types.Connection_failed err)))))
-               (fun err -> on_result (Error_types.Failure (Error_types.Network_error 
-                 (Error_types.Connection_failed err)))))
-           (fun err -> on_result (Error_types.Failure err))
+                          let required_scopes =
+                            if is_organization_urn resolved_author_urn || is_organization_brand_urn resolved_author_urn
+                            then ["w_organization_social"]
+                            else ["w_member_social"]
+                          in
+                          on_result
+                            (Error_types.Failure
+                               (parse_api_error ~required_scopes
+                                  ~status_code:response.status ~body:response.body)))
+                      (fun err ->
+                        on_result
+                          (Error_types.Failure
+                             (Error_types.Network_error (Error_types.Connection_failed err)))))
+                  (fun err ->
+                    on_result
+                      (Error_types.Failure
+                         (Error_types.Network_error (Error_types.Connection_failed err)))))
+              (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err)))
+          )
+          (fun err -> on_result (Error_types.Failure err))
   
   (** Post thread (LinkedIn doesn't support threads, posts only first item)
       
       @param account_id The account identifier
       @param texts List of post texts (only first is used)
       @param media_urls_per_post Media URLs for each post
+      @param author_urn Optional explicit author URN forwarded to post_single
       @param alt_texts_per_post Alt texts for each post's media
       @param validate_media_before_upload When true, validates media after download. Default: false
       @param on_result Callback receiving the outcome with thread_result
   *)
-  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) ?(validate_media_before_upload=false) on_result =
+  let post_thread ~account_id ~texts ~media_urls_per_post ?author_urn ?(alt_texts_per_post=[]) ?(validate_media_before_upload=false) on_result =
     let media_counts = List.map List.length media_urls_per_post in
     match validate_thread ~texts ~media_counts () with
     | Error errs ->
@@ -1076,7 +1350,7 @@ module Make (Config : CONFIG) = struct
         let first_text = List.hd texts in
         let first_media = if List.length media_urls_per_post > 0 then List.hd media_urls_per_post else [] in
         let first_alt_texts = if List.length alt_texts_per_post > 0 then List.hd alt_texts_per_post else [] in
-        post_single ~account_id ~text:first_text ~media_urls:first_media ~alt_texts:first_alt_texts ~validate_media_before_upload
+        post_single ~account_id ~text:first_text ~media_urls:first_media ?author_urn ~alt_texts:first_alt_texts ~validate_media_before_upload
           (fun outcome ->
             match outcome with
             | Error_types.Success post_id ->
@@ -1111,7 +1385,7 @@ module Make (Config : CONFIG) = struct
                 on_result (Error_types.Failure err))
   
   (** OAuth authorization URL *)
-  let get_oauth_url ~redirect_uri ~state on_success on_error =
+  let get_oauth_url ?(include_organization_scopes=false) ~redirect_uri ~state on_success on_error =
     let raw_client_id = Config.get_env "LINKEDIN_CLIENT_ID" |> Option.value ~default:"" in
     let raw_configured_redirect_uri = Config.get_env "LINKEDIN_REDIRECT_URI" |> Option.value ~default:"" in
     let client_id = String.trim raw_client_id in
@@ -1142,7 +1416,18 @@ module Make (Config : CONFIG) = struct
          
          Note: For organization/company page posting, use a separate implementation
          which requires the Community Management API product. *)
-      let scopes = ["openid"; "profile"; "email"; "w_member_social"] in
+      let scopes =
+        if include_organization_scopes then
+          [
+            "openid";
+            "profile";
+            "email";
+            "w_member_social";
+            "r_organization_admin";
+            "w_organization_social";
+          ]
+        else ["openid"; "profile"; "email"; "w_member_social"]
+      in
       let scope_str = String.concat " " scopes in
       
       let params = [
@@ -1259,6 +1544,41 @@ module Make (Config : CONFIG) = struct
             on_error (Printf.sprintf "LinkedIn OAuth exchange failed (%d): %s" response.status error_msg))
         on_error
     )
+
+  let get_organization_access ~account_id ?role ?(acl_state="APPROVED") on_result =
+    ensure_valid_token ~account_id
+      (fun access_token ->
+        let normalized_role = normalize_acl_role_filter role in
+        let normalized_state = normalize_acl_state_filter (Some acl_state) in
+        fetch_organization_accesses_by_token ?role:normalized_role ?state:normalized_state
+          ~access_token on_result)
+      (fun err -> on_result (Error err))
+
+  let get_preferred_organization_access ~account_id ?role ?(acl_state="APPROVED") on_result =
+    get_organization_access ~account_id ?role ~acl_state
+      (function
+        | Ok organizations -> on_result (Ok (select_preferred_organization_access organizations))
+        | Error err -> on_result (Error err))
+
+  let exchange_code_and_get_organizations ~code ~redirect_uri ?role ?(acl_state="APPROVED")
+      on_success on_error =
+    exchange_code ~code ~redirect_uri
+      (fun creds ->
+        let normalized_role = normalize_acl_role_filter role in
+        let normalized_state = normalize_acl_state_filter (Some acl_state) in
+        fetch_organization_accesses_by_token ?role:normalized_role ?state:normalized_state
+          ~access_token:creds.access_token
+          (function
+            | Ok organizations -> on_success (creds, organizations)
+            | Error err -> on_error (Error_types.error_to_string err)))
+      on_error
+
+  let exchange_code_and_get_preferred_organization ~code ~redirect_uri ?role ?(acl_state="APPROVED")
+      on_success on_error =
+    exchange_code_and_get_organizations ~code ~redirect_uri ?role ~acl_state
+      (fun (creds, organizations) ->
+        on_success (creds, select_preferred_organization_access organizations))
+      on_error
 
   let validate_oauth_state ~expected ~received on_success on_error =
     let constant_time_equal a b =

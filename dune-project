@@ -1,4 +1,4 @@
-(lang dune 3.17)
+(lang dune 3.16)
 (name ocaml-social-sdk)
 
 (generate_opam_files true)
@@ -16,7 +16,6 @@
  (description "Runtime-agnostic, HTTP-client-agnostic core interfaces for building social media API clients. This package provides CPS-style interfaces that can be implemented with any async runtime (Lwt, Eio, synchronous) and any HTTP client library.")
  (depends
   (ocaml (>= 4.14))
-  (dune (>= 3.0))
   yojson
   re))
 
@@ -26,7 +25,6 @@
  (description "Lwt runtime adapter for social-core with Cohttp_lwt_unix HTTP client implementation.")
  (depends
   (ocaml (>= 4.14))
-  (dune (>= 3.0))
   (social-core (= :version))
   lwt
   (lwt_ppx (>= 2.0.0))
@@ -38,7 +36,6 @@
  (description "Twitter API v2 client. Supports posting tweets, threads, media upload, user lookup, and character counting.")
  (depends
   (ocaml (>= 4.14))
-  (dune (>= 3.0))
   (social-core (= :version))
   yojson
   base64
@@ -53,7 +50,6 @@
  (description "Bluesky social network client using the AT Protocol. Supports posting, threads, media upload, and facets (mentions, links, hashtags).")
  (depends
   (ocaml (>= 4.14))
-  (dune (>= 3.0))
   (social-core (= :version))
   yojson
   re
@@ -66,7 +62,6 @@
  (description "LinkedIn API v2 client. Supports posting to personal profiles and company pages, media upload, and article shares.")
  (depends
   (ocaml (>= 4.14))
-  (dune (>= 3.0))
   (social-core (= :version))
   yojson
   uri
@@ -79,7 +74,6 @@
  (description "Mastodon API client. Supports posting toots, threads, media upload, and visibility settings.")
  (depends
   (ocaml (>= 4.14))
-  (dune (>= 3.0))
   (social-core (= :version))
   yojson
   digestif
@@ -93,7 +87,6 @@
  (description "Facebook Graph API v21 client. Supports posting to pages, media upload, stories, and reels.")
  (depends
   (ocaml (>= 4.14))
-  (dune (>= 3.0))
   (social-core (= :version))
   yojson
   uri
@@ -105,7 +98,6 @@
  (description "Instagram Graph API v21 client. Supports posting to business/creator accounts, media upload, stories, reels, and carousels.")
  (depends
   (ocaml (>= 4.14))
-  (dune (>= 3.0))
   (social-core (= :version))
   yojson
   uri
@@ -118,7 +110,6 @@
  (description "YouTube Data API v3 client. Supports video upload, shorts, and channel management.")
  (depends
   (ocaml (>= 4.14))
-  (dune (>= 3.0))
   (social-core (= :version))
   yojson
   uri
@@ -132,7 +123,6 @@
  (description "Pinterest API v5 client. Supports creating pins, boards, and media upload.")
  (depends
   (ocaml (>= 4.14))
-  (dune (>= 3.0))
   (social-core (= :version))
   yojson
   uri
@@ -145,7 +135,6 @@
  (description "TikTok Content Posting API client. Supports video upload and posting.")
  (depends
   (ocaml (>= 4.14))
-  (dune (>= 3.0))
   (social-core (= :version))
   yojson
   uri
@@ -157,7 +146,6 @@
  (description "Reddit API v1 client. Supports posting to subreddits (self-posts, links, images, videos, galleries), crossposting, flair management, and subreddit moderation.")
  (depends
   (ocaml (>= 4.14))
-  (dune (>= 3.0))
   (social-core (= :version))
   yojson
   uri
@@ -170,7 +158,6 @@
  (description "Threads API v1 client with OAuth, read operations, and publish support for text and single-media thread posts.")
  (depends
   (ocaml (>= 4.14))
-  (dune (>= 3.0))
   (social-core (= :version))
   yojson
   uri

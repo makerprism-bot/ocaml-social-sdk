@@ -5,6 +5,47 @@ open Social_bluesky_v1
 
 (** Track resolved handles for mention testing *)
 let resolved_handles = ref []
+let last_post_url = ref None
+let last_post_body = ref None
+let last_get_url = ref None
+let get_request_count = ref 0
+let force_read_unauthorized = ref false
+let used_video_upload_endpoint = ref false
+let used_blob_upload_endpoint = ref false
+type read_response_mode =
+  | Read_normal
+  | Read_api_error
+  | Read_invalid_json
+  | Read_schema_missing_fields
+  | Read_schema_wrong_types
+  | Read_network_error
+type video_upload_mode =
+  | Video_direct_blob
+  | Video_job_then_blob
+  | Video_job_status_transient_then_blob
+  | Video_job_status_bad_request
+  | Video_job_failed
+  | Video_job_done_without_blob
+  | Video_unavailable_then_blob
+  | Video_bad_request_unsupported_then_blob
+  | Video_bad_request_unsupported_with_underscore_then_blob
+  | Video_network_error_then_success
+  | Video_network_error_no_fallback
+  | Video_rejected_no_fallback
+let video_upload_mode = ref Video_direct_blob
+let video_job_status_polls = ref 0
+let profile_read_mode = ref Read_normal
+let thread_read_mode = ref Read_normal
+let timeline_read_mode = ref Read_normal
+let author_feed_read_mode = ref Read_normal
+let likes_read_mode = ref Read_normal
+let reposted_by_read_mode = ref Read_normal
+let followers_read_mode = ref Read_normal
+let follows_read_mode = ref Read_normal
+let notifications_read_mode = ref Read_normal
+let unread_count_read_mode = ref Read_normal
+let search_actors_read_mode = ref Read_normal
+let search_posts_read_mode = ref Read_normal
 
 (** Helper to check if string contains substring *)
 let string_contains_substr s sub =
@@ -13,11 +54,479 @@ let string_contains_substr s sub =
     true
   with Not_found -> false
 
+let assert_query_param_value url key expected =
+  let raw = key ^ "=" ^ expected in
+  let encoded = key ^ "=" ^ (Uri.pct_encode expected) in
+  if not (string_contains_substr url raw || string_contains_substr url encoded) then
+    failwith ("Expected query param " ^ key ^ " to be " ^ expected ^ " (raw or encoded), but got: " ^ url)
+
 (** Mock HTTP client for testing *)
 module Mock_http : Social_core.HTTP_CLIENT = struct
   let get ?headers:_ url on_success on_error =
+    last_get_url := Some url;
+    get_request_count := !get_request_count + 1;
+    (* Mock video fetch *)
+    if String.length url >= 16 && String.sub url 0 16 = "https://cdn.test" then
+      on_success {
+        Social_core.status = 200;
+        headers = [ ("content-type", "video/mp4") ];
+        body = "mock_video_data";
+      }
+    else if !force_read_unauthorized && string_contains_substr url "/xrpc/app.bsky." then
+      on_success {
+        Social_core.status = 401;
+        headers = [("content-type", "application/json")];
+        body = {|{"error":"AuthenticationRequired"}|};
+      }
+    else if string_contains_substr url "getJobStatus" then
+      let () = video_job_status_polls := !video_job_status_polls + 1 in
+      (match !video_upload_mode with
+      | Video_job_then_blob when !video_job_status_polls = 1 ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"jobStatus": {"jobId": "job-123", "state": "JOB_STATE_PROCESSING"}}|};
+          }
+      | Video_job_then_blob ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"jobStatus": {"jobId": "job-123", "state": "JOB_STATE_COMPLETED", "blob": {"$type": "blob", "ref": {"$link": "bafkreivideoblob-job"}, "mimeType": "video/mp4", "size": 54321}}}|};
+          }
+      | Video_job_status_transient_then_blob when !video_job_status_polls = 1 ->
+          on_success {
+            Social_core.status = 500;
+            headers = [("content-type", "application/json")];
+            body = {|{"error":"TemporaryBackendError"}|};
+          }
+      | Video_job_status_transient_then_blob ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"jobStatus": {"jobId": "job-123", "state": "JOB_STATE_COMPLETED", "blob": {"$type": "blob", "ref": {"$link": "bafkreivideoblob-transient"}, "mimeType": "video/mp4", "size": 54321}}}|};
+          }
+      | Video_job_status_bad_request ->
+          on_success {
+            Social_core.status = 400;
+            headers = [("content-type", "application/json")];
+            body = {|{"error":"InvalidJobId"}|};
+          }
+      | Video_job_failed ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"jobStatus": {"jobId": "job-123", "state": "JOB_STATE_FAILED"}}|};
+          }
+      | Video_job_done_without_blob ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"jobStatus": {"jobId": "job-123", "state": "JOB_STATE_COMPLETED"}}|};
+          }
+      | _ ->
+          on_success {
+            Social_core.status = 404;
+            headers = [("content-type", "application/json")];
+           body = {|{"error":"JobNotFound"}|};
+           })
+    else if string_contains_substr url "getTimeline" then
+      (match !timeline_read_mode with
+      | Read_normal ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"feed":[],"cursor":"next-cursor"}|};
+          }
+      | Read_api_error ->
+          on_success {
+            Social_core.status = 400;
+            headers = [("content-type", "application/json")];
+            body = {|{"error":"InvalidLimit"}|};
+          }
+      | Read_invalid_json ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = "{";
+          }
+      | Read_schema_missing_fields ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"cursor":"next-cursor"}|};
+          }
+      | Read_schema_wrong_types ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"feed":"bad","cursor":1}|};
+          }
+      | Read_network_error -> on_error "mock timeline network error")
+    else if string_contains_substr url "getProfile" then
+      (match !profile_read_mode with
+      | Read_normal ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"did":"did:plc:alice","handle":"alice.test"}|};
+          }
+      | Read_api_error ->
+          on_success {
+            Social_core.status = 400;
+            headers = [("content-type", "application/json")];
+            body = {|{"error":"InvalidRequest","message":"bad actor"}|};
+          }
+      | Read_invalid_json ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = "{";
+          }
+      | Read_schema_missing_fields ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"did":"did:plc:alice"}|};
+          }
+      | Read_schema_wrong_types ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"did":123,"handle":false}|};
+          }
+      | Read_network_error -> on_error "mock profile network error")
+    else if string_contains_substr url "getPostThread" then
+      (match !thread_read_mode with
+      | Read_normal ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"thread":{"$type":"app.bsky.feed.defs#threadViewPost"}}|};
+          }
+      | Read_api_error ->
+          on_success {
+            Social_core.status = 404;
+            headers = [("content-type", "application/json")];
+            body = {|{"error":"NotFound","message":"missing thread"}|};
+          }
+      | Read_invalid_json ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = "{";
+          }
+      | Read_schema_missing_fields ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"thread":{}}|};
+          }
+      | Read_schema_wrong_types ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"thread":"not-an-object"}|};
+          }
+      | Read_network_error -> on_error "mock thread network error")
+    else if string_contains_substr url "getAuthorFeed" then
+      (match !author_feed_read_mode with
+      | Read_normal ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"feed":[],"cursor":"author-cursor"}|};
+          }
+      | Read_api_error ->
+          on_success {
+            Social_core.status = 400;
+            headers = [("content-type", "application/json")];
+            body = {|{"error":"BadActor"}|};
+          }
+      | Read_invalid_json ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = "{";
+          }
+      | Read_schema_missing_fields ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"cursor":"author-cursor"}|};
+          }
+      | Read_schema_wrong_types ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"feed":"bad","cursor":1}|};
+          }
+      | Read_network_error -> on_error "mock author feed network error")
+    else if string_contains_substr url "getLikes" then
+      (match !likes_read_mode with
+      | Read_normal ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"likes":[],"cursor":"likes-cursor"}|};
+          }
+      | Read_api_error ->
+          on_success {
+            Social_core.status = 400;
+            headers = [("content-type", "application/json")];
+            body = {|{"error":"InvalidUri"}|};
+          }
+      | Read_invalid_json ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = "{";
+          }
+      | Read_schema_missing_fields ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"cursor":"likes-cursor"}|};
+          }
+      | Read_schema_wrong_types ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"likes":"bad","cursor":1}|};
+          }
+      | Read_network_error -> on_error "mock likes network error")
+    else if string_contains_substr url "getRepostedBy" then
+      (match !reposted_by_read_mode with
+      | Read_normal ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"repostedBy":[],"cursor":"repost-cursor"}|};
+          }
+      | Read_api_error ->
+          on_success {
+            Social_core.status = 404;
+            headers = [("content-type", "application/json")];
+            body = {|{"error":"NotFound"}|};
+          }
+      | Read_invalid_json ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = "{";
+          }
+      | Read_schema_missing_fields ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"cursor":"repost-cursor"}|};
+          }
+      | Read_schema_wrong_types ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"repostedBy":"bad","cursor":1}|};
+          }
+      | Read_network_error -> on_error "mock reposted-by network error")
+    else if string_contains_substr url "getFollowers" then
+      (match !followers_read_mode with
+      | Read_normal ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"followers":[],"cursor":"followers-cursor"}|};
+          }
+      | Read_api_error ->
+          on_success {
+            Social_core.status = 429;
+            headers = [("content-type", "application/json")];
+            body = {|{"error":"RateLimitExceeded"}|};
+          }
+      | Read_invalid_json ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = "{";
+          }
+      | Read_schema_missing_fields ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"cursor":"followers-cursor"}|};
+          }
+      | Read_schema_wrong_types ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"followers":"bad","cursor":1}|};
+          }
+      | Read_network_error -> on_error "mock followers network error")
+    else if string_contains_substr url "getFollows" then
+      (match !follows_read_mode with
+      | Read_normal ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"follows":[],"cursor":"follows-cursor"}|};
+          }
+      | Read_api_error ->
+          on_success {
+            Social_core.status = 400;
+            headers = [("content-type", "application/json")];
+            body = {|{"error":"BadActor"}|};
+          }
+      | Read_invalid_json ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = "{";
+          }
+      | Read_schema_missing_fields ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"cursor":"follows-cursor"}|};
+          }
+      | Read_schema_wrong_types ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"follows":"bad","cursor":1}|};
+          }
+      | Read_network_error -> on_error "mock follows network error")
+    else if string_contains_substr url "listNotifications" then
+      (match !notifications_read_mode with
+      | Read_normal ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"notifications":[],"cursor":"notif-cursor"}|};
+          }
+      | Read_api_error ->
+          on_success {
+            Social_core.status = 429;
+            headers = [("content-type", "application/json")];
+            body = {|{"error":"RateLimitExceeded"}|};
+          }
+      | Read_invalid_json ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = "{";
+          }
+      | Read_schema_missing_fields ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"cursor":"notif-cursor"}|};
+          }
+      | Read_schema_wrong_types ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"notifications":"bad","cursor":1}|};
+          }
+      | Read_network_error -> on_error "mock notifications network error")
+    else if string_contains_substr url "getUnreadCount" then
+      (match !unread_count_read_mode with
+      | Read_normal ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"count":3}|};
+          }
+      | Read_api_error ->
+          on_success {
+            Social_core.status = 500;
+            headers = [("content-type", "application/json")];
+            body = {|{"error":"Internal"}|};
+          }
+      | Read_invalid_json ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"count":"oops"}|};
+          }
+      | Read_schema_missing_fields ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{}|};
+          }
+      | Read_schema_wrong_types ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"count":true}|};
+          }
+      | Read_network_error -> on_error "mock unread network error")
+    else if string_contains_substr url "searchActors" then
+      (match !search_actors_read_mode with
+      | Read_normal ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"actors":[],"cursor":"actors-cursor"}|};
+          }
+      | Read_api_error ->
+          on_success {
+            Social_core.status = 400;
+            headers = [("content-type", "application/json")];
+            body = {|{"error":"InvalidSearch"}|};
+          }
+      | Read_invalid_json ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = "{";
+          }
+      | Read_schema_missing_fields ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"cursor":"actors-cursor"}|};
+          }
+      | Read_schema_wrong_types ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"actors":"bad","cursor":1}|};
+          }
+      | Read_network_error -> on_error "mock search actors network error")
+    else if string_contains_substr url "searchPosts" then
+      (match !search_posts_read_mode with
+      | Read_normal ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"posts":[],"cursor":"posts-cursor"}|};
+          }
+      | Read_api_error ->
+          on_success {
+            Social_core.status = 400;
+            headers = [("content-type", "application/json")];
+            body = {|{"error":"InvalidSearch"}|};
+          }
+      | Read_invalid_json ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = "{";
+          }
+      | Read_schema_missing_fields ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"cursor":"posts-cursor"}|};
+          }
+      | Read_schema_wrong_types ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"posts":"bad","cursor":1}|};
+          }
+      | Read_network_error -> on_error "mock search posts network error")
     (* Mock handle resolution *)
-    if String.contains url '?' && String.contains url '=' && string_contains_substr url "resolveHandle" then
+    else if String.contains url '?' && String.contains url '=' && string_contains_substr url "resolveHandle" then
       (* Extract handle from resolveHandle query *)
       try
         let parts = String.split_on_char '=' url in
@@ -64,7 +573,9 @@ module Mock_http : Social_core.HTTP_CLIENT = struct
         body = "mock_image_data";
       }
   
-  let post ?headers:_ ?body:_ url on_success _on_error =
+  let post ?headers:_ ?body url on_success on_error =
+    last_post_url := Some url;
+    last_post_body := body;
     (* Mock session creation - returns did and accessJwt *)
     if string_contains_substr url "createSession" then
       on_success {
@@ -72,8 +583,65 @@ module Mock_http : Social_core.HTTP_CLIENT = struct
         headers = [("content-type", "application/json")];
         body = {|{"did": "did:plc:testuser123", "accessJwt": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test", "refreshJwt": "refresh_jwt_token", "handle": "test.handle"}|};
       }
+    else if string_contains_substr url "uploadVideo" then
+      let () = used_video_upload_endpoint := true in
+      (match !video_upload_mode with
+      | Video_direct_blob ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"blob": {"$type": "blob", "ref": {"$link": "bafkreivideoblob123"}, "mimeType": "video/mp4", "size": 54321}}|};
+          }
+      | Video_job_then_blob ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"jobStatus": {"jobId": "job-123", "state": "JOB_STATE_QUEUED"}}|};
+          }
+      | Video_job_failed | Video_job_done_without_blob | Video_job_status_transient_then_blob | Video_job_status_bad_request ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"jobStatus": {"jobId": "job-123", "state": "JOB_STATE_QUEUED"}}|};
+          }
+      | Video_unavailable_then_blob ->
+          on_success {
+            Social_core.status = 404;
+            headers = [("content-type", "application/json")];
+            body = {|{"error":"NotFound"}|};
+          }
+      | Video_bad_request_unsupported_then_blob ->
+          on_success {
+            Social_core.status = 400;
+            headers = [("content-type", "application/json")];
+            body = {|{"error":"MethodNotFound"}|};
+          }
+      | Video_bad_request_unsupported_with_underscore_then_blob ->
+          on_success {
+            Social_core.status = 400;
+            headers = [("content-type", "application/json")];
+            body = {|{"error":"METHOD_NOT_FOUND"}|};
+          }
+      | Video_network_error_then_success when !video_job_status_polls = 0 ->
+          let () = video_job_status_polls := 1 in
+          on_error "connection reset"
+      | Video_network_error_then_success ->
+          on_success {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"blob": {"$type": "blob", "ref": {"$link": "bafkreivideoblob-retry"}, "mimeType": "video/mp4", "size": 54321}}|};
+          }
+      | Video_network_error_no_fallback ->
+          on_error "connection reset"
+      | Video_rejected_no_fallback ->
+          on_success {
+            Social_core.status = 400;
+            headers = [("content-type", "application/json")];
+            body = {|{"error":"InvalidVideo"}|};
+          })
     (* Mock blob upload response *)
     else if string_contains_substr url "uploadBlob" then
+      let () = used_blob_upload_endpoint := true in
       on_success {
         Social_core.status = 200;
         headers = [("content-type", "application/json")];
@@ -893,6 +1461,2548 @@ let test_gif_validation () =
   
   print_endline "    ✓ GIF validation test passed"
 
+let test_video_embed_on_single_post () =
+  print_endline "  Testing video embed on single post...";
+  last_post_url := None;
+  last_post_body := None;
+  used_video_upload_endpoint := false;
+  used_blob_upload_endpoint := false;
+  video_upload_mode := Video_direct_blob;
+  video_job_status_polls := 0;
+  let result = ref None in
+  Bluesky.post_single
+    ~account_id:"test_account"
+    ~text:"Video test"
+    ~media_urls:[ "https://cdn.test/video.mp4" ]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error_types.Success _) -> ()
+  | Some (Error_types.Partial_success { result = _; warnings = _ }) -> ()
+  | Some (Error_types.Failure err) ->
+      failwith ("Expected success, got error: " ^ Error_types.error_to_string err)
+  | None -> failwith "post_single did not complete");
+
+  let body =
+    match !last_post_body with
+    | Some b -> b
+    | None -> failwith "No POST body captured"
+  in
+  let json = Yojson.Basic.from_string body in
+  let open Yojson.Basic.Util in
+  let embed_type =
+    json |> member "record" |> member "embed" |> member "$type" |> to_string
+  in
+  assert (embed_type = "app.bsky.embed.video");
+  assert !used_video_upload_endpoint;
+  print_endline "    ✓ Video embed on single post test passed"
+
+let test_video_embed_on_quote_post () =
+  print_endline "  Testing video embed on quote post...";
+  last_post_url := None;
+  last_post_body := None;
+  used_video_upload_endpoint := false;
+  used_blob_upload_endpoint := false;
+  video_upload_mode := Video_direct_blob;
+  video_job_status_polls := 0;
+  let result = ref None in
+  Bluesky.quote_post
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:xyz/app.bsky.feed.post/abc123"
+    ~post_cid:"bafyreiabc123"
+    ~text:"Quote with video"
+    ~media_urls:[ "https://cdn.test/video.mp4" ]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error_types.Success _) -> ()
+  | Some (Error_types.Partial_success { result = _; warnings = _ }) -> ()
+  | Some (Error_types.Failure err) ->
+      failwith ("Expected success, got error: " ^ Error_types.error_to_string err)
+  | None -> failwith "quote_post did not complete");
+
+  let body =
+    match !last_post_body with
+    | Some b -> b
+    | None -> failwith "No POST body captured"
+  in
+  let json = Yojson.Basic.from_string body in
+  let open Yojson.Basic.Util in
+  let media_type =
+    json
+    |> member "record"
+    |> member "embed"
+    |> member "media"
+    |> member "$type"
+    |> to_string
+  in
+  assert (media_type = "app.bsky.embed.video");
+  assert !used_video_upload_endpoint;
+  print_endline "    ✓ Video embed on quote post test passed"
+
+let test_mixed_video_image_rejected_single_post () =
+  print_endline "  Testing mixed video+image rejection on single post...";
+  let result = ref None in
+  Bluesky.post_single
+    ~account_id:"test_account"
+    ~text:"Mixed media test"
+    ~media_urls:[ "https://cdn.test/video.mp4"; "https://example.com/image.png" ]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error_types.Failure (Error_types.Validation_error errs)) ->
+      let has_mixed_media_error =
+        List.exists
+          (function
+            | Error_types.Media_unsupported_format _ -> true
+            | _ -> false)
+          errs
+      in
+      assert has_mixed_media_error
+  | Some (Error_types.Failure err) ->
+      failwith
+        ("Expected validation error, got: " ^ Error_types.error_to_string err)
+  | Some _ -> failwith "Expected failure for mixed video+image post"
+  | None -> failwith "post_single did not complete");
+
+  print_endline "    ✓ Mixed video+image rejection test passed"
+
+let test_multiple_videos_rejected_single_post () =
+  print_endline "  Testing multiple video rejection on single post...";
+  let result = ref None in
+  Bluesky.post_single
+    ~account_id:"test_account"
+    ~text:"Multiple videos test"
+    ~media_urls:[ "https://cdn.test/video1.mp4"; "https://cdn.test/video2.mp4" ]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error_types.Failure (Error_types.Validation_error errs)) ->
+      let has_too_many_media =
+        List.exists
+          (function
+            | Error_types.Too_many_media _ -> true
+            | _ -> false)
+          errs
+      in
+      assert has_too_many_media
+  | Some (Error_types.Failure err) ->
+      failwith
+        ("Expected validation error, got: " ^ Error_types.error_to_string err)
+  | Some _ -> failwith "Expected failure for multiple videos"
+  | None -> failwith "post_single did not complete");
+
+  print_endline "    ✓ Multiple video rejection test passed"
+
+let test_video_upload_job_polling_path () =
+  print_endline "  Testing video upload job polling path...";
+  used_video_upload_endpoint := false;
+  used_blob_upload_endpoint := false;
+  video_upload_mode := Video_job_then_blob;
+  video_job_status_polls := 0;
+  let result = ref None in
+  Bluesky.post_single
+    ~account_id:"test_account"
+    ~text:"Video polling test"
+    ~media_urls:[ "https://cdn.test/video.mp4" ]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error_types.Success _) -> ()
+  | Some (Error_types.Partial_success { result = _; warnings = _ }) -> ()
+  | Some (Error_types.Failure err) ->
+      failwith ("Expected success, got error: " ^ Error_types.error_to_string err)
+  | None -> failwith "post_single did not complete");
+  assert !used_video_upload_endpoint;
+  assert (!video_job_status_polls > 0);
+  video_upload_mode := Video_direct_blob;
+  print_endline "    ✓ Video upload job polling test passed"
+
+let test_video_upload_fallback_to_blob_path () =
+  print_endline "  Testing video upload fallback to blob path...";
+  used_video_upload_endpoint := false;
+  used_blob_upload_endpoint := false;
+  video_upload_mode := Video_unavailable_then_blob;
+  video_job_status_polls := 0;
+  let result = ref None in
+  Bluesky.post_single
+    ~account_id:"test_account"
+    ~text:"Video fallback test"
+    ~media_urls:[ "https://cdn.test/video.mp4" ]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error_types.Success _) -> ()
+  | Some (Error_types.Partial_success { result = _; warnings = _ }) -> ()
+  | Some (Error_types.Failure err) ->
+      failwith ("Expected success, got error: " ^ Error_types.error_to_string err)
+  | None -> failwith "post_single did not complete");
+  assert !used_video_upload_endpoint;
+  assert !used_blob_upload_endpoint;
+  video_upload_mode := Video_direct_blob;
+  print_endline "    ✓ Video upload fallback to blob test passed"
+
+let test_video_upload_bad_request_unsupported_fallback_to_blob_path () =
+  print_endline "  Testing video upload MethodNotFound fallback to blob path...";
+  used_video_upload_endpoint := false;
+  used_blob_upload_endpoint := false;
+  video_upload_mode := Video_bad_request_unsupported_then_blob;
+  video_job_status_polls := 0;
+  let result = ref None in
+  Bluesky.post_single
+    ~account_id:"test_account"
+    ~text:"Video fallback bad request test"
+    ~media_urls:[ "https://cdn.test/video.mp4" ]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error_types.Success _) -> ()
+  | Some (Error_types.Partial_success { result = _; warnings = _ }) -> ()
+  | Some (Error_types.Failure err) ->
+      failwith ("Expected success, got error: " ^ Error_types.error_to_string err)
+  | None -> failwith "post_single did not complete");
+  assert !used_video_upload_endpoint;
+  assert !used_blob_upload_endpoint;
+  video_upload_mode := Video_direct_blob;
+  print_endline "    ✓ Video upload MethodNotFound fallback test passed"
+
+let test_video_upload_bad_request_underscore_unsupported_fallback_to_blob_path () =
+  print_endline "  Testing video upload METHOD_NOT_FOUND fallback to blob path...";
+  used_video_upload_endpoint := false;
+  used_blob_upload_endpoint := false;
+  video_upload_mode := Video_bad_request_unsupported_with_underscore_then_blob;
+  video_job_status_polls := 0;
+  let result = ref None in
+  Bluesky.post_single
+    ~account_id:"test_account"
+    ~text:"Video fallback underscore bad request test"
+    ~media_urls:[ "https://cdn.test/video.mp4" ]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error_types.Success _) -> ()
+  | Some (Error_types.Partial_success { result = _; warnings = _ }) -> ()
+  | Some (Error_types.Failure err) ->
+      failwith ("Expected success, got error: " ^ Error_types.error_to_string err)
+  | None -> failwith "post_single did not complete");
+  assert !used_video_upload_endpoint;
+  assert !used_blob_upload_endpoint;
+  video_upload_mode := Video_direct_blob;
+  print_endline "    ✓ Video upload METHOD_NOT_FOUND fallback test passed"
+
+let test_video_upload_rejected_no_fallback () =
+  print_endline "  Testing video upload rejection without fallback...";
+  used_video_upload_endpoint := false;
+  used_blob_upload_endpoint := false;
+  video_upload_mode := Video_rejected_no_fallback;
+  let result = ref None in
+  Bluesky.post_single
+    ~account_id:"test_account"
+    ~text:"Video rejected test"
+    ~media_urls:[ "https://cdn.test/video.mp4" ]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error_types.Failure _) -> ()
+  | Some _ -> failwith "Expected failure for rejected video upload"
+  | None -> failwith "post_single did not complete");
+  assert !used_video_upload_endpoint;
+  assert (not !used_blob_upload_endpoint);
+  video_upload_mode := Video_direct_blob;
+  print_endline "    ✓ Video upload rejection test passed"
+
+let test_video_upload_network_error_no_fallback () =
+  print_endline "  Testing video upload network error without fallback...";
+  used_video_upload_endpoint := false;
+  used_blob_upload_endpoint := false;
+  video_upload_mode := Video_network_error_no_fallback;
+  let result = ref None in
+  Bluesky.post_single
+    ~account_id:"test_account"
+    ~text:"Video network error test"
+    ~media_urls:[ "https://cdn.test/video.mp4" ]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error_types.Failure _) -> ()
+  | Some _ -> failwith "Expected failure for uploadVideo network error"
+  | None -> failwith "post_single did not complete");
+  assert !used_video_upload_endpoint;
+  assert (not !used_blob_upload_endpoint);
+  video_upload_mode := Video_direct_blob;
+  print_endline "    ✓ Video upload network error test passed"
+
+let test_video_upload_network_error_retry_then_success () =
+  print_endline "  Testing video upload network retry then success...";
+  used_video_upload_endpoint := false;
+  used_blob_upload_endpoint := false;
+  video_upload_mode := Video_network_error_then_success;
+  video_job_status_polls := 0;
+  let result = ref None in
+  Bluesky.post_single
+    ~account_id:"test_account"
+    ~text:"Video network retry test"
+    ~media_urls:[ "https://cdn.test/video.mp4" ]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error_types.Success _) -> ()
+  | Some (Error_types.Partial_success { result = _; warnings = _ }) -> ()
+  | Some (Error_types.Failure err) ->
+      failwith ("Expected success, got error: " ^ Error_types.error_to_string err)
+  | None -> failwith "post_single did not complete");
+  assert !used_video_upload_endpoint;
+  assert (not !used_blob_upload_endpoint);
+  video_upload_mode := Video_direct_blob;
+  print_endline "    ✓ Video upload network retry test passed"
+
+let test_video_job_failed_state_errors () =
+  print_endline "  Testing failed video job state handling...";
+  used_video_upload_endpoint := false;
+  used_blob_upload_endpoint := false;
+  video_upload_mode := Video_job_failed;
+  video_job_status_polls := 0;
+  let result = ref None in
+  Bluesky.post_single
+    ~account_id:"test_account"
+    ~text:"Video failed job test"
+    ~media_urls:[ "https://cdn.test/video.mp4" ]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error_types.Failure _) -> ()
+  | Some _ -> failwith "Expected failure for failed video job state"
+  | None -> failwith "post_single did not complete");
+  assert !used_video_upload_endpoint;
+  assert (not !used_blob_upload_endpoint);
+  video_upload_mode := Video_direct_blob;
+  print_endline "    ✓ Failed video job state test passed"
+
+let test_video_job_complete_without_blob_errors () =
+  print_endline "  Testing completed-without-blob video job handling...";
+  used_video_upload_endpoint := false;
+  used_blob_upload_endpoint := false;
+  video_upload_mode := Video_job_done_without_blob;
+  video_job_status_polls := 0;
+  let result = ref None in
+  Bluesky.post_single
+    ~account_id:"test_account"
+    ~text:"Video completed no blob test"
+    ~media_urls:[ "https://cdn.test/video.mp4" ]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error_types.Failure _) -> ()
+  | Some _ -> failwith "Expected failure for completed job without blob"
+  | None -> failwith "post_single did not complete");
+  assert !used_video_upload_endpoint;
+  assert (not !used_blob_upload_endpoint);
+  video_upload_mode := Video_direct_blob;
+  print_endline "    ✓ Completed-without-blob video job test passed"
+
+let test_video_job_status_transient_retry_succeeds () =
+  print_endline "  Testing transient video job status retry...";
+  used_video_upload_endpoint := false;
+  used_blob_upload_endpoint := false;
+  video_upload_mode := Video_job_status_transient_then_blob;
+  video_job_status_polls := 0;
+  let result = ref None in
+  Bluesky.post_single
+    ~account_id:"test_account"
+    ~text:"Video transient status retry test"
+    ~media_urls:[ "https://cdn.test/video.mp4" ]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error_types.Success _) -> ()
+  | Some (Error_types.Partial_success { result = _; warnings = _ }) -> ()
+  | Some (Error_types.Failure err) ->
+      failwith ("Expected success, got error: " ^ Error_types.error_to_string err)
+  | None -> failwith "post_single did not complete");
+  assert !used_video_upload_endpoint;
+  assert (not !used_blob_upload_endpoint);
+  assert (!video_job_status_polls >= 2);
+  video_upload_mode := Video_direct_blob;
+  print_endline "    ✓ Transient video job status retry test passed"
+
+let test_multiple_videos_rejected_quote_post () =
+  print_endline "  Testing multiple video rejection on quote post...";
+  let result = ref None in
+  Bluesky.quote_post
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:xyz/app.bsky.feed.post/abc123"
+    ~post_cid:"bafyreiabc123"
+    ~text:"Quote multiple videos"
+    ~media_urls:[ "https://cdn.test/video1.mp4"; "https://cdn.test/video2.mp4" ]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error_types.Failure (Error_types.Validation_error errs)) ->
+      let has_too_many_media =
+        List.exists
+          (function
+            | Error_types.Too_many_media _ -> true
+            | _ -> false)
+          errs
+      in
+      assert has_too_many_media
+  | Some (Error_types.Failure err) ->
+      failwith
+        ("Expected validation error, got: " ^ Error_types.error_to_string err)
+  | Some _ -> failwith "Expected failure for multiple videos in quote post"
+  | None -> failwith "quote_post did not complete");
+
+  print_endline "    ✓ Multiple video quote rejection test passed"
+
+let test_video_job_status_bad_request_no_retry () =
+  print_endline "  Testing non-retryable video job status error...";
+  used_video_upload_endpoint := false;
+  used_blob_upload_endpoint := false;
+  video_upload_mode := Video_job_status_bad_request;
+  video_job_status_polls := 0;
+  let result = ref None in
+  Bluesky.post_single
+    ~account_id:"test_account"
+    ~text:"Video bad request status test"
+    ~media_urls:[ "https://cdn.test/video.mp4" ]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error_types.Failure _) -> ()
+  | Some _ -> failwith "Expected failure for non-retryable video job status error"
+  | None -> failwith "post_single did not complete");
+  assert !used_video_upload_endpoint;
+  assert (not !used_blob_upload_endpoint);
+  assert (!video_job_status_polls = 1);
+  video_upload_mode := Video_direct_blob;
+  print_endline "    ✓ Non-retryable video job status error test passed"
+
+let test_mixed_video_image_rejected_quote_post () =
+  print_endline "  Testing mixed video+image rejection on quote post...";
+  let result = ref None in
+  Bluesky.quote_post
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:xyz/app.bsky.feed.post/abc123"
+    ~post_cid:"bafyreiabc123"
+    ~text:"Quote mixed media"
+    ~media_urls:[ "https://cdn.test/video.mp4"; "https://example.com/image.png" ]
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error_types.Failure (Error_types.Validation_error errs)) ->
+      let has_mixed_media_error =
+        List.exists
+          (function
+            | Error_types.Media_unsupported_format _ -> true
+            | _ -> false)
+          errs
+      in
+      assert has_mixed_media_error
+  | Some (Error_types.Failure err) ->
+      failwith
+        ("Expected validation error, got: " ^ Error_types.error_to_string err)
+  | Some _ -> failwith "Expected failure for mixed video+image quote post"
+  | None -> failwith "quote_post did not complete");
+
+  print_endline "    ✓ Mixed video+image quote rejection test passed"
+
+let test_get_timeline_limit_cursor_query () =
+  print_endline "  Testing timeline query includes limit and cursor...";
+  last_get_url := None;
+  let result = ref None in
+  Bluesky.get_timeline
+    ~account_id:"test_account"
+    ~limit:25
+    ~cursor:"abc def"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok _) -> ()
+  | Some (Error err) ->
+      failwith ("Expected timeline success, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "get_timeline did not complete");
+
+  let url =
+    match !last_get_url with
+    | Some u -> u
+    | None -> failwith "No GET URL captured"
+  in
+  assert (string_contains_substr url "app.bsky.feed.getTimeline?");
+  assert (string_contains_substr url "limit=25");
+  assert (string_contains_substr url "cursor=abc%20def");
+  print_endline "    ✓ Timeline query parameter test passed"
+
+let test_get_timeline_without_optional_params () =
+  print_endline "  Testing timeline query without optional params...";
+  last_get_url := None;
+  let result = ref None in
+  Bluesky.get_timeline
+    ~account_id:"test_account"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok _) -> ()
+  | Some (Error err) ->
+      failwith ("Expected timeline success, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "get_timeline did not complete");
+
+  let url =
+    match !last_get_url with
+    | Some u -> u
+    | None -> failwith "No GET URL captured"
+  in
+  assert (string_contains_substr url "app.bsky.feed.getTimeline");
+  assert (not (string_contains_substr url "?"));
+  print_endline "    ✓ Timeline no-params query test passed"
+
+let test_get_timeline_success_schema () =
+  print_endline "  Testing timeline success schema...";
+  timeline_read_mode := Read_normal;
+  let result = ref None in
+  Bluesky.get_timeline
+    ~account_id:"test_account"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok json) ->
+      let open Yojson.Basic.Util in
+      let feed = json |> member "feed" |> to_list in
+      let cursor = json |> member "cursor" |> to_string in
+      assert (List.length feed = 0);
+      assert (cursor = "next-cursor")
+  | Some (Error err) ->
+      failwith ("Expected timeline success schema, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "get_timeline did not complete");
+  print_endline "    ✓ Timeline success schema test passed"
+
+let test_get_timeline_api_error_mapping () =
+  print_endline "  Testing timeline API error mapping...";
+  timeline_read_mode := Read_api_error;
+  let result = ref None in
+  Bluesky.get_timeline
+    ~account_id:"test_account"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Api_error api_err)) ->
+      assert (api_err.status_code = 400);
+      assert (api_err.message = "InvalidLimit")
+  | Some (Error err) ->
+      failwith ("Expected timeline Api_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected timeline API failure"
+  | None -> failwith "get_timeline did not complete");
+  timeline_read_mode := Read_normal;
+  print_endline "    ✓ Timeline API error mapping test passed"
+
+let test_get_timeline_invalid_json_maps_internal_error () =
+  print_endline "  Testing timeline invalid JSON maps to internal error...";
+  timeline_read_mode := Read_invalid_json;
+  let result = ref None in
+  Bluesky.get_timeline
+    ~account_id:"test_account"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected timeline Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected timeline parse failure"
+  | None -> failwith "get_timeline did not complete");
+  timeline_read_mode := Read_normal;
+  print_endline "    ✓ Timeline invalid JSON mapping test passed"
+
+let test_get_timeline_network_error_no_retry () =
+  print_endline "  Testing timeline network error does not retry...";
+  timeline_read_mode := Read_network_error;
+  get_request_count := 0;
+  let result = ref None in
+  Bluesky.get_timeline
+    ~account_id:"test_account"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Network_error (Error_types.Connection_failed _))) -> ()
+  | Some (Error err) ->
+      failwith ("Expected timeline network error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected timeline network failure"
+  | None -> failwith "get_timeline did not complete");
+  assert (!get_request_count = 1);
+  timeline_read_mode := Read_normal;
+  print_endline "    ✓ Timeline network no-retry test passed"
+
+let test_get_timeline_unauthorized_maps_auth_error () =
+  print_endline "  Testing timeline unauthorized maps to auth error...";
+  force_read_unauthorized := true;
+  let result = ref None in
+  Bluesky.get_timeline
+    ~account_id:"test_account"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Auth_error Error_types.Token_invalid)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected timeline Auth_error Token_invalid, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected timeline unauthorized failure"
+  | None -> failwith "get_timeline did not complete");
+  force_read_unauthorized := false;
+  print_endline "    ✓ Timeline unauthorized auth mapping test passed"
+
+let test_get_timeline_schema_missing_fields_surface_to_caller () =
+  print_endline "  Testing timeline missing-field schema maps to internal error...";
+  timeline_read_mode := Read_schema_missing_fields;
+  let result = ref None in
+  Bluesky.get_timeline
+    ~account_id:"test_account"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected timeline Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected timeline missing-field failure"
+  | None -> failwith "get_timeline did not complete");
+  timeline_read_mode := Read_normal;
+  print_endline "    ✓ Timeline missing-field mapping test passed"
+
+let test_get_timeline_schema_wrong_types_surface_to_caller () =
+  print_endline "  Testing timeline wrong-type schema maps to internal error...";
+  timeline_read_mode := Read_schema_wrong_types;
+  let result = ref None in
+  Bluesky.get_timeline
+    ~account_id:"test_account"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected timeline Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected timeline wrong-type failure"
+  | None -> failwith "get_timeline did not complete");
+  timeline_read_mode := Read_normal;
+  print_endline "    ✓ Timeline wrong-type mapping test passed"
+
+let test_get_profile_actor_query_encoding () =
+  print_endline "  Testing profile query includes encoded actor...";
+  last_get_url := None;
+  let result = ref None in
+  Bluesky.get_profile
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok _) -> ()
+  | Some (Error err) ->
+      failwith ("Expected profile success, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "get_profile did not complete");
+
+  let url =
+    match !last_get_url with
+    | Some u -> u
+    | None -> failwith "No GET URL captured"
+  in
+  assert (string_contains_substr url "app.bsky.actor.getProfile?");
+  assert_query_param_value url "actor" "did:plc:alice";
+  print_endline "    ✓ Profile query parameter test passed"
+
+let test_get_post_thread_uri_query_encoding () =
+  print_endline "  Testing post thread query includes encoded uri...";
+  last_get_url := None;
+  let result = ref None in
+  Bluesky.get_post_thread
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok _) -> ()
+  | Some (Error err) ->
+      failwith ("Expected post thread success, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "get_post_thread did not complete");
+
+  let url =
+    match !last_get_url with
+    | Some u -> u
+    | None -> failwith "No GET URL captured"
+  in
+  assert (string_contains_substr url "app.bsky.feed.getPostThread?");
+  assert_query_param_value url "uri" "at://did:plc:alice/app.bsky.feed.post/xyz";
+  print_endline "    ✓ Post thread query parameter test passed"
+
+let test_get_author_feed_limit_cursor_query () =
+  print_endline "  Testing author feed query includes actor, limit, and cursor...";
+  last_get_url := None;
+  let result = ref None in
+  Bluesky.get_author_feed
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    ~limit:10
+    ~cursor:"cur 123"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok _) -> ()
+  | Some (Error err) ->
+      failwith ("Expected author feed success, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "get_author_feed did not complete");
+
+  let url =
+    match !last_get_url with
+    | Some u -> u
+    | None -> failwith "No GET URL captured"
+  in
+  assert (string_contains_substr url "app.bsky.feed.getAuthorFeed?");
+  assert_query_param_value url "actor" "did:plc:alice";
+  assert (string_contains_substr url "limit=10");
+  assert (string_contains_substr url "cursor=cur%20123");
+  print_endline "    ✓ Author feed query parameter test passed"
+
+let test_get_author_feed_without_optional_params () =
+  print_endline "  Testing author feed query without optional params...";
+  last_get_url := None;
+  let result = ref None in
+  Bluesky.get_author_feed
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok _) -> ()
+  | Some (Error err) ->
+      failwith ("Expected author feed success, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "get_author_feed did not complete");
+
+  let url =
+    match !last_get_url with
+    | Some u -> u
+    | None -> failwith "No GET URL captured"
+  in
+  assert (string_contains_substr url "app.bsky.feed.getAuthorFeed?");
+  assert_query_param_value url "actor" "did:plc:alice";
+  assert (not (string_contains_substr url "limit="));
+  assert (not (string_contains_substr url "cursor="));
+  print_endline "    ✓ Author feed no-optional query test passed"
+
+let test_get_author_feed_api_error_mapping () =
+  print_endline "  Testing author feed API error mapping...";
+  author_feed_read_mode := Read_api_error;
+  let result = ref None in
+  Bluesky.get_author_feed
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Api_error api_err)) ->
+      assert (api_err.status_code = 400);
+      assert (api_err.message = "BadActor")
+  | Some (Error err) ->
+      failwith ("Expected author feed Api_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected author feed API failure"
+  | None -> failwith "get_author_feed did not complete");
+  author_feed_read_mode := Read_normal;
+  print_endline "    ✓ Author feed API error mapping test passed"
+
+let test_get_author_feed_invalid_json_maps_internal_error () =
+  print_endline "  Testing author feed invalid JSON maps to internal error...";
+  author_feed_read_mode := Read_invalid_json;
+  let result = ref None in
+  Bluesky.get_author_feed
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected author feed Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected author feed parse failure"
+  | None -> failwith "get_author_feed did not complete");
+  author_feed_read_mode := Read_normal;
+  print_endline "    ✓ Author feed invalid JSON mapping test passed"
+
+let test_get_author_feed_network_error_no_retry () =
+  print_endline "  Testing author feed network error does not retry...";
+  author_feed_read_mode := Read_network_error;
+  get_request_count := 0;
+  let result = ref None in
+  Bluesky.get_author_feed
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Network_error (Error_types.Connection_failed _))) -> ()
+  | Some (Error err) ->
+      failwith ("Expected author feed network error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected author feed network failure"
+  | None -> failwith "get_author_feed did not complete");
+  assert (!get_request_count = 1);
+  author_feed_read_mode := Read_normal;
+  print_endline "    ✓ Author feed network no-retry test passed"
+
+let test_get_author_feed_unauthorized_maps_auth_error () =
+  print_endline "  Testing author feed unauthorized maps to auth error...";
+  force_read_unauthorized := true;
+  let result = ref None in
+  Bluesky.get_author_feed
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Auth_error Error_types.Token_invalid)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected author feed Auth_error Token_invalid, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected author feed unauthorized failure"
+  | None -> failwith "get_author_feed did not complete");
+  force_read_unauthorized := false;
+  print_endline "    ✓ Author feed unauthorized auth mapping test passed"
+
+let test_get_author_feed_schema_missing_fields_surface_to_caller () =
+  print_endline "  Testing author feed missing-field schema maps to internal error...";
+  author_feed_read_mode := Read_schema_missing_fields;
+  let result = ref None in
+  Bluesky.get_author_feed
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected author feed Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected author feed missing-field failure"
+  | None -> failwith "get_author_feed did not complete");
+  author_feed_read_mode := Read_normal;
+  print_endline "    ✓ Author feed missing-field mapping test passed"
+
+let test_get_author_feed_success_schema () =
+  print_endline "  Testing author feed success schema...";
+  author_feed_read_mode := Read_normal;
+  let result = ref None in
+  Bluesky.get_author_feed
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok json) ->
+      let open Yojson.Basic.Util in
+      let feed = json |> member "feed" |> to_list in
+      let cursor = json |> member "cursor" |> to_string in
+      assert (List.length feed = 0);
+      assert (cursor = "author-cursor")
+  | Some (Error err) ->
+      failwith ("Expected author feed success schema, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "get_author_feed did not complete");
+  print_endline "    ✓ Author feed success schema test passed"
+
+let test_get_author_feed_schema_wrong_types_surface_to_caller () =
+  print_endline "  Testing author feed wrong-type schema maps to internal error...";
+  author_feed_read_mode := Read_schema_wrong_types;
+  let result = ref None in
+  Bluesky.get_author_feed
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected author feed Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected author feed wrong-type failure"
+  | None -> failwith "get_author_feed did not complete");
+  author_feed_read_mode := Read_normal;
+  print_endline "    ✓ Author feed wrong-type mapping test passed"
+
+let test_get_likes_limit_cursor_query () =
+  print_endline "  Testing likes query includes uri, limit, and cursor...";
+  last_get_url := None;
+  let result = ref None in
+  Bluesky.get_likes
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    ~limit:7
+    ~cursor:"likes next"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok _) -> ()
+  | Some (Error err) ->
+      failwith ("Expected likes success, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "get_likes did not complete");
+
+  let url =
+    match !last_get_url with
+    | Some u -> u
+    | None -> failwith "No GET URL captured"
+  in
+  assert (string_contains_substr url "app.bsky.feed.getLikes?");
+  assert_query_param_value url "uri" "at://did:plc:alice/app.bsky.feed.post/xyz";
+  assert (string_contains_substr url "limit=7");
+  assert (string_contains_substr url "cursor=likes%20next");
+  print_endline "    ✓ Likes query parameter test passed"
+
+let test_get_likes_without_optional_params () =
+  print_endline "  Testing likes query without optional params...";
+  last_get_url := None;
+  let result = ref None in
+  Bluesky.get_likes
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok _) -> ()
+  | Some (Error err) ->
+      failwith ("Expected likes success, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "get_likes did not complete");
+
+  let url =
+    match !last_get_url with
+    | Some u -> u
+    | None -> failwith "No GET URL captured"
+  in
+  assert (string_contains_substr url "app.bsky.feed.getLikes?");
+  assert_query_param_value url "uri" "at://did:plc:alice/app.bsky.feed.post/xyz";
+  assert (not (string_contains_substr url "limit="));
+  assert (not (string_contains_substr url "cursor="));
+  print_endline "    ✓ Likes no-optional query test passed"
+
+let test_get_likes_api_error_mapping () =
+  print_endline "  Testing likes API error mapping...";
+  likes_read_mode := Read_api_error;
+  let result = ref None in
+  Bluesky.get_likes
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Api_error api_err)) ->
+      assert (api_err.status_code = 400);
+      assert (api_err.message = "InvalidUri")
+  | Some (Error err) ->
+      failwith ("Expected likes Api_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected likes API failure"
+  | None -> failwith "get_likes did not complete");
+  likes_read_mode := Read_normal;
+  print_endline "    ✓ Likes API error mapping test passed"
+
+let test_get_likes_invalid_json_maps_internal_error () =
+  print_endline "  Testing likes invalid JSON maps to internal error...";
+  likes_read_mode := Read_invalid_json;
+  let result = ref None in
+  Bluesky.get_likes
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected likes Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected likes parse failure"
+  | None -> failwith "get_likes did not complete");
+  likes_read_mode := Read_normal;
+  print_endline "    ✓ Likes invalid JSON mapping test passed"
+
+let test_get_likes_network_error_no_retry () =
+  print_endline "  Testing likes network error does not retry...";
+  likes_read_mode := Read_network_error;
+  get_request_count := 0;
+  let result = ref None in
+  Bluesky.get_likes
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Network_error (Error_types.Connection_failed _))) -> ()
+  | Some (Error err) ->
+      failwith ("Expected likes network error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected likes network failure"
+  | None -> failwith "get_likes did not complete");
+  assert (!get_request_count = 1);
+  likes_read_mode := Read_normal;
+  print_endline "    ✓ Likes network no-retry test passed"
+
+let test_get_likes_unauthorized_maps_auth_error () =
+  print_endline "  Testing likes unauthorized maps to auth error...";
+  force_read_unauthorized := true;
+  let result = ref None in
+  Bluesky.get_likes
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Auth_error Error_types.Token_invalid)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected likes Auth_error Token_invalid, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected likes unauthorized failure"
+  | None -> failwith "get_likes did not complete");
+  force_read_unauthorized := false;
+  print_endline "    ✓ Likes unauthorized auth mapping test passed"
+
+let test_get_likes_schema_missing_fields_surface_to_caller () =
+  print_endline "  Testing likes missing-field schema maps to internal error...";
+  likes_read_mode := Read_schema_missing_fields;
+  let result = ref None in
+  Bluesky.get_likes
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected likes Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected likes missing-field failure"
+  | None -> failwith "get_likes did not complete");
+  likes_read_mode := Read_normal;
+  print_endline "    ✓ Likes missing-field mapping test passed"
+
+let test_get_likes_success_schema () =
+  print_endline "  Testing likes success schema...";
+  likes_read_mode := Read_normal;
+  let result = ref None in
+  Bluesky.get_likes
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok json) ->
+      let open Yojson.Basic.Util in
+      let likes = json |> member "likes" |> to_list in
+      let cursor = json |> member "cursor" |> to_string in
+      assert (List.length likes = 0);
+      assert (cursor = "likes-cursor")
+  | Some (Error err) ->
+      failwith ("Expected likes success schema, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "get_likes did not complete");
+  print_endline "    ✓ Likes success schema test passed"
+
+let test_get_likes_schema_wrong_types_surface_to_caller () =
+  print_endline "  Testing likes wrong-type schema maps to internal error...";
+  likes_read_mode := Read_schema_wrong_types;
+  let result = ref None in
+  Bluesky.get_likes
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected likes Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected likes wrong-type failure"
+  | None -> failwith "get_likes did not complete");
+  likes_read_mode := Read_normal;
+  print_endline "    ✓ Likes wrong-type mapping test passed"
+
+let test_get_reposted_by_limit_cursor_query () =
+  print_endline "  Testing reposted-by query includes uri, limit, and cursor...";
+  last_get_url := None;
+  let result = ref None in
+  Bluesky.get_reposted_by
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    ~limit:11
+    ~cursor:"repost next"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok _) -> ()
+  | Some (Error err) ->
+      failwith ("Expected reposted-by success, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "get_reposted_by did not complete");
+
+  let url =
+    match !last_get_url with
+    | Some u -> u
+    | None -> failwith "No GET URL captured"
+  in
+  assert (string_contains_substr url "app.bsky.feed.getRepostedBy?");
+  assert_query_param_value url "uri" "at://did:plc:alice/app.bsky.feed.post/xyz";
+  assert (string_contains_substr url "limit=11");
+  assert (string_contains_substr url "cursor=repost%20next");
+  print_endline "    ✓ Reposted-by query parameter test passed"
+
+let test_get_reposted_by_without_optional_params () =
+  print_endline "  Testing reposted-by query without optional params...";
+  last_get_url := None;
+  let result = ref None in
+  Bluesky.get_reposted_by
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok _) -> ()
+  | Some (Error err) ->
+      failwith ("Expected reposted-by success, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "get_reposted_by did not complete");
+
+  let url =
+    match !last_get_url with
+    | Some u -> u
+    | None -> failwith "No GET URL captured"
+  in
+  assert (string_contains_substr url "app.bsky.feed.getRepostedBy?");
+  assert_query_param_value url "uri" "at://did:plc:alice/app.bsky.feed.post/xyz";
+  assert (not (string_contains_substr url "limit="));
+  assert (not (string_contains_substr url "cursor="));
+  print_endline "    ✓ Reposted-by no-optional query test passed"
+
+let test_get_reposted_by_api_error_mapping () =
+  print_endline "  Testing reposted-by API error mapping...";
+  reposted_by_read_mode := Read_api_error;
+  let result = ref None in
+  Bluesky.get_reposted_by
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Api_error api_err)) ->
+      assert (api_err.status_code = 404);
+      assert (api_err.message = "NotFound")
+  | Some (Error err) ->
+      failwith ("Expected reposted-by Api_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected reposted-by API failure"
+  | None -> failwith "get_reposted_by did not complete");
+  reposted_by_read_mode := Read_normal;
+  print_endline "    ✓ Reposted-by API error mapping test passed"
+
+let test_get_reposted_by_invalid_json_maps_internal_error () =
+  print_endline "  Testing reposted-by invalid JSON maps to internal error...";
+  reposted_by_read_mode := Read_invalid_json;
+  let result = ref None in
+  Bluesky.get_reposted_by
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected reposted-by Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected reposted-by parse failure"
+  | None -> failwith "get_reposted_by did not complete");
+  reposted_by_read_mode := Read_normal;
+  print_endline "    ✓ Reposted-by invalid JSON mapping test passed"
+
+let test_get_reposted_by_network_error_no_retry () =
+  print_endline "  Testing reposted-by network error does not retry...";
+  reposted_by_read_mode := Read_network_error;
+  get_request_count := 0;
+  let result = ref None in
+  Bluesky.get_reposted_by
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Network_error (Error_types.Connection_failed _))) -> ()
+  | Some (Error err) ->
+      failwith ("Expected reposted-by network error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected reposted-by network failure"
+  | None -> failwith "get_reposted_by did not complete");
+  assert (!get_request_count = 1);
+  reposted_by_read_mode := Read_normal;
+  print_endline "    ✓ Reposted-by network no-retry test passed"
+
+let test_get_reposted_by_unauthorized_maps_auth_error () =
+  print_endline "  Testing reposted-by unauthorized maps to auth error...";
+  force_read_unauthorized := true;
+  let result = ref None in
+  Bluesky.get_reposted_by
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Auth_error Error_types.Token_invalid)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected reposted-by Auth_error Token_invalid, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected reposted-by unauthorized failure"
+  | None -> failwith "get_reposted_by did not complete");
+  force_read_unauthorized := false;
+  print_endline "    ✓ Reposted-by unauthorized auth mapping test passed"
+
+let test_get_reposted_by_schema_missing_fields_surface_to_caller () =
+  print_endline "  Testing reposted-by missing-field schema maps to internal error...";
+  reposted_by_read_mode := Read_schema_missing_fields;
+  let result = ref None in
+  Bluesky.get_reposted_by
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected reposted-by Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected reposted-by missing-field failure"
+  | None -> failwith "get_reposted_by did not complete");
+  reposted_by_read_mode := Read_normal;
+  print_endline "    ✓ Reposted-by missing-field mapping test passed"
+
+let test_get_reposted_by_success_schema () =
+  print_endline "  Testing reposted-by success schema...";
+  reposted_by_read_mode := Read_normal;
+  let result = ref None in
+  Bluesky.get_reposted_by
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok json) ->
+      let open Yojson.Basic.Util in
+      let reposted_by = json |> member "repostedBy" |> to_list in
+      let cursor = json |> member "cursor" |> to_string in
+      assert (List.length reposted_by = 0);
+      assert (cursor = "repost-cursor")
+  | Some (Error err) ->
+      failwith ("Expected reposted-by success schema, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "get_reposted_by did not complete");
+  print_endline "    ✓ Reposted-by success schema test passed"
+
+let test_get_reposted_by_schema_wrong_types_surface_to_caller () =
+  print_endline "  Testing reposted-by wrong-type schema maps to internal error...";
+  reposted_by_read_mode := Read_schema_wrong_types;
+  let result = ref None in
+  Bluesky.get_reposted_by
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected reposted-by Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected reposted-by wrong-type failure"
+  | None -> failwith "get_reposted_by did not complete");
+  reposted_by_read_mode := Read_normal;
+  print_endline "    ✓ Reposted-by wrong-type mapping test passed"
+
+let test_get_followers_limit_cursor_query () =
+  print_endline "  Testing followers query includes actor, limit, and cursor...";
+  last_get_url := None;
+  let result = ref None in
+  Bluesky.get_followers
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    ~limit:13
+    ~cursor:"followers next"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok _) -> ()
+  | Some (Error err) ->
+      failwith ("Expected followers success, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "get_followers did not complete");
+
+  let url =
+    match !last_get_url with
+    | Some u -> u
+    | None -> failwith "No GET URL captured"
+  in
+  assert (string_contains_substr url "app.bsky.graph.getFollowers?");
+  assert_query_param_value url "actor" "did:plc:alice";
+  assert (string_contains_substr url "limit=13");
+  assert (string_contains_substr url "cursor=followers%20next");
+  print_endline "    ✓ Followers query parameter test passed"
+
+let test_get_followers_without_optional_params () =
+  print_endline "  Testing followers query without optional params...";
+  last_get_url := None;
+  let result = ref None in
+  Bluesky.get_followers
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok _) -> ()
+  | Some (Error err) ->
+      failwith ("Expected followers success, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "get_followers did not complete");
+
+  let url =
+    match !last_get_url with
+    | Some u -> u
+    | None -> failwith "No GET URL captured"
+  in
+  assert (string_contains_substr url "app.bsky.graph.getFollowers?");
+  assert_query_param_value url "actor" "did:plc:alice";
+  assert (not (string_contains_substr url "limit="));
+  assert (not (string_contains_substr url "cursor="));
+  print_endline "    ✓ Followers no-optional query test passed"
+
+let test_get_followers_rate_limit_mapping () =
+  print_endline "  Testing followers rate-limit mapping...";
+  followers_read_mode := Read_api_error;
+  let result = ref None in
+  Bluesky.get_followers
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Rate_limited _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected followers Rate_limited, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected followers rate-limit failure"
+  | None -> failwith "get_followers did not complete");
+  followers_read_mode := Read_normal;
+  print_endline "    ✓ Followers rate-limit mapping test passed"
+
+let test_get_followers_invalid_json_maps_internal_error () =
+  print_endline "  Testing followers invalid JSON maps to internal error...";
+  followers_read_mode := Read_invalid_json;
+  let result = ref None in
+  Bluesky.get_followers
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected followers Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected followers parse failure"
+  | None -> failwith "get_followers did not complete");
+  followers_read_mode := Read_normal;
+  print_endline "    ✓ Followers invalid JSON mapping test passed"
+
+let test_get_followers_network_error_no_retry () =
+  print_endline "  Testing followers network error does not retry...";
+  followers_read_mode := Read_network_error;
+  get_request_count := 0;
+  let result = ref None in
+  Bluesky.get_followers
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Network_error (Error_types.Connection_failed _))) -> ()
+  | Some (Error err) ->
+      failwith ("Expected followers network error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected followers network failure"
+  | None -> failwith "get_followers did not complete");
+  assert (!get_request_count = 1);
+  followers_read_mode := Read_normal;
+  print_endline "    ✓ Followers network no-retry test passed"
+
+let test_get_followers_unauthorized_maps_auth_error () =
+  print_endline "  Testing followers unauthorized maps to auth error...";
+  force_read_unauthorized := true;
+  let result = ref None in
+  Bluesky.get_followers
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Auth_error Error_types.Token_invalid)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected followers Auth_error Token_invalid, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected followers unauthorized failure"
+  | None -> failwith "get_followers did not complete");
+  force_read_unauthorized := false;
+  print_endline "    ✓ Followers unauthorized auth mapping test passed"
+
+let test_get_followers_schema_missing_fields_surface_to_caller () =
+  print_endline "  Testing followers missing-field schema maps to internal error...";
+  followers_read_mode := Read_schema_missing_fields;
+  let result = ref None in
+  Bluesky.get_followers
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected followers Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected followers missing-field failure"
+  | None -> failwith "get_followers did not complete");
+  followers_read_mode := Read_normal;
+  print_endline "    ✓ Followers missing-field mapping test passed"
+
+let test_get_followers_success_schema () =
+  print_endline "  Testing followers success schema...";
+  followers_read_mode := Read_normal;
+  let result = ref None in
+  Bluesky.get_followers
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok json) ->
+      let open Yojson.Basic.Util in
+      let followers = json |> member "followers" |> to_list in
+      let cursor = json |> member "cursor" |> to_string in
+      assert (List.length followers = 0);
+      assert (cursor = "followers-cursor")
+  | Some (Error err) ->
+      failwith ("Expected followers success schema, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "get_followers did not complete");
+  print_endline "    ✓ Followers success schema test passed"
+
+let test_get_followers_schema_wrong_types_surface_to_caller () =
+  print_endline "  Testing followers wrong-type schema maps to internal error...";
+  followers_read_mode := Read_schema_wrong_types;
+  let result = ref None in
+  Bluesky.get_followers
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected followers Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected followers wrong-type failure"
+  | None -> failwith "get_followers did not complete");
+  followers_read_mode := Read_normal;
+  print_endline "    ✓ Followers wrong-type mapping test passed"
+
+let test_get_follows_limit_cursor_query () =
+  print_endline "  Testing follows query includes actor, limit, and cursor...";
+  last_get_url := None;
+  let result = ref None in
+  Bluesky.get_follows
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    ~limit:17
+    ~cursor:"follows next"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok _) -> ()
+  | Some (Error err) ->
+      failwith ("Expected follows success, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "get_follows did not complete");
+
+  let url =
+    match !last_get_url with
+    | Some u -> u
+    | None -> failwith "No GET URL captured"
+  in
+  assert (string_contains_substr url "app.bsky.graph.getFollows?");
+  assert_query_param_value url "actor" "did:plc:alice";
+  assert (string_contains_substr url "limit=17");
+  assert (string_contains_substr url "cursor=follows%20next");
+  print_endline "    ✓ Follows query parameter test passed"
+
+let test_get_follows_without_optional_params () =
+  print_endline "  Testing follows query without optional params...";
+  last_get_url := None;
+  let result = ref None in
+  Bluesky.get_follows
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok _) -> ()
+  | Some (Error err) ->
+      failwith ("Expected follows success, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "get_follows did not complete");
+
+  let url =
+    match !last_get_url with
+    | Some u -> u
+    | None -> failwith "No GET URL captured"
+  in
+  assert (string_contains_substr url "app.bsky.graph.getFollows?");
+  assert_query_param_value url "actor" "did:plc:alice";
+  assert (not (string_contains_substr url "limit="));
+  assert (not (string_contains_substr url "cursor="));
+  print_endline "    ✓ Follows no-optional query test passed"
+
+let test_get_follows_api_error_mapping () =
+  print_endline "  Testing follows API error mapping...";
+  follows_read_mode := Read_api_error;
+  let result = ref None in
+  Bluesky.get_follows
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Api_error api_err)) ->
+      assert (api_err.status_code = 400);
+      assert (api_err.message = "BadActor")
+  | Some (Error err) ->
+      failwith ("Expected follows Api_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected follows API failure"
+  | None -> failwith "get_follows did not complete");
+  follows_read_mode := Read_normal;
+  print_endline "    ✓ Follows API error mapping test passed"
+
+let test_get_follows_invalid_json_maps_internal_error () =
+  print_endline "  Testing follows invalid JSON maps to internal error...";
+  follows_read_mode := Read_invalid_json;
+  let result = ref None in
+  Bluesky.get_follows
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected follows Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected follows parse failure"
+  | None -> failwith "get_follows did not complete");
+  follows_read_mode := Read_normal;
+  print_endline "    ✓ Follows invalid JSON mapping test passed"
+
+let test_get_follows_network_error_no_retry () =
+  print_endline "  Testing follows network error does not retry...";
+  follows_read_mode := Read_network_error;
+  get_request_count := 0;
+  let result = ref None in
+  Bluesky.get_follows
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Network_error (Error_types.Connection_failed _))) -> ()
+  | Some (Error err) ->
+      failwith ("Expected follows network error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected follows network failure"
+  | None -> failwith "get_follows did not complete");
+  assert (!get_request_count = 1);
+  follows_read_mode := Read_normal;
+  print_endline "    ✓ Follows network no-retry test passed"
+
+let test_get_follows_unauthorized_maps_auth_error () =
+  print_endline "  Testing follows unauthorized maps to auth error...";
+  force_read_unauthorized := true;
+  let result = ref None in
+  Bluesky.get_follows
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Auth_error Error_types.Token_invalid)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected follows Auth_error Token_invalid, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected follows unauthorized failure"
+  | None -> failwith "get_follows did not complete");
+  force_read_unauthorized := false;
+  print_endline "    ✓ Follows unauthorized auth mapping test passed"
+
+let test_get_follows_schema_missing_fields_surface_to_caller () =
+  print_endline "  Testing follows missing-field schema maps to internal error...";
+  follows_read_mode := Read_schema_missing_fields;
+  let result = ref None in
+  Bluesky.get_follows
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected follows Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected follows missing-field failure"
+  | None -> failwith "get_follows did not complete");
+  follows_read_mode := Read_normal;
+  print_endline "    ✓ Follows missing-field mapping test passed"
+
+let test_get_follows_success_schema () =
+  print_endline "  Testing follows success schema...";
+  follows_read_mode := Read_normal;
+  let result = ref None in
+  Bluesky.get_follows
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok json) ->
+      let open Yojson.Basic.Util in
+      let follows = json |> member "follows" |> to_list in
+      let cursor = json |> member "cursor" |> to_string in
+      assert (List.length follows = 0);
+      assert (cursor = "follows-cursor")
+  | Some (Error err) ->
+      failwith ("Expected follows success schema, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "get_follows did not complete");
+  print_endline "    ✓ Follows success schema test passed"
+
+let test_get_follows_schema_wrong_types_surface_to_caller () =
+  print_endline "  Testing follows wrong-type schema maps to internal error...";
+  follows_read_mode := Read_schema_wrong_types;
+  let result = ref None in
+  Bluesky.get_follows
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected follows Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected follows wrong-type failure"
+  | None -> failwith "get_follows did not complete");
+  follows_read_mode := Read_normal;
+  print_endline "    ✓ Follows wrong-type mapping test passed"
+
+let test_list_notifications_limit_cursor_query () =
+  print_endline "  Testing notifications query includes limit and cursor...";
+  last_get_url := None;
+  let result = ref None in
+  Bluesky.list_notifications
+    ~account_id:"test_account"
+    ~limit:19
+    ~cursor:"notif next"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok _) -> ()
+  | Some (Error err) ->
+      failwith ("Expected notifications success, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "list_notifications did not complete");
+
+  let url =
+    match !last_get_url with
+    | Some u -> u
+    | None -> failwith "No GET URL captured"
+  in
+  assert (string_contains_substr url "app.bsky.notification.listNotifications?");
+  assert (string_contains_substr url "limit=19");
+  assert (string_contains_substr url "cursor=notif%20next");
+  print_endline "    ✓ Notifications query parameter test passed"
+
+let test_search_actors_query_limit_cursor () =
+  print_endline "  Testing search actors query includes q, limit, and cursor...";
+  last_get_url := None;
+  let result = ref None in
+  Bluesky.search_actors
+    ~account_id:"test_account"
+    ~query:"alice dev"
+    ~limit:23
+    ~cursor:"actors next"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok _) -> ()
+  | Some (Error err) ->
+      failwith ("Expected search actors success, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "search_actors did not complete");
+
+  let url =
+    match !last_get_url with
+    | Some u -> u
+    | None -> failwith "No GET URL captured"
+  in
+  assert (string_contains_substr url "app.bsky.actor.searchActors?");
+  assert (string_contains_substr url "q=alice%20dev");
+  assert (string_contains_substr url "limit=23");
+  assert (string_contains_substr url "cursor=actors%20next");
+  print_endline "    ✓ Search actors query parameter test passed"
+
+let test_search_actors_without_optional_params () =
+  print_endline "  Testing search actors query without optional params...";
+  last_get_url := None;
+  let result = ref None in
+  Bluesky.search_actors
+    ~account_id:"test_account"
+    ~query:"alice dev"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok _) -> ()
+  | Some (Error err) ->
+      failwith ("Expected search actors success, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "search_actors did not complete");
+
+  let url =
+    match !last_get_url with
+    | Some u -> u
+    | None -> failwith "No GET URL captured"
+  in
+  assert (string_contains_substr url "app.bsky.actor.searchActors?q=alice%20dev");
+  assert (not (string_contains_substr url "limit="));
+  assert (not (string_contains_substr url "cursor="));
+  print_endline "    ✓ Search actors no-optional query test passed"
+
+let test_search_actors_api_error_mapping () =
+  print_endline "  Testing search actors API error mapping...";
+  search_actors_read_mode := Read_api_error;
+  let result = ref None in
+  Bluesky.search_actors
+    ~account_id:"test_account"
+    ~query:"alice dev"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Api_error api_err)) ->
+      assert (api_err.status_code = 400);
+      assert (api_err.message = "InvalidSearch")
+  | Some (Error err) ->
+      failwith ("Expected search actors Api_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected search actors API failure"
+  | None -> failwith "search_actors did not complete");
+  search_actors_read_mode := Read_normal;
+  print_endline "    ✓ Search actors API error mapping test passed"
+
+let test_search_actors_network_error_no_retry () =
+  print_endline "  Testing search actors network error does not retry...";
+  search_actors_read_mode := Read_network_error;
+  get_request_count := 0;
+  let result = ref None in
+  Bluesky.search_actors
+    ~account_id:"test_account"
+    ~query:"alice dev"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Network_error (Error_types.Connection_failed _))) -> ()
+  | Some (Error err) ->
+      failwith ("Expected search actors network error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected search actors network failure"
+  | None -> failwith "search_actors did not complete");
+  assert (!get_request_count = 1);
+  search_actors_read_mode := Read_normal;
+  print_endline "    ✓ Search actors network no-retry test passed"
+
+let test_search_actors_invalid_json_maps_internal_error () =
+  print_endline "  Testing search actors invalid JSON maps to internal error...";
+  search_actors_read_mode := Read_invalid_json;
+  let result = ref None in
+  Bluesky.search_actors
+    ~account_id:"test_account"
+    ~query:"alice dev"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected search actors Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected search actors parse failure"
+  | None -> failwith "search_actors did not complete");
+  search_actors_read_mode := Read_normal;
+  print_endline "    ✓ Search actors invalid JSON mapping test passed"
+
+let test_search_actors_unauthorized_maps_auth_error () =
+  print_endline "  Testing search actors unauthorized maps to auth error...";
+  force_read_unauthorized := true;
+  let result = ref None in
+  Bluesky.search_actors
+    ~account_id:"test_account"
+    ~query:"alice dev"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Auth_error Error_types.Token_invalid)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected search actors Auth_error Token_invalid, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected search actors unauthorized failure"
+  | None -> failwith "search_actors did not complete");
+  force_read_unauthorized := false;
+  print_endline "    ✓ Search actors unauthorized auth mapping test passed"
+
+let test_search_actors_success_schema () =
+  print_endline "  Testing search actors success schema...";
+  search_actors_read_mode := Read_normal;
+  let result = ref None in
+  Bluesky.search_actors
+    ~account_id:"test_account"
+    ~query:"alice dev"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok json) ->
+      let open Yojson.Basic.Util in
+      let actors = json |> member "actors" |> to_list in
+      let cursor = json |> member "cursor" |> to_string in
+      assert (List.length actors = 0);
+      assert (cursor = "actors-cursor")
+  | Some (Error err) ->
+      failwith ("Expected search actors success schema, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "search_actors did not complete");
+  print_endline "    ✓ Search actors success schema test passed"
+
+let test_search_actors_schema_missing_fields_surface_to_caller () =
+  print_endline "  Testing search actors missing-field schema maps to internal error...";
+  search_actors_read_mode := Read_schema_missing_fields;
+  let result = ref None in
+  Bluesky.search_actors
+    ~account_id:"test_account"
+    ~query:"alice dev"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected search actors Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected search actors missing-field failure"
+  | None -> failwith "search_actors did not complete");
+  search_actors_read_mode := Read_normal;
+  print_endline "    ✓ Search actors missing-field mapping test passed"
+
+let test_search_actors_schema_wrong_types_surface_to_caller () =
+  print_endline "  Testing search actors wrong-type schema maps to internal error...";
+  search_actors_read_mode := Read_schema_wrong_types;
+  let result = ref None in
+  Bluesky.search_actors
+    ~account_id:"test_account"
+    ~query:"alice dev"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected search actors Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected search actors wrong-type failure"
+  | None -> failwith "search_actors did not complete");
+  search_actors_read_mode := Read_normal;
+  print_endline "    ✓ Search actors wrong-type mapping test passed"
+
+let test_search_posts_query_limit_cursor () =
+  print_endline "  Testing search posts query includes q, limit, and cursor...";
+  last_get_url := None;
+  let result = ref None in
+  Bluesky.search_posts
+    ~account_id:"test_account"
+    ~query:"ocaml bluesky"
+    ~limit:29
+    ~cursor:"posts next"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok _) -> ()
+  | Some (Error err) ->
+      failwith ("Expected search posts success, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "search_posts did not complete");
+
+  let url =
+    match !last_get_url with
+    | Some u -> u
+    | None -> failwith "No GET URL captured"
+  in
+  assert (string_contains_substr url "app.bsky.feed.searchPosts?");
+  assert (string_contains_substr url "q=ocaml%20bluesky");
+  assert (string_contains_substr url "limit=29");
+  assert (string_contains_substr url "cursor=posts%20next");
+  print_endline "    ✓ Search posts query parameter test passed"
+
+let test_search_posts_without_optional_params () =
+  print_endline "  Testing search posts query without optional params...";
+  last_get_url := None;
+  let result = ref None in
+  Bluesky.search_posts
+    ~account_id:"test_account"
+    ~query:"ocaml bluesky"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok _) -> ()
+  | Some (Error err) ->
+      failwith ("Expected search posts success, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "search_posts did not complete");
+
+  let url =
+    match !last_get_url with
+    | Some u -> u
+    | None -> failwith "No GET URL captured"
+  in
+  assert (string_contains_substr url "app.bsky.feed.searchPosts?q=ocaml%20bluesky");
+  assert (not (string_contains_substr url "limit="));
+  assert (not (string_contains_substr url "cursor="));
+  print_endline "    ✓ Search posts no-optional query test passed"
+
+let test_search_posts_api_error_mapping () =
+  print_endline "  Testing search posts API error mapping...";
+  search_posts_read_mode := Read_api_error;
+  let result = ref None in
+  Bluesky.search_posts
+    ~account_id:"test_account"
+    ~query:"ocaml bluesky"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Api_error api_err)) ->
+      assert (api_err.status_code = 400);
+      assert (api_err.message = "InvalidSearch")
+  | Some (Error err) ->
+      failwith ("Expected search posts Api_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected search posts API failure"
+  | None -> failwith "search_posts did not complete");
+  search_posts_read_mode := Read_normal;
+  print_endline "    ✓ Search posts API error mapping test passed"
+
+let test_search_posts_success_schema () =
+  print_endline "  Testing search posts success schema...";
+  search_posts_read_mode := Read_normal;
+  let result = ref None in
+  Bluesky.search_posts
+    ~account_id:"test_account"
+    ~query:"ocaml bluesky"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok json) ->
+      let open Yojson.Basic.Util in
+      let posts = json |> member "posts" |> to_list in
+      let cursor = json |> member "cursor" |> to_string in
+      assert (List.length posts = 0);
+      assert (cursor = "posts-cursor")
+  | Some (Error err) ->
+      failwith ("Expected search posts success schema, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "search_posts did not complete");
+  print_endline "    ✓ Search posts success schema test passed"
+
+let test_search_posts_invalid_json_maps_internal_error () =
+  print_endline "  Testing search posts invalid JSON maps to internal error...";
+  search_posts_read_mode := Read_invalid_json;
+  let result = ref None in
+  Bluesky.search_posts
+    ~account_id:"test_account"
+    ~query:"ocaml bluesky"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected search posts Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected search posts parse failure"
+  | None -> failwith "search_posts did not complete");
+  search_posts_read_mode := Read_normal;
+  print_endline "    ✓ Search posts invalid JSON mapping test passed"
+
+let test_search_posts_network_error_no_retry () =
+  print_endline "  Testing search posts network error does not retry...";
+  search_posts_read_mode := Read_network_error;
+  get_request_count := 0;
+  let result = ref None in
+  Bluesky.search_posts
+    ~account_id:"test_account"
+    ~query:"ocaml bluesky"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Network_error (Error_types.Connection_failed _))) -> ()
+  | Some (Error err) ->
+      failwith ("Expected search posts network error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected search posts network failure"
+  | None -> failwith "search_posts did not complete");
+  assert (!get_request_count = 1);
+  search_posts_read_mode := Read_normal;
+  print_endline "    ✓ Search posts network no-retry test passed"
+
+let test_search_posts_schema_missing_fields_surface_to_caller () =
+  print_endline "  Testing search posts missing-field schema maps to internal error...";
+  search_posts_read_mode := Read_schema_missing_fields;
+  let result = ref None in
+  Bluesky.search_posts
+    ~account_id:"test_account"
+    ~query:"ocaml bluesky"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected search posts Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected search posts missing-field failure"
+  | None -> failwith "search_posts did not complete");
+  search_posts_read_mode := Read_normal;
+  print_endline "    ✓ Search posts missing-field mapping test passed"
+
+let test_search_posts_schema_wrong_types_surface_to_caller () =
+  print_endline "  Testing search posts wrong-type schema maps to internal error...";
+  search_posts_read_mode := Read_schema_wrong_types;
+  let result = ref None in
+  Bluesky.search_posts
+    ~account_id:"test_account"
+    ~query:"ocaml bluesky"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected search posts Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected search posts wrong-type failure"
+  | None -> failwith "search_posts did not complete");
+  search_posts_read_mode := Read_normal;
+  print_endline "    ✓ Search posts wrong-type mapping test passed"
+
+let test_get_profile_unauthorized_maps_auth_error () =
+  print_endline "  Testing profile unauthorized maps to auth error...";
+  force_read_unauthorized := true;
+  let result = ref None in
+  Bluesky.get_profile
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Auth_error Error_types.Token_invalid)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected profile Auth_error Token_invalid, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected profile unauthorized failure"
+  | None -> failwith "get_profile did not complete");
+  force_read_unauthorized := false;
+  print_endline "    ✓ Profile unauthorized auth mapping test passed"
+
+let test_get_post_thread_schema_missing_fields_surface_to_caller () =
+  print_endline "  Testing post thread missing-field schema maps to internal error...";
+  thread_read_mode := Read_schema_missing_fields;
+  let result = ref None in
+  Bluesky.get_post_thread
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected post thread Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected post thread missing-field failure"
+  | None -> failwith "get_post_thread did not complete");
+  thread_read_mode := Read_normal;
+  print_endline "    ✓ Post thread missing-field mapping test passed"
+
+let test_list_notifications_without_optional_params () =
+  print_endline "  Testing notifications query without optional params...";
+  last_get_url := None;
+  let result = ref None in
+  Bluesky.list_notifications
+    ~account_id:"test_account"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok _) -> ()
+  | Some (Error err) ->
+      failwith ("Expected notifications success, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "list_notifications did not complete");
+
+  let url =
+    match !last_get_url with
+    | Some u -> u
+    | None -> failwith "No GET URL captured"
+  in
+  assert (string_contains_substr url "app.bsky.notification.listNotifications");
+  assert (not (string_contains_substr url "?"));
+  print_endline "    ✓ Notifications no-optional query test passed"
+
+let test_count_unread_notifications_endpoint () =
+  print_endline "  Testing unread count endpoint and parse...";
+  last_get_url := None;
+  let result = ref None in
+  Bluesky.count_unread_notifications
+    ~account_id:"test_account"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok count) -> assert (count = 3)
+  | Some (Error err) ->
+      failwith ("Expected unread count success, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "count_unread_notifications did not complete");
+
+  let url =
+    match !last_get_url with
+    | Some u -> u
+    | None -> failwith "No GET URL captured"
+  in
+  assert (string_contains_substr url "app.bsky.notification.getUnreadCount");
+  print_endline "    ✓ Unread count endpoint test passed"
+
+let test_get_profile_api_error_mapping () =
+  print_endline "  Testing profile API error mapping...";
+  profile_read_mode := Read_api_error;
+  let result = ref None in
+  Bluesky.get_profile
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Api_error api_err)) -> assert (api_err.status_code = 400)
+  | Some (Error err) ->
+      failwith ("Expected Api_error for profile, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected profile failure"
+  | None -> failwith "get_profile did not complete");
+  profile_read_mode := Read_normal;
+  print_endline "    ✓ Profile API error mapping test passed"
+
+let test_get_profile_success_schema () =
+  print_endline "  Testing profile success schema...";
+  profile_read_mode := Read_normal;
+  let result = ref None in
+  Bluesky.get_profile
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok json) ->
+      let open Yojson.Basic.Util in
+      let did = json |> member "did" |> to_string in
+      let handle = json |> member "handle" |> to_string in
+      assert (did = "did:plc:alice");
+      assert (handle = "alice.test")
+  | Some (Error err) ->
+      failwith ("Expected profile success schema, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "get_profile did not complete");
+  print_endline "    ✓ Profile success schema test passed"
+
+let test_get_profile_invalid_json_maps_internal_error () =
+  print_endline "  Testing profile invalid JSON maps to internal error...";
+  profile_read_mode := Read_invalid_json;
+  let result = ref None in
+  Bluesky.get_profile
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected Internal_error for profile JSON parse, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected profile parse failure"
+  | None -> failwith "get_profile did not complete");
+  profile_read_mode := Read_normal;
+  print_endline "    ✓ Profile invalid JSON mapping test passed"
+
+let test_get_profile_network_error_no_retry () =
+  print_endline "  Testing profile network error does not retry...";
+  profile_read_mode := Read_network_error;
+  get_request_count := 0;
+  let result = ref None in
+  Bluesky.get_profile
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Network_error (Error_types.Connection_failed _))) -> ()
+  | Some (Error err) ->
+      failwith ("Expected profile network error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected profile network failure"
+  | None -> failwith "get_profile did not complete");
+  assert (!get_request_count = 1);
+  profile_read_mode := Read_normal;
+  print_endline "    ✓ Profile network no-retry test passed"
+
+let test_get_profile_schema_missing_fields_surface_to_caller () =
+  print_endline "  Testing profile missing-field schema maps to internal error...";
+  profile_read_mode := Read_schema_missing_fields;
+  let result = ref None in
+  Bluesky.get_profile
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected profile Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected profile missing-field failure"
+  | None -> failwith "get_profile did not complete");
+  profile_read_mode := Read_normal;
+  print_endline "    ✓ Profile missing-field mapping test passed"
+
+let test_get_profile_schema_wrong_types_surface_to_caller () =
+  print_endline "  Testing profile wrong-type schema maps to internal error...";
+  profile_read_mode := Read_schema_wrong_types;
+  let result = ref None in
+  Bluesky.get_profile
+    ~account_id:"test_account"
+    ~actor:"did:plc:alice"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected profile Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected profile wrong-type failure"
+  | None -> failwith "get_profile did not complete");
+  profile_read_mode := Read_normal;
+  print_endline "    ✓ Profile wrong-type mapping test passed"
+
+let test_get_post_thread_network_error_mapping () =
+  print_endline "  Testing post thread network error mapping...";
+  thread_read_mode := Read_network_error;
+  get_request_count := 0;
+  let result = ref None in
+  Bluesky.get_post_thread
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Network_error (Error_types.Connection_failed _))) -> ()
+  | Some (Error err) ->
+      failwith ("Expected Network_error for thread, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected post thread failure"
+  | None -> failwith "get_post_thread did not complete");
+  assert (!get_request_count = 1);
+  thread_read_mode := Read_normal;
+  print_endline "    ✓ Post thread network error mapping test passed"
+
+let test_get_post_thread_success_schema () =
+  print_endline "  Testing post thread success schema...";
+  thread_read_mode := Read_normal;
+  let result = ref None in
+  Bluesky.get_post_thread
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok json) ->
+      let open Yojson.Basic.Util in
+      let thread_type = json |> member "thread" |> member "$type" |> to_string in
+      assert (thread_type = "app.bsky.feed.defs#threadViewPost")
+  | Some (Error err) ->
+      failwith ("Expected post thread success schema, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "get_post_thread did not complete");
+  print_endline "    ✓ Post thread success schema test passed"
+
+let test_get_post_thread_api_error_mapping () =
+  print_endline "  Testing post thread API error mapping...";
+  thread_read_mode := Read_api_error;
+  let result = ref None in
+  Bluesky.get_post_thread
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Api_error api_err)) ->
+      assert (api_err.status_code = 404);
+      assert (api_err.message = "missing thread")
+  | Some (Error err) ->
+      failwith ("Expected Api_error for thread, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected post thread API failure"
+  | None -> failwith "get_post_thread did not complete");
+  thread_read_mode := Read_normal;
+  print_endline "    ✓ Post thread API error mapping test passed"
+
+let test_get_post_thread_unauthorized_maps_auth_error () =
+  print_endline "  Testing post thread unauthorized maps to auth error...";
+  force_read_unauthorized := true;
+  let result = ref None in
+  Bluesky.get_post_thread
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Auth_error Error_types.Token_invalid)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected post thread Auth_error Token_invalid, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected post thread unauthorized failure"
+  | None -> failwith "get_post_thread did not complete");
+  force_read_unauthorized := false;
+  print_endline "    ✓ Post thread unauthorized auth mapping test passed"
+
+let test_get_post_thread_invalid_json_maps_internal_error () =
+  print_endline "  Testing post thread invalid JSON maps to internal error...";
+  thread_read_mode := Read_invalid_json;
+  let result = ref None in
+  Bluesky.get_post_thread
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected Internal_error for post thread JSON parse, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected post thread parse failure"
+  | None -> failwith "get_post_thread did not complete");
+  thread_read_mode := Read_normal;
+  print_endline "    ✓ Post thread invalid JSON mapping test passed"
+
+let test_get_post_thread_schema_wrong_type_surface_to_caller () =
+  print_endline "  Testing post thread wrong-type schema maps to internal error...";
+  thread_read_mode := Read_schema_wrong_types;
+  let result = ref None in
+  Bluesky.get_post_thread
+    ~account_id:"test_account"
+    ~post_uri:"at://did:plc:alice/app.bsky.feed.post/xyz"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected post thread Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected post thread wrong-type failure"
+  | None -> failwith "get_post_thread did not complete");
+  thread_read_mode := Read_normal;
+  print_endline "    ✓ Post thread wrong-type mapping test passed"
+
+let test_list_notifications_rate_limit_mapping () =
+  print_endline "  Testing notifications rate-limit mapping...";
+  notifications_read_mode := Read_api_error;
+  let result = ref None in
+  Bluesky.list_notifications
+    ~account_id:"test_account"
+    ~limit:5
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Rate_limited _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected Rate_limited for notifications, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected notifications rate-limit failure"
+  | None -> failwith "list_notifications did not complete");
+  notifications_read_mode := Read_normal;
+  print_endline "    ✓ Notifications rate-limit mapping test passed"
+
+let test_list_notifications_success_schema () =
+  print_endline "  Testing notifications success schema...";
+  notifications_read_mode := Read_normal;
+  let result = ref None in
+  Bluesky.list_notifications
+    ~account_id:"test_account"
+    ~limit:5
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Ok json) ->
+      let open Yojson.Basic.Util in
+      let notifications = json |> member "notifications" |> to_list in
+      let cursor = json |> member "cursor" |> to_string in
+      assert (List.length notifications = 0);
+      assert (cursor = "notif-cursor")
+  | Some (Error err) ->
+      failwith ("Expected notifications success schema, got: " ^ Error_types.error_to_string err)
+  | None -> failwith "list_notifications did not complete");
+  print_endline "    ✓ Notifications success schema test passed"
+
+let test_list_notifications_invalid_json_maps_internal_error () =
+  print_endline "  Testing notifications invalid JSON maps to internal error...";
+  notifications_read_mode := Read_invalid_json;
+  let result = ref None in
+  Bluesky.list_notifications
+    ~account_id:"test_account"
+    ~limit:5
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected Internal_error for notifications JSON parse, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected notifications parse failure"
+  | None -> failwith "list_notifications did not complete");
+  notifications_read_mode := Read_normal;
+  print_endline "    ✓ Notifications invalid JSON mapping test passed"
+
+let test_list_notifications_network_error_no_retry () =
+  print_endline "  Testing notifications network error does not retry...";
+  notifications_read_mode := Read_network_error;
+  get_request_count := 0;
+  let result = ref None in
+  Bluesky.list_notifications
+    ~account_id:"test_account"
+    ~limit:5
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Network_error (Error_types.Connection_failed _))) -> ()
+  | Some (Error err) ->
+      failwith ("Expected notifications network error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected notifications network failure"
+  | None -> failwith "list_notifications did not complete");
+  assert (!get_request_count = 1);
+  notifications_read_mode := Read_normal;
+  print_endline "    ✓ Notifications network no-retry test passed"
+
+let test_list_notifications_schema_missing_fields_surface_to_caller () =
+  print_endline "  Testing notifications missing-field schema maps to internal error...";
+  notifications_read_mode := Read_schema_missing_fields;
+  let result = ref None in
+  Bluesky.list_notifications
+    ~account_id:"test_account"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected notifications Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected notifications missing-field failure"
+  | None -> failwith "list_notifications did not complete");
+  notifications_read_mode := Read_normal;
+  print_endline "    ✓ Notifications missing-field mapping test passed"
+
+let test_list_notifications_schema_wrong_types_surface_to_caller () =
+  print_endline "  Testing notifications wrong-type schema maps to internal error...";
+  notifications_read_mode := Read_schema_wrong_types;
+  let result = ref None in
+  Bluesky.list_notifications
+    ~account_id:"test_account"
+    ~limit:5
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected notifications Internal_error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected notifications wrong-type failure"
+  | None -> failwith "list_notifications did not complete");
+  notifications_read_mode := Read_normal;
+  print_endline "    ✓ Notifications wrong-type mapping test passed"
+
+let test_list_notifications_unauthorized_maps_auth_error () =
+  print_endline "  Testing notifications unauthorized maps to auth error...";
+  force_read_unauthorized := true;
+  let result = ref None in
+  Bluesky.list_notifications
+    ~account_id:"test_account"
+    ~limit:5
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Auth_error Error_types.Token_invalid)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected notifications Auth_error Token_invalid, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected notifications unauthorized failure"
+  | None -> failwith "list_notifications did not complete");
+  force_read_unauthorized := false;
+  print_endline "    ✓ Notifications unauthorized auth mapping test passed"
+
+let test_count_unread_notifications_api_error_mapping () =
+  print_endline "  Testing unread count API error mapping...";
+  unread_count_read_mode := Read_api_error;
+  let result = ref None in
+  Bluesky.count_unread_notifications
+    ~account_id:"test_account"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Api_error api_err)) ->
+      assert (api_err.status_code = 500);
+      assert (api_err.message = "Internal")
+  | Some (Error err) ->
+      failwith ("Expected Api_error for unread count, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected unread count API failure"
+  | None -> failwith "count_unread_notifications did not complete");
+  unread_count_read_mode := Read_normal;
+  print_endline "    ✓ Unread count API error mapping test passed"
+
+let test_count_unread_notifications_missing_count_maps_internal_error () =
+  print_endline "  Testing unread count missing field maps to internal error...";
+  unread_count_read_mode := Read_schema_missing_fields;
+  let result = ref None in
+  Bluesky.count_unread_notifications
+    ~account_id:"test_account"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected Internal_error for unread missing field, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected unread count missing-field failure"
+  | None -> failwith "count_unread_notifications did not complete");
+  unread_count_read_mode := Read_normal;
+  print_endline "    ✓ Unread count missing-field mapping test passed"
+
+let test_count_unread_notifications_network_error_no_retry () =
+  print_endline "  Testing unread count network error does not retry...";
+  unread_count_read_mode := Read_network_error;
+  get_request_count := 0;
+  let result = ref None in
+  Bluesky.count_unread_notifications
+    ~account_id:"test_account"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Network_error (Error_types.Connection_failed _))) -> ()
+  | Some (Error err) ->
+      failwith ("Expected unread count network error, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected unread count network failure"
+  | None -> failwith "count_unread_notifications did not complete");
+  assert (!get_request_count = 1);
+  unread_count_read_mode := Read_normal;
+  print_endline "    ✓ Unread count network no-retry test passed"
+
+let test_count_unread_notifications_parse_error_mapping () =
+  print_endline "  Testing unread count parse error mapping...";
+  unread_count_read_mode := Read_invalid_json;
+  let result = ref None in
+  Bluesky.count_unread_notifications
+    ~account_id:"test_account"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected Internal_error for unread count parse, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected unread count parse failure"
+  | None -> failwith "count_unread_notifications did not complete");
+  unread_count_read_mode := Read_normal;
+  print_endline "    ✓ Unread count parse error mapping test passed"
+
+let test_count_unread_notifications_wrong_type_maps_internal_error () =
+  print_endline "  Testing unread count wrong type maps to internal error...";
+  unread_count_read_mode := Read_schema_wrong_types;
+  let result = ref None in
+  Bluesky.count_unread_notifications
+    ~account_id:"test_account"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Internal_error _)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected Internal_error for unread count wrong type, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected unread count wrong-type failure"
+  | None -> failwith "count_unread_notifications did not complete");
+  unread_count_read_mode := Read_normal;
+  print_endline "    ✓ Unread count wrong-type mapping test passed"
+
+let test_count_unread_notifications_unauthorized_maps_auth_error () =
+  print_endline "  Testing unread count unauthorized maps to auth error...";
+  force_read_unauthorized := true;
+  let result = ref None in
+  Bluesky.count_unread_notifications
+    ~account_id:"test_account"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Auth_error Error_types.Token_invalid)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected unread count Auth_error Token_invalid, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected unread count unauthorized failure"
+  | None -> failwith "count_unread_notifications did not complete");
+  force_read_unauthorized := false;
+  print_endline "    ✓ Unread count unauthorized auth mapping test passed"
+
+let test_search_posts_unauthorized_maps_auth_error () =
+  print_endline "  Testing search posts unauthorized maps to auth error...";
+  force_read_unauthorized := true;
+  let result = ref None in
+  Bluesky.search_posts
+    ~account_id:"test_account"
+    ~query:"ocaml bluesky"
+    (fun outcome -> result := Some outcome);
+
+  (match !result with
+  | Some (Error (Error_types.Auth_error Error_types.Token_invalid)) -> ()
+  | Some (Error err) ->
+      failwith ("Expected search posts Auth_error Token_invalid, got: " ^ Error_types.error_to_string err)
+  | Some (Ok _) -> failwith "Expected search posts unauthorized failure"
+  | None -> failwith "search_posts did not complete");
+  force_read_unauthorized := false;
+  print_endline "    ✓ Search posts unauthorized auth mapping test passed"
+
 (** Run all tests *)
 let () =
   print_endline "";
@@ -934,6 +4044,113 @@ let () =
   print_endline "";
   print_endline "Running link card tests...";
   test_link_card_fetching ();
+
+  print_endline "";
+  print_endline "Running read API tests...";
+  test_get_profile_actor_query_encoding ();
+  test_get_post_thread_uri_query_encoding ();
+  test_get_timeline_without_optional_params ();
+  test_get_timeline_limit_cursor_query ();
+  test_get_timeline_success_schema ();
+  test_get_timeline_api_error_mapping ();
+  test_get_timeline_invalid_json_maps_internal_error ();
+  test_get_timeline_network_error_no_retry ();
+  test_get_timeline_unauthorized_maps_auth_error ();
+  test_get_timeline_schema_missing_fields_surface_to_caller ();
+  test_get_timeline_schema_wrong_types_surface_to_caller ();
+  test_get_author_feed_limit_cursor_query ();
+  test_get_author_feed_without_optional_params ();
+  test_get_author_feed_api_error_mapping ();
+  test_get_author_feed_invalid_json_maps_internal_error ();
+  test_get_author_feed_network_error_no_retry ();
+  test_get_author_feed_unauthorized_maps_auth_error ();
+  test_get_author_feed_schema_missing_fields_surface_to_caller ();
+  test_get_author_feed_success_schema ();
+  test_get_author_feed_schema_wrong_types_surface_to_caller ();
+  test_get_likes_limit_cursor_query ();
+  test_get_likes_without_optional_params ();
+  test_get_likes_api_error_mapping ();
+  test_get_likes_invalid_json_maps_internal_error ();
+  test_get_likes_network_error_no_retry ();
+  test_get_likes_unauthorized_maps_auth_error ();
+  test_get_likes_schema_missing_fields_surface_to_caller ();
+  test_get_likes_success_schema ();
+  test_get_likes_schema_wrong_types_surface_to_caller ();
+  test_get_reposted_by_limit_cursor_query ();
+  test_get_reposted_by_without_optional_params ();
+  test_get_reposted_by_api_error_mapping ();
+  test_get_reposted_by_invalid_json_maps_internal_error ();
+  test_get_reposted_by_network_error_no_retry ();
+  test_get_reposted_by_unauthorized_maps_auth_error ();
+  test_get_reposted_by_schema_missing_fields_surface_to_caller ();
+  test_get_reposted_by_success_schema ();
+  test_get_reposted_by_schema_wrong_types_surface_to_caller ();
+  test_get_followers_limit_cursor_query ();
+  test_get_followers_without_optional_params ();
+  test_get_followers_rate_limit_mapping ();
+  test_get_followers_invalid_json_maps_internal_error ();
+  test_get_followers_network_error_no_retry ();
+  test_get_followers_unauthorized_maps_auth_error ();
+  test_get_followers_schema_missing_fields_surface_to_caller ();
+  test_get_followers_success_schema ();
+  test_get_followers_schema_wrong_types_surface_to_caller ();
+  test_get_follows_limit_cursor_query ();
+  test_get_follows_without_optional_params ();
+  test_get_follows_api_error_mapping ();
+  test_get_follows_invalid_json_maps_internal_error ();
+  test_get_follows_network_error_no_retry ();
+  test_get_follows_unauthorized_maps_auth_error ();
+  test_get_follows_schema_missing_fields_surface_to_caller ();
+  test_get_follows_success_schema ();
+  test_get_follows_schema_wrong_types_surface_to_caller ();
+  test_list_notifications_limit_cursor_query ();
+  test_list_notifications_without_optional_params ();
+  test_search_actors_query_limit_cursor ();
+  test_search_actors_without_optional_params ();
+  test_search_actors_api_error_mapping ();
+  test_search_actors_network_error_no_retry ();
+  test_search_actors_invalid_json_maps_internal_error ();
+  test_search_actors_unauthorized_maps_auth_error ();
+  test_search_actors_success_schema ();
+  test_search_actors_schema_missing_fields_surface_to_caller ();
+  test_search_actors_schema_wrong_types_surface_to_caller ();
+  test_search_posts_query_limit_cursor ();
+  test_search_posts_without_optional_params ();
+  test_search_posts_api_error_mapping ();
+  test_search_posts_success_schema ();
+  test_search_posts_invalid_json_maps_internal_error ();
+  test_search_posts_network_error_no_retry ();
+  test_search_posts_schema_missing_fields_surface_to_caller ();
+  test_search_posts_schema_wrong_types_surface_to_caller ();
+  test_search_posts_unauthorized_maps_auth_error ();
+  test_count_unread_notifications_endpoint ();
+  test_get_profile_unauthorized_maps_auth_error ();
+  test_get_profile_api_error_mapping ();
+  test_get_profile_success_schema ();
+  test_get_profile_invalid_json_maps_internal_error ();
+  test_get_profile_network_error_no_retry ();
+  test_get_profile_schema_missing_fields_surface_to_caller ();
+  test_get_profile_schema_wrong_types_surface_to_caller ();
+  test_get_post_thread_network_error_mapping ();
+  test_get_post_thread_success_schema ();
+  test_get_post_thread_api_error_mapping ();
+  test_get_post_thread_unauthorized_maps_auth_error ();
+  test_get_post_thread_invalid_json_maps_internal_error ();
+  test_get_post_thread_schema_missing_fields_surface_to_caller ();
+  test_get_post_thread_schema_wrong_type_surface_to_caller ();
+  test_list_notifications_rate_limit_mapping ();
+  test_list_notifications_success_schema ();
+  test_list_notifications_invalid_json_maps_internal_error ();
+  test_list_notifications_network_error_no_retry ();
+  test_list_notifications_schema_missing_fields_surface_to_caller ();
+  test_list_notifications_schema_wrong_types_surface_to_caller ();
+  test_list_notifications_unauthorized_maps_auth_error ();
+  test_count_unread_notifications_api_error_mapping ();
+  test_count_unread_notifications_missing_count_maps_internal_error ();
+  test_count_unread_notifications_network_error_no_retry ();
+  test_count_unread_notifications_parse_error_mapping ();
+  test_count_unread_notifications_wrong_type_maps_internal_error ();
+  test_count_unread_notifications_unauthorized_maps_auth_error ();
   
   print_endline "";
   print_endline "Running video upload tests...";
@@ -941,6 +4158,23 @@ let () =
   test_video_validation_too_large ();
   test_video_validation_too_long ();
   test_video_at_limits ();
+  test_video_embed_on_single_post ();
+  test_video_embed_on_quote_post ();
+  test_mixed_video_image_rejected_single_post ();
+  test_multiple_videos_rejected_single_post ();
+  test_mixed_video_image_rejected_quote_post ();
+  test_multiple_videos_rejected_quote_post ();
+  test_video_upload_job_polling_path ();
+  test_video_upload_fallback_to_blob_path ();
+  test_video_upload_bad_request_unsupported_fallback_to_blob_path ();
+  test_video_upload_bad_request_underscore_unsupported_fallback_to_blob_path ();
+  test_video_upload_rejected_no_fallback ();
+  test_video_upload_network_error_no_fallback ();
+  test_video_upload_network_error_retry_then_success ();
+  test_video_job_failed_state_errors ();
+  test_video_job_complete_without_blob_errors ();
+  test_video_job_status_transient_retry_succeeds ();
+  test_video_job_status_bad_request_no_retry ();
   test_video_mime_types ();
   test_video_upload_structure ();
   test_gif_validation ();
@@ -957,6 +4191,7 @@ let () =
   print_endline "  - Alt-text (6 tests)";
   print_endline "  - Error handling (1 test)";
   print_endline "  - Link cards (1 test - skipped)";
-  print_endline "  - Video upload (7 tests)";
+  print_endline "  - Read API query + error mapping (104 tests)";
+  print_endline "  - Video upload (22 tests)";
   print_endline "";
-  print_endline "Total: 23 test functions";
+  print_endline "Total: 144 test functions";

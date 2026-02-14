@@ -1,15 +1,15 @@
 (** Bluesky AT Protocol v1 Provider
-    
+
     This implementation uses app password authentication and creates sessions
-    for each API call. No OAuth refresh tokens needed.
+    for each API call.
 *)
 
 open Social_core
 
 (** Authentication module for Bluesky
-    
-    IMPORTANT: Bluesky does NOT use OAuth. Instead, it uses app passwords
-    with the AT Protocol's session management.
+
+    IMPORTANT: this provider implementation does not use OAuth. It uses app
+    passwords with the AT Protocol's session management.
     
     Authentication flow:
     1. User creates an app password at https://bsky.app/settings/app-passwords
@@ -22,7 +22,7 @@ open Social_core
 module Auth = struct
   (** Platform metadata for Bluesky authentication *)
   module Metadata = struct
-    (** Bluesky does NOT use OAuth *)
+    (** This provider implementation does not use OAuth *)
     let uses_oauth = false
     
     (** Bluesky uses app passwords for authentication *)
@@ -279,6 +279,18 @@ module Make (Config : CONFIG) = struct
   
   (** Parse API error from response *)
   let parse_api_error ~status_code ~body =
+    let parse_error_message () =
+      try
+        let json = Yojson.Basic.from_string body in
+        let open Yojson.Basic.Util in
+        let msg = json |> member "message" in
+        if msg <> `Null then to_string msg
+        else
+          let err = json |> member "error" in
+          if err <> `Null then to_string err
+          else "API error"
+      with _ -> "API error"
+    in
     if status_code = 401 then
       Error_types.Auth_error Error_types.Token_invalid
     else if status_code = 429 then
@@ -287,11 +299,26 @@ module Make (Config : CONFIG) = struct
       Error_types.make_api_error
         ~platform:Platform_types.Bluesky
         ~status_code
-        ~message:(try
-          let json = Yojson.Basic.from_string body in
-          json |> Yojson.Basic.Util.member "message" |> Yojson.Basic.Util.to_string
-        with _ -> "API error")
+        ~message:(parse_error_message ())
         ~raw_response:body ()
+
+  let parse_json_object_or_error ~context ~body =
+    try
+      let json = Yojson.Basic.from_string body in
+      match json with
+      | `Assoc _ -> Ok json
+      | _ -> Error (Error_types.Internal_error (Printf.sprintf "%s: expected JSON object" context))
+    with e ->
+      Error (Error_types.Internal_error
+        (Printf.sprintf "%s: %s" context (Printexc.to_string e)))
+
+  let ensure_array_field ~json ~field ~context =
+    try
+      let _ = json |> Yojson.Basic.Util.member field |> Yojson.Basic.Util.to_list in
+      Ok ()
+    with e ->
+      Error (Error_types.Internal_error
+        (Printf.sprintf "%s: %s" context (Printexc.to_string e)))
   
   (** Resolve handle to DID *)
   let resolve_handle ~handle on_result =
@@ -434,26 +461,156 @@ module Make (Config : CONFIG) = struct
   
   (** Upload blob to Bluesky with optional alt text *)
   let upload_blob ~access_jwt ~blob_data ~mime_type ~alt_text on_success on_error =
-    let url = Printf.sprintf "%s/xrpc/com.atproto.repo.uploadBlob" pds_url in
     let headers = [
       ("Authorization", Printf.sprintf "Bearer %s" access_jwt);
       ("Content-Type", mime_type);
     ] in
-    
-    Config.Http.post ~headers ~body:blob_data url
-      (fun response ->
-        if response.status >= 200 && response.status < 300 then
-          try
-            let open Yojson.Basic.Util in
-            let json = Yojson.Basic.from_string response.body in
-            let blob = json |> member "blob" in
-            (* Return blob with alt text *)
-            on_success (blob, alt_text)
-          with e ->
-            on_error (Printf.sprintf "Failed to parse blob response: %s" (Printexc.to_string e))
-        else
-          on_error (Printf.sprintf "Bluesky blob upload error (%d): %s" response.status response.body))
-      on_error
+    let is_video = String.starts_with ~prefix:"video/" mime_type in
+    let non_null json key =
+      let open Yojson.Basic.Util in
+      let v = json |> member key in
+      if v = `Null then None else Some v
+    in
+    let parse_blob_from_json json =
+      match non_null json "blob" with
+      | Some blob -> Some blob
+      | None ->
+          (match non_null json "jobStatus" with
+           | Some job_status -> non_null job_status "blob"
+           | None -> None)
+    in
+    let parse_string_field json key =
+      let open Yojson.Basic.Util in
+      match non_null json key with
+      | Some v ->
+          (try Some (to_string v) with _ -> None)
+      | None -> None
+    in
+    let parse_job_id json =
+      match parse_string_field json "jobId" with
+      | Some id -> Some id
+      | None ->
+          (match non_null json "jobStatus" with
+           | Some job_status -> parse_string_field job_status "jobId"
+           | None -> None)
+    in
+    let parse_job_state json =
+      match parse_string_field json "state" with
+      | Some state -> Some state
+      | None ->
+          (match non_null json "jobStatus" with
+           | Some job_status -> parse_string_field job_status "state"
+           | None -> None)
+    in
+    let upload_via_blob () =
+      let url = Printf.sprintf "%s/xrpc/com.atproto.repo.uploadBlob" pds_url in
+      Config.Http.post ~headers ~body:blob_data url
+        (fun response ->
+          if response.status >= 200 && response.status < 300 then
+            try
+              let json = Yojson.Basic.from_string response.body in
+              match parse_blob_from_json json with
+              | Some blob -> on_success (blob, alt_text)
+              | None -> on_error "Blob upload response missing blob field"
+            with e ->
+              on_error (Printf.sprintf "Failed to parse blob response: %s" (Printexc.to_string e))
+          else
+            on_error (Printf.sprintf "Bluesky blob upload error (%d): %s" response.status response.body))
+        on_error
+    in
+    let rec poll_video_job job_id attempts_left =
+      if attempts_left <= 0 then
+        on_error (Printf.sprintf "Video processing timeout waiting for job %s" job_id)
+      else
+        let status_url = Printf.sprintf "%s/xrpc/app.bsky.video.getJobStatus?jobId=%s"
+          pds_url (Uri.pct_encode job_id) in
+        let should_retry_status status_code =
+          status_code = 429 || status_code >= 500
+        in
+        Config.Http.get ~headers:[("Authorization", Printf.sprintf "Bearer %s" access_jwt)] status_url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                match parse_blob_from_json json with
+                | Some blob -> on_success (blob, alt_text)
+                | None ->
+                    let state = parse_job_state json |> Option.value ~default:"UNKNOWN" in
+                    let upper = String.uppercase_ascii state in
+                    let rec contains token i =
+                      let token_len = String.length token in
+                      if i + token_len > String.length upper then false
+                      else if String.sub upper i token_len = token then true
+                      else contains token (i + 1)
+                    in
+                    if contains "FAIL" 0 || contains "ERROR" 0 || contains "CANCEL" 0 then
+                      on_error (Printf.sprintf "Video processing failed (state=%s)" state)
+                    else if contains "COMPLETE" 0 || contains "DONE" 0 then
+                      on_error (Printf.sprintf "Video processing completed without blob (state=%s)" state)
+                    else
+                      poll_video_job job_id (attempts_left - 1)
+              with e ->
+                on_error (Printf.sprintf "Failed to parse video job status: %s" (Printexc.to_string e))
+            else
+              if should_retry_status response.status then
+                poll_video_job job_id (attempts_left - 1)
+              else
+                on_error (Printf.sprintf "Video job status failed (%d): %s" response.status response.body))
+          (fun _ -> poll_video_job job_id (attempts_left - 1))
+    in
+    let should_fallback_from_video_endpoint status_code response_body =
+      let upper_body = String.uppercase_ascii response_body in
+      let contains token =
+        let token_len = String.length token in
+        let rec loop i =
+          if i + token_len > String.length upper_body then false
+          else if String.sub upper_body i token_len = token then true
+          else loop (i + 1)
+        in
+        loop 0
+      in
+      let method_unavailable_error =
+        status_code = 400
+        && (contains "METHODNOTFOUND"
+            || contains "METHOD_NOT_FOUND"
+            || contains "METHOD NOT FOUND"
+            || contains "UNKNOWNMETHOD"
+            || contains "NOTIMPLEMENTED")
+      in
+      status_code = 404
+      || status_code = 405
+      || status_code = 501
+      || method_unavailable_error
+    in
+    let rec upload_via_video attempts_left =
+      let video_url = Printf.sprintf "%s/xrpc/app.bsky.video.uploadVideo" pds_url in
+      Config.Http.post ~headers ~body:blob_data video_url
+        (fun response ->
+          if response.status >= 200 && response.status < 300 then
+            try
+              let json = Yojson.Basic.from_string response.body in
+              match parse_blob_from_json json with
+              | Some blob -> on_success (blob, alt_text)
+              | None ->
+                  (match parse_job_id json with
+                   | Some job_id -> poll_video_job job_id 5
+                   | None -> on_error "Video upload response missing both blob and jobId")
+            with e -> on_error (Printf.sprintf "Failed to parse video upload response: %s" (Printexc.to_string e))
+          else
+            if should_fallback_from_video_endpoint response.status response.body then
+              upload_via_blob ()
+            else
+              on_error (Printf.sprintf "Video upload failed (%d): %s" response.status response.body))
+        (fun err ->
+          if attempts_left > 1 then
+            upload_via_video (attempts_left - 1)
+          else
+            on_error (Printf.sprintf "Video upload network error: %s" err))
+    in
+    if is_video then
+      upload_via_video 2
+    else
+      upload_via_blob ()
   
   (** Extract OpenGraph meta tag content from HTML *)
   let extract_og_tag html property =
@@ -701,7 +858,9 @@ module Make (Config : CONFIG) = struct
                             | Ok () ->
                                 (* Upload blob with alt text *)
                                 upload_blob ~access_jwt ~blob_data:media_resp.body ~mime_type ~alt_text
-                                  (fun (blob, alt) -> upload_blobs_seq rest ((blob, alt) :: acc) on_complete on_err)
+                                  (fun (blob, alt) ->
+                                    let media_type = media_type_of_mime mime_type in
+                                    upload_blobs_seq rest ((blob, alt, media_type) :: acc) on_complete on_err)
                                   (fun err -> on_err (Error_types.Internal_error err)))
                           else
                             on_err (Error_types.make_api_error
@@ -755,8 +914,42 @@ module Make (Config : CONFIG) = struct
                     (* Add embed based on content *)
                     let post_record_cont =
                       if List.length blobs > 0 then
-                        (* Images present - skip link card *)
-                        let images_json = `List (List.map (fun (blob, alt_text_opt) ->
+                        let video_blobs = List.filter (fun (_, _, mt) -> mt = Platform_types.Video) blobs in
+                        let non_video_blobs = List.filter (fun (_, _, mt) -> mt <> Platform_types.Video) blobs in
+                        if List.length video_blobs > 1 then
+                          fun _ ->
+                            on_result (Error_types.Failure (Error_types.Validation_error [
+                              Error_types.Too_many_media { count = List.length video_blobs; max = 1 }
+                            ]))
+                        else if List.length video_blobs > 0 && List.length non_video_blobs > 0 then
+                          fun _ ->
+                            on_result (Error_types.Failure (Error_types.Validation_error [
+                              Error_types.Media_unsupported_format
+                                "Mixing video and image embeds in one Bluesky post is not supported by this provider"
+                            ]))
+                        else if List.length video_blobs = 1 then
+                          let (video_blob, alt_text_opt, _) = List.hd video_blobs in
+                          let video_fields =
+                            match alt_text_opt with
+                            | Some alt when String.length alt > 0 ->
+                                [
+                                  ("$type", `String "app.bsky.embed.video");
+                                  ("video", video_blob);
+                                  ("alt", `String alt);
+                                ]
+                            | _ ->
+                                [
+                                  ("$type", `String "app.bsky.embed.video");
+                                  ("video", video_blob);
+                                ]
+                          in
+                          fun on_rec_success ->
+                            on_rec_success (`Assoc (base_with_reply @ [
+                              ("embed", `Assoc video_fields)
+                            ]))
+                        else
+                          (* Images present - skip link card *)
+                          let images_json = `List (List.map (fun (blob, alt_text_opt, _) ->
                           let alt_text = match alt_text_opt with
                             | Some alt when String.length alt > 0 -> alt
                             | _ -> ""
@@ -765,14 +958,14 @@ module Make (Config : CONFIG) = struct
                             ("alt", `String alt_text);
                             ("image", blob);
                           ]
-                        ) blobs) in
-                        fun on_rec_success ->
-                          on_rec_success (`Assoc (base_with_reply @ [
-                            ("embed", `Assoc [
-                              ("$type", `String "app.bsky.embed.images");
-                              ("images", images_json);
-                            ])
-                          ]))
+                          ) non_video_blobs) in
+                          fun on_rec_success ->
+                            on_rec_success (`Assoc (base_with_reply @ [
+                              ("embed", `Assoc [
+                                ("$type", `String "app.bsky.embed.images");
+                                ("images", images_json);
+                              ])
+                            ]))
                       else if skip_enrichments then
                         (* Skip link card extraction *)
                         fun on_rec_success -> on_rec_success (`Assoc base_with_reply)
@@ -1271,12 +1464,16 @@ module Make (Config : CONFIG) = struct
         Config.Http.get ~headers url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              try
-                let json = Yojson.Basic.from_string response.body in
-                on_result (Ok json)
-              with e ->
-                on_result (Error (Error_types.Internal_error 
-                  (Printf.sprintf "Failed to parse profile: %s" (Printexc.to_string e))))
+              match parse_json_object_or_error ~context:"Failed to parse profile" ~body:response.body with
+              | Ok json ->
+                  (try
+                     let _ = json |> Yojson.Basic.Util.member "did" |> Yojson.Basic.Util.to_string in
+                     let _ = json |> Yojson.Basic.Util.member "handle" |> Yojson.Basic.Util.to_string in
+                     on_result (Ok json)
+                   with e ->
+                     on_result (Error (Error_types.Internal_error
+                       (Printf.sprintf "Failed to parse profile: %s" (Printexc.to_string e)))))
+              | Error err -> on_result (Error err)
             else
               on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
@@ -1295,12 +1492,20 @@ module Make (Config : CONFIG) = struct
         Config.Http.get ~headers url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              try
-                let json = Yojson.Basic.from_string response.body in
-                on_result (Ok json)
-              with e ->
-                on_result (Error (Error_types.Internal_error 
-                  (Printf.sprintf "Failed to parse thread: %s" (Printexc.to_string e))))
+              match parse_json_object_or_error ~context:"Failed to parse thread" ~body:response.body with
+              | Ok json ->
+                  (try
+                     let _ =
+                       json
+                       |> Yojson.Basic.Util.member "thread"
+                       |> Yojson.Basic.Util.member "$type"
+                       |> Yojson.Basic.Util.to_string
+                     in
+                     on_result (Ok json)
+                   with e ->
+                     on_result (Error (Error_types.Internal_error
+                       (Printf.sprintf "Failed to parse thread: %s" (Printexc.to_string e)))))
+              | Error err -> on_result (Error err)
             else
               on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
@@ -1309,25 +1514,36 @@ module Make (Config : CONFIG) = struct
       (fun err -> on_result (Error err))
   
   (** Get timeline *)
-  let get_timeline ~account_id ?limit on_result =
+  let get_timeline ~account_id ?limit ?cursor on_result =
     ensure_valid_token ~account_id
       (fun access_jwt ->
-        let limit_param = match limit with
-          | Some l -> Printf.sprintf "?limit=%d" l
-          | None -> ""
+        let params = [] in
+        let params = match limit with
+          | Some l -> ("limit", string_of_int l) :: params
+          | None -> params
         in
-        let url = Printf.sprintf "%s/xrpc/app.bsky.feed.getTimeline%s" pds_url limit_param in
+        let params = match cursor with
+          | Some c -> ("cursor", c) :: params
+          | None -> params
+        in
+        let query_string =
+          if params = [] then ""
+          else
+            "?" ^ (String.concat "&" (List.map (fun (k, v) ->
+              Printf.sprintf "%s=%s" k (Uri.pct_encode v)) params))
+        in
+        let url = Printf.sprintf "%s/xrpc/app.bsky.feed.getTimeline%s" pds_url query_string in
         let headers = [("Authorization", Printf.sprintf "Bearer %s" access_jwt)] in
         
         Config.Http.get ~headers url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              try
-                let json = Yojson.Basic.from_string response.body in
-                on_result (Ok json)
-              with e ->
-                on_result (Error (Error_types.Internal_error 
-                  (Printf.sprintf "Failed to parse timeline: %s" (Printexc.to_string e))))
+              match parse_json_object_or_error ~context:"Failed to parse timeline" ~body:response.body with
+              | Ok json ->
+                  (match ensure_array_field ~json ~field:"feed" ~context:"Failed to parse timeline" with
+                   | Ok () -> on_result (Ok json)
+                   | Error err -> on_result (Error err))
+              | Error err -> on_result (Error err)
             else
               on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
@@ -1369,7 +1585,13 @@ module Make (Config : CONFIG) = struct
                             in
                             (* Upload with alt text *)
                             upload_blob ~access_jwt ~blob_data:media_resp.body ~mime_type ~alt_text
-                              (fun (blob, alt) -> upload_blobs_seq rest ((blob, alt) :: acc) on_complete on_err)
+                              (fun (blob, alt) ->
+                                let media_type =
+                                  if String.starts_with ~prefix:"video/" mime_type then Platform_types.Video
+                                  else if mime_type = "image/gif" then Platform_types.Gif
+                                  else Platform_types.Image
+                                in
+                                upload_blobs_seq rest ((blob, alt, media_type) :: acc) on_complete on_err)
                               (fun err -> on_err (Error_types.Internal_error err))
                           else
                             on_err (Error_types.make_api_error
@@ -1382,6 +1604,18 @@ module Make (Config : CONFIG) = struct
                 let media_to_upload = List.filteri (fun i _ -> i < 4) urls_with_alt in
                 upload_blobs_seq media_to_upload []
                   (fun blobs ->
+                    let video_count = List.length (List.filter (fun (_, _, mt) -> mt = Platform_types.Video) blobs) in
+                    let non_video_count = List.length (List.filter (fun (_, _, mt) -> mt <> Platform_types.Video) blobs) in
+                    if video_count > 1 then
+                      on_result (Error_types.Failure (Error_types.Validation_error [
+                        Error_types.Too_many_media { count = video_count; max = 1 }
+                      ]))
+                    else if video_count > 0 && non_video_count > 0 then
+                      on_result (Error_types.Failure (Error_types.Validation_error [
+                        Error_types.Media_unsupported_format
+                          "Mixing video and image embeds in one quoted Bluesky post is not supported by this provider"
+                      ]))
+                    else
                     extract_facets text
                       (fun facets ->
                         let now = Ptime.to_rfc3339 ~frac_s:6 ~tz_offset_s:0 (Ptime_clock.now ()) in
@@ -1409,18 +1643,44 @@ module Make (Config : CONFIG) = struct
                         ] in
                         
                         (* If we have media, use recordWithMedia *)
-                        let final_record = 
+                         let final_record = 
                           if List.length blobs > 0 then
-                            let images_json = `List (List.map (fun (blob, alt_text_opt) ->
-                              let alt_text = match alt_text_opt with
-                                | Some alt when String.length alt > 0 -> alt
-                                | _ -> ""
-                              in
-                              `Assoc [
-                                ("alt", `String alt_text);
-                                ("image", blob);
-                              ]
-                            ) blobs) in
+                            let video_blobs = List.filter (fun (_, _, mt) -> mt = Platform_types.Video) blobs in
+                            let non_video_blobs = List.filter (fun (_, _, mt) -> mt <> Platform_types.Video) blobs in
+                            let media_embed =
+                              if List.length video_blobs = 1 && List.length non_video_blobs = 0 then
+                                let (video_blob, alt_text_opt, _) = List.hd video_blobs in
+                                let video_fields =
+                                  match alt_text_opt with
+                                  | Some alt when String.length alt > 0 ->
+                                      [
+                                        ("$type", `String "app.bsky.embed.video");
+                                        ("video", video_blob);
+                                        ("alt", `String alt);
+                                      ]
+                                  | _ ->
+                                      [
+                                        ("$type", `String "app.bsky.embed.video");
+                                        ("video", video_blob);
+                                      ]
+                                in
+                                `Assoc video_fields
+                              else
+                                let images_json = `List (List.map (fun (blob, alt_text_opt, _) ->
+                                  let alt_text = match alt_text_opt with
+                                    | Some alt when String.length alt > 0 -> alt
+                                    | _ -> ""
+                                  in
+                                  `Assoc [
+                                    ("alt", `String alt_text);
+                                    ("image", blob);
+                                  ]
+                                ) non_video_blobs) in
+                                `Assoc [
+                                  ("$type", `String "app.bsky.embed.images");
+                                  ("images", images_json);
+                                ]
+                            in
                             base_with_facets @ [
                               ("embed", `Assoc [
                                 ("$type", `String "app.bsky.embed.recordWithMedia");
@@ -1431,10 +1691,7 @@ module Make (Config : CONFIG) = struct
                                     ("cid", `String post_cid);
                                   ]);
                                 ]);
-                                ("media", `Assoc [
-                                  ("$type", `String "app.bsky.embed.images");
-                                  ("images", images_json);
-                                ]);
+                                ("media", media_embed);
                               ])
                             ]
                           else
@@ -1504,12 +1761,12 @@ module Make (Config : CONFIG) = struct
         Config.Http.get ~headers url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              try
-                let json = Yojson.Basic.from_string response.body in
-                on_result (Ok json)
-              with e ->
-                on_result (Error (Error_types.Internal_error 
-                  (Printf.sprintf "Failed to parse notifications: %s" (Printexc.to_string e))))
+              match parse_json_object_or_error ~context:"Failed to parse notifications" ~body:response.body with
+              | Ok json ->
+                  (match ensure_array_field ~json ~field:"notifications" ~context:"Failed to parse notifications" with
+                   | Ok () -> on_result (Ok json)
+                   | Error err -> on_result (Error err))
+              | Error err -> on_result (Error err)
             else
               on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
@@ -1591,12 +1848,12 @@ module Make (Config : CONFIG) = struct
         Config.Http.get ~headers url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              try
-                let json = Yojson.Basic.from_string response.body in
-                on_result (Ok json)
-              with e ->
-                on_result (Error (Error_types.Internal_error 
-                  (Printf.sprintf "Failed to parse search results: %s" (Printexc.to_string e))))
+              match parse_json_object_or_error ~context:"Failed to parse search results" ~body:response.body with
+              | Ok json ->
+                  (match ensure_array_field ~json ~field:"actors" ~context:"Failed to parse search results" with
+                   | Ok () -> on_result (Ok json)
+                   | Error err -> on_result (Error err))
+              | Error err -> on_result (Error err)
             else
               on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
@@ -1626,12 +1883,12 @@ module Make (Config : CONFIG) = struct
         Config.Http.get ~headers url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              try
-                let json = Yojson.Basic.from_string response.body in
-                on_result (Ok json)
-              with e ->
-                on_result (Error (Error_types.Internal_error 
-                  (Printf.sprintf "Failed to parse search results: %s" (Printexc.to_string e))))
+              match parse_json_object_or_error ~context:"Failed to parse search results" ~body:response.body with
+              | Ok json ->
+                  (match ensure_array_field ~json ~field:"posts" ~context:"Failed to parse search results" with
+                   | Ok () -> on_result (Ok json)
+                   | Error err -> on_result (Error err))
+              | Error err -> on_result (Error err)
             else
               on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
@@ -1792,12 +2049,12 @@ module Make (Config : CONFIG) = struct
         Config.Http.get ~headers url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              try
-                let json = Yojson.Basic.from_string response.body in
-                on_result (Ok json)
-              with e ->
-                on_result (Error (Error_types.Internal_error 
-                  (Printf.sprintf "Failed to parse author feed: %s" (Printexc.to_string e))))
+              match parse_json_object_or_error ~context:"Failed to parse author feed" ~body:response.body with
+              | Ok json ->
+                  (match ensure_array_field ~json ~field:"feed" ~context:"Failed to parse author feed" with
+                   | Ok () -> on_result (Ok json)
+                   | Error err -> on_result (Error err))
+              | Error err -> on_result (Error err)
             else
               on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
@@ -1827,12 +2084,12 @@ module Make (Config : CONFIG) = struct
         Config.Http.get ~headers url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              try
-                let json = Yojson.Basic.from_string response.body in
-                on_result (Ok json)
-              with e ->
-                on_result (Error (Error_types.Internal_error 
-                  (Printf.sprintf "Failed to parse likes: %s" (Printexc.to_string e))))
+              match parse_json_object_or_error ~context:"Failed to parse likes" ~body:response.body with
+              | Ok json ->
+                  (match ensure_array_field ~json ~field:"likes" ~context:"Failed to parse likes" with
+                   | Ok () -> on_result (Ok json)
+                   | Error err -> on_result (Error err))
+              | Error err -> on_result (Error err)
             else
               on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
@@ -1862,12 +2119,12 @@ module Make (Config : CONFIG) = struct
         Config.Http.get ~headers url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              try
-                let json = Yojson.Basic.from_string response.body in
-                on_result (Ok json)
-              with e ->
-                on_result (Error (Error_types.Internal_error 
-                  (Printf.sprintf "Failed to parse reposts: %s" (Printexc.to_string e))))
+              match parse_json_object_or_error ~context:"Failed to parse reposts" ~body:response.body with
+              | Ok json ->
+                  (match ensure_array_field ~json ~field:"repostedBy" ~context:"Failed to parse reposts" with
+                   | Ok () -> on_result (Ok json)
+                   | Error err -> on_result (Error err))
+              | Error err -> on_result (Error err)
             else
               on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
@@ -1897,12 +2154,12 @@ module Make (Config : CONFIG) = struct
         Config.Http.get ~headers url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              try
-                let json = Yojson.Basic.from_string response.body in
-                on_result (Ok json)
-              with e ->
-                on_result (Error (Error_types.Internal_error 
-                  (Printf.sprintf "Failed to parse followers: %s" (Printexc.to_string e))))
+              match parse_json_object_or_error ~context:"Failed to parse followers" ~body:response.body with
+              | Ok json ->
+                  (match ensure_array_field ~json ~field:"followers" ~context:"Failed to parse followers" with
+                   | Ok () -> on_result (Ok json)
+                   | Error err -> on_result (Error err))
+              | Error err -> on_result (Error err)
             else
               on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
@@ -1932,12 +2189,12 @@ module Make (Config : CONFIG) = struct
         Config.Http.get ~headers url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              try
-                let json = Yojson.Basic.from_string response.body in
-                on_result (Ok json)
-              with e ->
-                on_result (Error (Error_types.Internal_error 
-                  (Printf.sprintf "Failed to parse follows: %s" (Printexc.to_string e))))
+              match parse_json_object_or_error ~context:"Failed to parse follows" ~body:response.body with
+              | Ok json ->
+                  (match ensure_array_field ~json ~field:"follows" ~context:"Failed to parse follows" with
+                   | Ok () -> on_result (Ok json)
+                   | Error err -> on_result (Error err))
+              | Error err -> on_result (Error err)
             else
               on_result (Error (parse_api_error 
                 ~status_code:response.status ~body:response.body)))
@@ -1945,4 +2202,3 @@ module Make (Config : CONFIG) = struct
             (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
 end
-

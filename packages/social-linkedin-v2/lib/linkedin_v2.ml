@@ -172,12 +172,27 @@ module OAuth = struct
         ("client_id", [client_id]);
         ("client_secret", [client_secret]);
       ] in
-      let body = Uri.encoded_of_query params in
-      let headers = [
-        ("Content-Type", "application/x-www-form-urlencoded");
-      ] in
-      
-      Http.post ~headers ~body Metadata.token_endpoint
+      let query_string = Uri.encoded_of_query params in
+      let url = Printf.sprintf "%s?%s" Metadata.token_endpoint query_string in
+
+      let parse_error body =
+        try
+          let json = Yojson.Basic.from_string body in
+          let open Yojson.Basic.Util in
+          let error = json |> member "error" |> to_string_option in
+          let error_desc = json |> member "error_description" |> to_string_option in
+          let error_msg =
+            match error, error_desc with
+            | Some err, Some desc -> Printf.sprintf "%s: %s" err desc
+            | Some err, None -> err
+            | None, _ -> body
+          in
+          (error, error_msg)
+        with _ ->
+          (None, body)
+      in
+
+      Http.post ~headers:[] ~body:"" url
         (fun response ->
           if response.status >= 200 && response.status < 300 then
             try
@@ -213,18 +228,7 @@ module OAuth = struct
             with e ->
               on_error (Printf.sprintf "Failed to parse token response: %s" (Printexc.to_string e))
           else
-            (* Parse error response *)
-            let error_msg = 
-              try
-                let json = Yojson.Basic.from_string response.body in
-                let open Yojson.Basic.Util in
-                let error = json |> member "error" |> to_string_option |> Option.value ~default:"unknown" in
-                let error_desc = json |> member "error_description" |> to_string_option in
-                match error_desc with
-                | Some desc -> Printf.sprintf "%s: %s" error desc
-                | None -> error
-              with _ -> response.body
-            in
+            let _, error_msg = parse_error response.body in
             on_error (Printf.sprintf "LinkedIn OAuth exchange failed (%d): %s" response.status error_msg))
         on_error
     
@@ -1477,12 +1481,27 @@ module Make (Config : CONFIG) = struct
         ("client_secret", [client_secret]);
       ] in
 
-      let body = Uri.encoded_of_query params in
-      let headers = [
-        ("Content-Type", "application/x-www-form-urlencoded");
-      ] in
+      let query_string = Uri.encoded_of_query params in
+      let url = Printf.sprintf "%s/accessToken?%s" linkedin_auth_url query_string in
 
-      Config.Http.post ~headers ~body (Printf.sprintf "%s/accessToken" linkedin_auth_url)
+      let parse_error body =
+        try
+          let json = Yojson.Basic.from_string body in
+          let open Yojson.Basic.Util in
+          let error = json |> member "error" |> to_string_option in
+          let error_desc = json |> member "error_description" |> to_string_option in
+          let error_msg =
+            match error, error_desc with
+            | Some err, Some desc -> Printf.sprintf "%s: %s" err desc
+            | Some err, None -> err
+            | None, _ -> body
+          in
+          (error, error_msg)
+        with _ ->
+          (None, body)
+      in
+
+      Config.Http.post ~headers:[] ~body:"" url
         (fun response ->
           if response.status >= 200 && response.status < 300 then
             try
@@ -1529,18 +1548,7 @@ module Make (Config : CONFIG) = struct
             with e ->
               on_error (Printf.sprintf "Failed to parse token response: %s" (Printexc.to_string e))
           else
-            (* Parse error response *)
-            let error_msg = 
-              try
-                let json = Yojson.Basic.from_string response.body in
-                let open Yojson.Basic.Util in
-                let error = json |> member "error" |> to_string_option |> Option.value ~default:"unknown" in
-                let error_desc = json |> member "error_description" |> to_string_option in
-                match error_desc with
-                | Some desc -> Printf.sprintf "%s: %s" error desc
-                | None -> error
-              with _ -> response.body
-            in
+            let _, error_msg = parse_error response.body in
             on_error (Printf.sprintf "LinkedIn OAuth exchange failed (%d): %s" response.status error_msg))
         on_error
     )

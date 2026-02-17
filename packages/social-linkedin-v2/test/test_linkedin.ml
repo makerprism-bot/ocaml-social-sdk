@@ -192,14 +192,45 @@ let test_token_exchange () =
       (match requests with
       | ("POST", url, headers, body) :: _ ->
           assert (string_contains url "/oauth/v2/accessToken");
-          assert (not (string_contains url "grant_type="));
-          assert (find_header headers "Content-Type" = Some "application/x-www-form-urlencoded");
-          assert (string_contains body "grant_type=authorization_code");
-          assert (string_contains body "code=test_code");
-          assert (string_contains body "redirect_uri=")
+          assert (string_contains url "grant_type=authorization_code");
+          assert (string_contains url "code=test_code");
+          assert (string_contains url "redirect_uri=");
+          assert (string_contains url "client_id=test_client");
+          assert (string_contains url "client_secret=test_secret");
+          assert (headers = []);
+          assert (body = "")
       | _ -> failwith "Expected OAuth token exchange POST request");
       print_endline "✓ Token exchange")
     (fun err -> failwith ("Token exchange failed: " ^ err))
+
+(** Test: Token exchange does not retry on non-invalid_client errors *)
+let test_token_exchange_non_invalid_client_no_retry () =
+  Mock_config.reset ();
+  Mock_config.set_env "LINKEDIN_CLIENT_ID" "test_client";
+  Mock_config.set_env "LINKEDIN_CLIENT_SECRET" "test_secret";
+
+  Mock_http.set_responses [
+    {
+      status = 400;
+      body = {|{"error":"invalid_grant","error_description":"Code was already used"}|};
+      headers = [];
+    };
+    {
+      status = 200;
+      body = {|{"access_token":"should_not_be_used","expires_in":5184000}|};
+      headers = [];
+    };
+  ];
+
+  LinkedIn.exchange_code
+    ~code:"test_code"
+    ~redirect_uri:"https://example.com/callback"
+    (fun _ -> failwith "Expected non-invalid_client response to fail without retry")
+    (fun err ->
+      assert (string_contains err "invalid_grant" || string_contains err "400");
+      let requests = !Mock_http.requests in
+      assert (List.length requests = 1);
+      print_endline "✓ Token exchange non-invalid_client error does not retry")
 
 (** Test: OAuth URL rejects state with surrounding whitespace *)
 let test_oauth_url_rejects_whitespace_state () =
@@ -5125,6 +5156,7 @@ let () =
   test_validate_oauth_state_whitespace_rejected ();
   test_oauth_scope_validation ();
   test_token_exchange ();
+  test_token_exchange_non_invalid_client_no_retry ();
   test_exchange_code_and_get_organizations ();
   test_exchange_code_and_get_organizations_filter_normalization ();
   test_exchange_code_and_get_preferred_organization ();

@@ -26,3 +26,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Structured error handling:
   - Posting operations use `outcome` type with Success/Partial_success/Failure
   - Non-posting operations use `api_result` type with Ok/Error
+- Added account analytics flow:
+  - `GET /v2/user/info`
+  - `POST /v2/video/list`
+  - `POST /v2/video/query`
+- Added post analytics API `get_post_analytics` via `POST /v2/video/query`
+- Added typed analytics records and canonical analytics conversion helpers
+- Added request-contract and parsing tests for analytics endpoints

@@ -489,6 +489,219 @@ module Make (Config : CONFIG) = struct
             (fun () -> on_success creds.access_token)
             (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
       (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
+
+  type analytics_totals = {
+    impression: int option;
+    pin_click: int option;
+    outbound_click: int option;
+    save: int option;
+  }
+
+  type account_analytics = {
+    start_date: string;
+    end_date: string;
+    totals: analytics_totals;
+    raw_json: Yojson.Basic.t;
+  }
+
+  type pin_analytics = {
+    pin_id: string;
+    start_date: string;
+    end_date: string;
+    totals: analytics_totals;
+    raw_json: Yojson.Basic.t;
+  }
+
+  let analytics_metric_names =
+    [ "IMPRESSION"; "PIN_CLICK"; "OUTBOUND_CLICK"; "SAVE" ]
+
+  let analytics_canonical_metric_keys =
+    Analytics_normalization.canonical_metric_keys_of_provider_metrics
+      ~provider:Analytics_normalization.Pinterest
+      analytics_metric_names
+
+  let int_of_json_opt json =
+    match json with
+    | `Int n -> Some n
+    | `Float f -> Some (int_of_float f)
+    | `String s -> (try Some (int_of_string s) with _ -> None)
+    | _ -> None
+
+  let first_item_opt json =
+    match Yojson.Basic.Util.member "items" json with
+    | `List (item :: _) -> Some item
+    | _ -> None
+
+  let extract_metric ~metric json =
+    let open Yojson.Basic.Util in
+    let lowered = String.lowercase_ascii metric in
+    let candidates =
+      json ::
+      [ member "all" json;
+        member "all_source_types" json;
+        member "summary" json;
+        member "summary_metrics" json ] @
+      (match first_item_opt json with Some item -> [item] | None -> [])
+    in
+    let rec loop = function
+      | [] -> None
+      | candidate :: rest ->
+          (match candidate with
+           | `Assoc _ ->
+               let metric_json =
+                 match member metric candidate with
+                 | `Null -> member lowered candidate
+                 | value -> value
+               in
+               (match int_of_json_opt metric_json with
+                | Some value -> Some value
+                | None -> loop rest)
+           | _ -> loop rest)
+    in
+    loop candidates
+
+  let parse_analytics_totals json =
+    {
+      impression = extract_metric ~metric:"IMPRESSION" json;
+      pin_click = extract_metric ~metric:"PIN_CLICK" json;
+      outbound_click = extract_metric ~metric:"OUTBOUND_CLICK" json;
+      save = extract_metric ~metric:"SAVE" json;
+    }
+
+  let to_canonical_optional_point value_opt =
+    match value_opt with
+    | Some value -> [ Analytics_types.make_datapoint value ]
+    | None -> []
+
+  let to_canonical_pinterest_series ?time_range ~scope ~provider_metric points =
+    match Analytics_normalization.pinterest_metric_to_canonical provider_metric with
+    | Some metric ->
+        Some
+          (Analytics_types.make_series
+             ?time_range
+             ~metric
+             ~scope
+             ~provider_metric
+             points)
+    | None -> None
+
+  let to_canonical_analytics_totals_series ?time_range ~scope totals =
+    [ ("IMPRESSION", to_canonical_optional_point totals.impression);
+      ("PIN_CLICK", to_canonical_optional_point totals.pin_click);
+      ("OUTBOUND_CLICK", to_canonical_optional_point totals.outbound_click);
+      ("SAVE", to_canonical_optional_point totals.save) ]
+    |> List.filter_map (fun (provider_metric, points) ->
+           to_canonical_pinterest_series
+             ?time_range
+             ~scope
+             ~provider_metric
+             points)
+
+  let to_canonical_account_analytics_series
+      (account_analytics : account_analytics) =
+    let time_range =
+      {
+        Analytics_types.since = Some account_analytics.start_date;
+        until_ = Some account_analytics.end_date;
+        granularity = Some Analytics_types.Day;
+      }
+    in
+    to_canonical_analytics_totals_series
+      ~time_range
+      ~scope:Analytics_types.Account
+      account_analytics.totals
+
+  let to_canonical_pin_analytics_series (pin_analytics : pin_analytics) =
+    let time_range =
+      {
+        Analytics_types.since = Some pin_analytics.start_date;
+        until_ = Some pin_analytics.end_date;
+        granularity = Some Analytics_types.Day;
+      }
+    in
+    to_canonical_analytics_totals_series
+      ~time_range
+      ~scope:Analytics_types.Pin
+      pin_analytics.totals
+
+  let get_account_analytics ~account_id ~start_date ~end_date on_result =
+    ensure_valid_token ~account_id
+      (fun access_token ->
+        let query =
+          Uri.encoded_of_query [
+            ("start_date", [start_date]);
+            ("end_date", [end_date]);
+          ]
+        in
+        let url = Printf.sprintf "%s/user_account/analytics?%s" pinterest_api_base query in
+        let headers = [
+          ("Authorization", "Bearer " ^ access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let parsed : account_analytics = {
+                  start_date;
+                  end_date;
+                  totals = parse_analytics_totals json;
+                  raw_json = json;
+                } in
+                on_result (Ok parsed)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse account analytics: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  let get_account_analytics_canonical ~account_id ~start_date ~end_date on_result =
+    get_account_analytics ~account_id ~start_date ~end_date
+      (function
+        | Ok analytics ->
+            on_result (Ok (to_canonical_account_analytics_series analytics))
+        | Error err -> on_result (Error err))
+
+  let get_pin_analytics ~account_id ~pin_id ~start_date ~end_date on_result =
+    ensure_valid_token ~account_id
+      (fun access_token ->
+        let query =
+          Uri.encoded_of_query [
+            ("start_date", [start_date]);
+            ("end_date", [end_date]);
+            ("metric_types", [String.concat "," analytics_metric_names]);
+          ]
+        in
+        let url = Printf.sprintf "%s/pins/%s/analytics?%s" pinterest_api_base (Uri.pct_encode pin_id) query in
+        let headers = [
+          ("Authorization", "Bearer " ^ access_token);
+        ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let json = Yojson.Basic.from_string response.body in
+                let parsed : pin_analytics = {
+                  pin_id;
+                  start_date;
+                  end_date;
+                  totals = parse_analytics_totals json;
+                  raw_json = json;
+                } in
+                on_result (Ok parsed)
+              with e ->
+                on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse pin analytics: %s" (Printexc.to_string e))))
+            else
+              on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  let get_pin_analytics_canonical ~account_id ~pin_id ~start_date ~end_date on_result =
+    get_pin_analytics ~account_id ~pin_id ~start_date ~end_date
+      (function
+        | Ok analytics -> on_result (Ok (to_canonical_pin_analytics_series analytics))
+        | Error err -> on_result (Error err))
   
   (** Get user's default board *)
   let get_default_board ~access_token on_success on_error =

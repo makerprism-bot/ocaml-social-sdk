@@ -365,6 +365,207 @@ let test_post_requires_image () =
       | _ ->
           failwith "Expected validation error")
 
+let test_get_account_analytics_request_contract () =
+  setup_valid_credentials ();
+
+  Mock_http.set_responses [
+    { status = 200; body = {|{}|}; headers = [] };
+  ];
+
+  let result = ref None in
+  Pinterest.get_account_analytics
+    ~account_id:"test_account"
+    ~start_date:"2024-01-01"
+    ~end_date:"2024-01-31"
+    (function
+      | Ok analytics -> result := Some (Ok analytics)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok _) -> ()
+   | Some (Error err) -> failwith ("Account analytics request contract failed: " ^ err)
+   | None -> failwith "No result in account analytics request contract test");
+
+  let chronological = List.rev !Mock_http.requests in
+  assert (List.length chronological = 1);
+  let (method_name, url, headers, _) = List.hd chronological in
+  assert (method_name = "GET");
+  assert (string_contains url "/user_account/analytics");
+  assert (List.assoc_opt "Authorization" headers = Some "Bearer test_access_token");
+
+  let uri = Uri.of_string url in
+  assert ((Uri.get_query_param uri "start_date" |> Option.value ~default:"") = "2024-01-01");
+  assert ((Uri.get_query_param uri "end_date" |> Option.value ~default:"") = "2024-01-31");
+  print_endline "✓ Account analytics request contract test passed"
+
+let test_get_pin_analytics_request_contract () =
+  setup_valid_credentials ();
+
+  Mock_http.set_responses [
+    { status = 200; body = {|{}|}; headers = [] };
+  ];
+
+  let result = ref None in
+  Pinterest.get_pin_analytics
+    ~account_id:"test_account"
+    ~pin_id:"pin_123"
+    ~start_date:"2024-02-01"
+    ~end_date:"2024-02-29"
+    (function
+      | Ok analytics -> result := Some (Ok analytics)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok _) -> ()
+   | Some (Error err) -> failwith ("Pin analytics request contract failed: " ^ err)
+   | None -> failwith "No result in pin analytics request contract test");
+
+  let chronological = List.rev !Mock_http.requests in
+  assert (List.length chronological = 1);
+  let (method_name, url, headers, _) = List.hd chronological in
+  assert (method_name = "GET");
+  assert (string_contains url "/pins/pin_123/analytics");
+  assert (List.assoc_opt "Authorization" headers = Some "Bearer test_access_token");
+
+  let uri = Uri.of_string url in
+  assert ((Uri.get_query_param uri "start_date" |> Option.value ~default:"") = "2024-02-01");
+  assert ((Uri.get_query_param uri "end_date" |> Option.value ~default:"") = "2024-02-29");
+  assert ((Uri.get_query_param uri "metric_types" |> Option.value ~default:"") = "IMPRESSION,PIN_CLICK,OUTBOUND_CLICK,SAVE");
+  print_endline "✓ Pin analytics request contract test passed"
+
+let test_get_account_analytics_parse_typed_result () =
+  setup_valid_credentials ();
+
+  Mock_http.set_responses [
+    {
+      status = 200;
+      body = {|{
+        "all_source_types": {
+          "IMPRESSION": 1200,
+          "PIN_CLICK": 45,
+          "OUTBOUND_CLICK": "9",
+          "SAVE": 30
+        }
+      }|};
+      headers = [ ("content-type", "application/json") ];
+    };
+  ];
+
+  let result = ref None in
+  Pinterest.get_account_analytics
+    ~account_id:"test_account"
+    ~start_date:"2024-03-01"
+    ~end_date:"2024-03-31"
+    (function
+      | Ok analytics -> result := Some (Ok analytics)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok analytics) ->
+       assert (analytics.start_date = "2024-03-01");
+       assert (analytics.end_date = "2024-03-31");
+       assert (analytics.totals.impression = Some 1200);
+       assert (analytics.totals.pin_click = Some 45);
+       assert (analytics.totals.outbound_click = Some 9);
+       assert (analytics.totals.save = Some 30)
+   | Some (Error err) -> failwith ("Account analytics parse failed: " ^ err)
+   | None -> failwith "No result in account analytics parse test");
+
+  print_endline "✓ Account analytics parse test passed"
+
+let test_get_pin_analytics_parse_typed_result () =
+  setup_valid_credentials ();
+
+  Mock_http.set_responses [
+    {
+      status = 200;
+      body = {|{
+        "items": [
+          {
+            "impression": 200,
+            "pin_click": 11,
+            "outbound_click": 4,
+            "save": 7
+          }
+        ]
+      }|};
+      headers = [ ("content-type", "application/json") ];
+    };
+  ];
+
+  let result = ref None in
+  Pinterest.get_pin_analytics
+    ~account_id:"test_account"
+    ~pin_id:"pin_parse_1"
+    ~start_date:"2024-04-01"
+    ~end_date:"2024-04-30"
+    (function
+      | Ok analytics -> result := Some (Ok analytics)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok analytics) ->
+       assert (analytics.pin_id = "pin_parse_1");
+       assert (analytics.start_date = "2024-04-01");
+       assert (analytics.end_date = "2024-04-30");
+       assert (analytics.totals.impression = Some 200);
+       assert (analytics.totals.pin_click = Some 11);
+       assert (analytics.totals.outbound_click = Some 4);
+       assert (analytics.totals.save = Some 7)
+   | Some (Error err) -> failwith ("Pin analytics parse failed: " ^ err)
+   | None -> failwith "No result in pin analytics parse test");
+
+  print_endline "✓ Pin analytics parse test passed"
+
+let test_canonical_analytics_adapters () =
+  let find_series provider_metric series =
+    List.find_opt
+      (fun item -> item.Analytics_types.provider_metric = Some provider_metric)
+      series
+  in
+  let account_analytics : Pinterest.account_analytics = {
+    start_date = "2024-06-01";
+    end_date = "2024-06-30";
+    totals = {
+      impression = Some 100;
+      pin_click = Some 30;
+      outbound_click = Some 8;
+      save = Some 11;
+    };
+    raw_json = `Assoc [];
+  } in
+  let account_series =
+    Pinterest.to_canonical_account_analytics_series account_analytics
+  in
+  assert (List.length account_series = 4);
+  (match find_series "OUTBOUND_CLICK" account_series with
+   | Some item ->
+       assert (Analytics_types.canonical_metric_key item.metric = "outbound_clicks");
+       assert ((List.hd item.points).value = 8)
+   | None -> failwith "Missing OUTBOUND_CLICK canonical series");
+
+  let pin_analytics : Pinterest.pin_analytics = {
+    pin_id = "pin_77";
+    start_date = "2024-06-01";
+    end_date = "2024-06-30";
+    totals = {
+      impression = Some 55;
+      pin_click = Some 21;
+      outbound_click = Some 5;
+      save = Some 6;
+    };
+    raw_json = `Assoc [];
+  } in
+  let pin_series = Pinterest.to_canonical_pin_analytics_series pin_analytics in
+  assert (List.length pin_series = 4);
+  (match find_series "PIN_CLICK" pin_series with
+   | Some item ->
+       assert (Analytics_types.canonical_metric_key item.metric = "pin_clicks");
+       assert ((List.hd item.points).value = 21)
+   | None -> failwith "Missing PIN_CLICK canonical series");
+
+  print_endline "✓ Canonical analytics adapters"
+
 let test_validate_media_file_rejects_large_image () =
   let oversized = (20 * 1024 * 1024) + 1 in
   let media : Platform_types.post_media = {
@@ -981,6 +1182,11 @@ let () =
   (* test_get_all_boards (); *) (* TODO: Function not implemented *)
   test_content_validation ();
   test_post_requires_image ();
+  test_get_account_analytics_request_contract ();
+  test_get_pin_analytics_request_contract ();
+  test_get_account_analytics_parse_typed_result ();
+  test_get_pin_analytics_parse_typed_result ();
+  test_canonical_analytics_adapters ();
   test_validate_media_file_rejects_large_image ();
   test_post_single_full_image_flow_with_alt_text ();
   test_post_single_truncates_title_to_100_chars ();

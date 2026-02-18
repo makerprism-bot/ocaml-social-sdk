@@ -28,3 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Structured error handling:
   - Posting operations use `outcome` type with Success/Partial_success/Failure
   - Non-posting operations use `api_result` type with Ok/Error
+- Added account analytics API:
+  - `get_account_analytics` for `/v5/user_account/analytics`
+- Added pin analytics API:
+  - `get_pin_analytics` for `/v5/pins/{pin_id}/analytics`
+- Added typed analytics response records and canonical analytics conversion helpers
+- Added request-contract and parsing tests for account and pin analytics

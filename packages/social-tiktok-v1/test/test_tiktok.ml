@@ -4,6 +4,11 @@ open Social_core
 
 (** Mock HTTP client for testing *)
 module Mock_http = struct
+  type get_call = {
+    url : string;
+    headers : (string * string) list;
+  }
+
   type post_call = {
     url : string;
     headers : (string * string) list;
@@ -14,6 +19,7 @@ module Mock_http = struct
     headers : (string * string) list;
   }
 
+  let get_calls : get_call list ref = ref []
   let post_calls : post_call list ref = ref []
   let put_calls : put_call list ref = ref []
   let custom_get_handler : (string -> Social_core.response) option ref = ref None
@@ -22,6 +28,7 @@ module Mock_http = struct
   let custom_put_handler : (string -> ((string * string) list) -> string option -> Social_core.response) option ref = ref None
 
   let reset () =
+    get_calls := [];
     post_calls := [];
     put_calls := [];
     custom_get_handler := None;
@@ -41,15 +48,16 @@ module Mock_http = struct
   let set_custom_put_handler f =
     custom_put_handler := Some f
 
-  let get ?headers:_ _url on_success _on_error =
+  let get ?(headers=[]) url on_success _on_error =
+    get_calls := { url; headers } :: !get_calls;
     match !custom_get_error_handler with
-    | Some f -> _on_error (f _url)
+    | Some f -> _on_error (f url)
     | None ->
         (match !custom_get_handler with
-         | Some f -> on_success (f _url)
+         | Some f -> on_success (f url)
          | None ->
-             (* Return mock video content *)
-             on_success {
+              (* Return mock video content *)
+              on_success {
                Social_core.status = 200;
                headers = [("content-type", "video/mp4")];
                body = "mock_video_content";
@@ -462,8 +470,213 @@ let test_parse_creator_info_missing_privacy_defaults_self_only () =
   match Social_tiktok_v1.parse_creator_info json with
   | Ok info ->
       assert (info.privacy_level_options = [Social_tiktok_v1.SelfOnly]);
+       print_endline "PASSED"
+  | Error err -> failwith ("Unexpected parse error: " ^ err)
+
+let test_parse_account_stats_response () =
+  print_string "Test: parse_account_stats_response... ";
+  let json = Yojson.Basic.from_string
+    {|{"data":{"user":{"follower_count":101,"following_count":"12","likes_count":5000,"video_count":34}}}|}
+  in
+  match Social_tiktok_v1.parse_account_stats_response json with
+  | Ok (stats : Social_tiktok_v1.account_stats) ->
+      assert (stats.Social_tiktok_v1.follower_count = 101);
+      assert (stats.Social_tiktok_v1.following_count = 12);
+      assert (stats.Social_tiktok_v1.likes_count = 5000);
+      assert (stats.Social_tiktok_v1.video_count = 34);
       print_endline "PASSED"
   | Error err -> failwith ("Unexpected parse error: " ^ err)
+
+let test_parse_video_ids_response () =
+  print_string "Test: parse_video_ids_response... ";
+  let json = Yojson.Basic.from_string
+    {|{"data":{"videos":[{"id":"video_1"},{"id":"video_2"},{"bad":"skip"}]}}|}
+  in
+  match Social_tiktok_v1.parse_video_ids_response json with
+  | Ok ids ->
+      assert (ids = ["video_1"; "video_2"]);
+      print_endline "PASSED"
+  | Error err -> failwith ("Unexpected parse error: " ^ err)
+
+let test_parse_video_analytics_response () =
+  print_string "Test: parse_video_analytics_response... ";
+  let json = Yojson.Basic.from_string
+    {|{"data":{"videos":[{"id":"video_1","like_count":10,"comment_count":"2","share_count":1,"view_count":300}]}}|}
+  in
+  match Social_tiktok_v1.parse_video_analytics_response json with
+  | Ok [ (video : Social_tiktok_v1.video_analytics) ] ->
+      assert (video.Social_tiktok_v1.id = "video_1");
+      assert (video.Social_tiktok_v1.like_count = 10);
+      assert (video.Social_tiktok_v1.comment_count = 2);
+      assert (video.Social_tiktok_v1.share_count = 1);
+      assert (video.Social_tiktok_v1.view_count = 300);
+      print_endline "PASSED"
+  | Ok _ -> failwith "Expected exactly one parsed video analytics record"
+  | Error err -> failwith ("Unexpected parse error: " ^ err)
+
+let test_canonical_analytics_adapters () =
+  print_string "Test: canonical analytics adapters... ";
+  let find_series provider_metric series =
+    List.find_opt
+      (fun item -> item.Analytics_types.provider_metric = Some provider_metric)
+      series
+  in
+  let analytics : Social_tiktok_v1.account_analytics = {
+    account = {
+      follower_count = 1000;
+      following_count = 250;
+      likes_count = 9000;
+      video_count = 40;
+    };
+    recent_video_analytics =
+      [ { id = "video_1"; like_count = 20; comment_count = 3; share_count = 2; view_count = 120 };
+        { id = "video_2"; like_count = 30; comment_count = 4; share_count = 1; view_count = 180 } ];
+  } in
+  let account_series = Social_tiktok_v1.to_canonical_account_analytics_series analytics in
+  assert (List.length account_series = 8);
+  (match find_series "follower_count" account_series with
+   | Some item ->
+       assert (Analytics_types.canonical_metric_key item.metric = "followers");
+       assert ((List.hd item.points).value = 1000)
+   | None -> failwith "Missing follower_count canonical series");
+  (match find_series "view_count" account_series with
+   | Some item ->
+       assert (Analytics_types.canonical_metric_key item.metric = "views");
+       assert ((List.hd item.points).value = 300)
+   | None -> failwith "Missing view_count canonical series");
+
+  let video_analytics : Social_tiktok_v1.video_analytics = {
+    id = "video_99";
+    like_count = 7;
+    comment_count = 3;
+    share_count = 2;
+    view_count = 400;
+  } in
+  let video_series = Social_tiktok_v1.to_canonical_video_analytics_series video_analytics in
+  assert (List.length video_series = 4);
+  (match find_series "comment_count" video_series with
+   | Some item ->
+       assert (Analytics_types.canonical_metric_key item.metric = "comments");
+       assert ((List.hd item.points).value = 3)
+   | None -> failwith "Missing comment_count canonical series");
+  print_endline "PASSED"
+
+let test_get_account_analytics_request_contract () =
+  print_string "Test: get_account_analytics request contract... ";
+  reset_mock_state ();
+  Mock_http.set_custom_get_handler (fun url ->
+    if url = "https://open.tiktokapis.com/v2/user/info/?fields=follower_count,following_count,likes_count,video_count" then
+      {
+        Social_core.status = 200;
+        headers = [ ("content-type", "application/json") ];
+        body = {|{"data":{"user":{"follower_count":1000,"following_count":250,"likes_count":9999,"video_count":77}}}|};
+      }
+    else
+      failwith ("Unexpected GET URL: " ^ url));
+  Mock_http.set_custom_post_handler (fun url _headers body ->
+    if url = "https://open.tiktokapis.com/v2/video/list/?fields=id" then
+      {
+        Social_core.status = 200;
+        headers = [ ("content-type", "application/json") ];
+        body = {|{"data":{"videos":[{"id":"video_1"},{"id":"video_2"}]}}|};
+      }
+    else if url = "https://open.tiktokapis.com/v2/video/query/?fields=id,like_count,comment_count,share_count,view_count" then
+      {
+        Social_core.status = 200;
+        headers = [ ("content-type", "application/json") ];
+        body = {|{"data":{"videos":[{"id":"video_1","like_count":11,"comment_count":2,"share_count":1,"view_count":100},{"id":"video_2","like_count":22,"comment_count":4,"share_count":2,"view_count":200}]}}|};
+      }
+    else
+      failwith ("Unexpected POST URL: " ^ url ^ " body=" ^ Option.value ~default:"" body));
+  let success_called = ref false in
+  TikTok.get_account_analytics
+    ~account_id:"test_account"
+    (handle_api_result
+      (fun (analytics : Social_tiktok_v1.account_analytics) ->
+        assert (analytics.Social_tiktok_v1.account.Social_tiktok_v1.follower_count = 1000);
+        assert (List.length analytics.Social_tiktok_v1.recent_video_analytics = 2);
+        success_called := true)
+      (fun err -> failwith ("Unexpected error: " ^ err)));
+  assert !success_called;
+
+  let user_info_get_call =
+    match List.find_opt (fun (c : Mock_http.get_call) -> c.url = "https://open.tiktokapis.com/v2/user/info/?fields=follower_count,following_count,likes_count,video_count") !(Mock_http.get_calls) with
+    | Some c -> c
+    | None -> failwith "Expected user info GET call"
+  in
+  let auth_header_present =
+    List.exists (fun (k, v) -> k = "Authorization" && v = "Bearer test_access_token") user_info_get_call.headers
+  in
+  assert auth_header_present;
+
+  let video_list_call =
+    match List.find_opt (fun (c : Mock_http.post_call) -> c.url = "https://open.tiktokapis.com/v2/video/list/?fields=id") !(Mock_http.post_calls) with
+    | Some c -> c
+    | None -> failwith "Expected video list POST call"
+  in
+  let video_list_body = Option.value ~default:"" video_list_call.body in
+  let list_json = Yojson.Basic.from_string video_list_body in
+  let open Yojson.Basic.Util in
+  assert ((list_json |> member "max_count" |> to_int) = 20);
+
+  let video_query_call =
+    match List.find_opt (fun (c : Mock_http.post_call) -> c.url = "https://open.tiktokapis.com/v2/video/query/?fields=id,like_count,comment_count,share_count,view_count") !(Mock_http.post_calls) with
+    | Some c -> c
+    | None -> failwith "Expected video query POST call"
+  in
+  let video_query_body = Option.value ~default:"" video_query_call.body in
+  let query_json = Yojson.Basic.from_string video_query_body in
+  let query_video_ids =
+    query_json
+    |> member "filters"
+    |> member "video_ids"
+    |> to_list
+    |> List.map to_string
+  in
+  assert (query_video_ids = ["video_1"; "video_2"]);
+  print_endline "PASSED"
+
+let test_get_post_analytics_request_contract () =
+  print_string "Test: get_post_analytics request contract... ";
+  reset_mock_state ();
+  Mock_http.set_custom_post_handler (fun url _headers body ->
+    if url = "https://open.tiktokapis.com/v2/video/query/?fields=id,like_count,comment_count,share_count,view_count" then
+      {
+        Social_core.status = 200;
+        headers = [ ("content-type", "application/json") ];
+        body = {|{"data":{"videos":[{"id":"video_99","like_count":7,"comment_count":3,"share_count":2,"view_count":400}]}}|};
+      }
+    else
+      failwith ("Unexpected POST URL: " ^ url ^ " body=" ^ Option.value ~default:"" body));
+  let success_called = ref false in
+  TikTok.get_post_analytics
+    ~account_id:"test_account"
+    ~video_id:"video_99"
+    (handle_api_result
+      (fun (video : Social_tiktok_v1.video_analytics) ->
+        assert (video.Social_tiktok_v1.id = "video_99");
+        assert (video.Social_tiktok_v1.view_count = 400);
+        success_called := true)
+      (fun err -> failwith ("Unexpected error: " ^ err)));
+  assert !success_called;
+
+  let query_call =
+    match List.find_opt (fun (c : Mock_http.post_call) -> c.url = "https://open.tiktokapis.com/v2/video/query/?fields=id,like_count,comment_count,share_count,view_count") !(Mock_http.post_calls) with
+    | Some c -> c
+    | None -> failwith "Expected video query POST call"
+  in
+  let query_body = Option.value ~default:"" query_call.body in
+  let query_json = Yojson.Basic.from_string query_body in
+  let open Yojson.Basic.Util in
+  let video_ids =
+    query_json
+    |> member "filters"
+    |> member "video_ids"
+    |> to_list
+    |> List.map to_string
+  in
+  assert (video_ids = ["video_99"]);
+  print_endline "PASSED"
 
 let test_check_publish_status () =
   print_string "Test: check_publish_status success... ";
@@ -2229,9 +2442,15 @@ let () =
   test_parse_creator_info_missing_optional_fields ();
   test_parse_creator_info_unknown_privacy_values_fallback ();
   test_parse_creator_info_missing_privacy_defaults_self_only ();
+  test_parse_account_stats_response ();
+  test_parse_video_ids_response ();
+  test_parse_video_analytics_response ();
+  test_canonical_analytics_adapters ();
   test_check_publish_status ();
   test_init_video_upload ();
   test_init_video_upload_request_contract ();
+  test_get_account_analytics_request_contract ();
+  test_get_post_analytics_request_contract ();
   test_parse_publish_status_with_publicly_field ();
   test_parse_publish_status_failed_without_reason ();
   test_check_publish_status_request_contract ();
@@ -2284,4 +2503,4 @@ let () =
   test_get_oauth_url_missing_client_key ();
   test_post_single_multiple_media_rejected ();
 
-  print_endline "\n=== All 90 tests passed! ==="
+  print_endline "\n=== All tests passed! ==="

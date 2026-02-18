@@ -341,6 +341,111 @@ type publish_status =
   | Published of string  (** TikTok video ID *)
   | Failed of { error_code : string; error_message : string }
 
+(** Account-level counters from TikTok analytics endpoints *)
+type account_stats = {
+  follower_count : int;
+  following_count : int;
+  likes_count : int;
+  video_count : int;
+}
+
+(** Engagement metrics for a TikTok video *)
+type video_analytics = {
+  id : string;
+  like_count : int;
+  comment_count : int;
+  share_count : int;
+  view_count : int;
+}
+
+(** Aggregated account analytics payload *)
+type account_analytics = {
+  account : account_stats;
+  recent_video_analytics : video_analytics list;
+}
+
+let account_metric_names =
+  [ "follower_count"; "following_count"; "likes_count"; "video_count" ]
+
+let video_metric_names =
+  [ "view_count"; "like_count"; "comment_count"; "share_count" ]
+
+let account_canonical_metric_keys =
+  Analytics_normalization.canonical_metric_keys_of_provider_metrics
+    ~provider:Analytics_normalization.TikTok
+    account_metric_names
+
+let video_canonical_metric_keys =
+  Analytics_normalization.canonical_metric_keys_of_provider_metrics
+    ~provider:Analytics_normalization.TikTok
+    video_metric_names
+
+(** Typed callback aliases for analytics APIs *)
+type account_analytics_success_callback = account_analytics -> unit
+type post_analytics_success_callback = video_analytics -> unit
+type analytics_error_callback = Error_types.error -> unit
+
+let to_canonical_optional_point value_opt =
+  match value_opt with
+  | Some value -> [ Analytics_types.make_datapoint value ]
+  | None -> []
+
+let to_canonical_tiktok_series ?time_range ~scope ~provider_metric points =
+  match Analytics_normalization.tiktok_metric_to_canonical provider_metric with
+  | Some metric ->
+      Some
+        (Analytics_types.make_series
+           ?time_range
+           ~metric
+           ~scope
+           ~provider_metric
+           points)
+  | None -> None
+
+let to_canonical_account_stats_series (account_stats : account_stats) =
+  [ ("follower_count", to_canonical_optional_point (Some account_stats.follower_count));
+    ("following_count", to_canonical_optional_point (Some account_stats.following_count));
+    ("likes_count", to_canonical_optional_point (Some account_stats.likes_count));
+    ("video_count", to_canonical_optional_point (Some account_stats.video_count)) ]
+  |> List.filter_map (fun (provider_metric, points) ->
+         to_canonical_tiktok_series
+           ~scope:Analytics_types.Account
+           ~provider_metric
+           points)
+
+let to_canonical_video_analytics_series (video_analytics : video_analytics) =
+  [ ("view_count", to_canonical_optional_point (Some video_analytics.view_count));
+    ("like_count", to_canonical_optional_point (Some video_analytics.like_count));
+    ("comment_count", to_canonical_optional_point (Some video_analytics.comment_count));
+    ("share_count", to_canonical_optional_point (Some video_analytics.share_count)) ]
+  |> List.filter_map (fun (provider_metric, points) ->
+         to_canonical_tiktok_series
+           ~scope:Analytics_types.Video
+           ~provider_metric
+           points)
+
+let to_canonical_recent_video_totals_series recent_video_analytics =
+  let has_values = recent_video_analytics <> [] in
+  let total getter =
+    List.fold_left (fun acc video -> acc + getter video) 0 recent_video_analytics
+  in
+  let points value =
+    if has_values then [ Analytics_types.make_datapoint value ] else []
+  in
+  [ ("view_count", points (total (fun video -> video.view_count)));
+    ("like_count", points (total (fun video -> video.like_count)));
+    ("comment_count", points (total (fun video -> video.comment_count)));
+    ("share_count", points (total (fun video -> video.share_count))) ]
+  |> List.filter_map (fun (provider_metric, value_points) ->
+         to_canonical_tiktok_series
+           ~scope:Analytics_types.Video
+           ~provider_metric
+           value_points)
+
+let to_canonical_account_analytics_series (analytics : account_analytics) =
+  to_canonical_account_stats_series analytics.account
+  @ to_canonical_recent_video_totals_series analytics.recent_video_analytics
+
 (** {1 API Endpoints} *)
 
 let api_base_url = "https://open.tiktokapis.com/v2"
@@ -515,6 +620,85 @@ let parse_publish_status json =
   with e ->
     Failed { error_code = "PARSE_ERROR"; error_message = Printexc.to_string e }
 
+let read_json_int_field ~obj ~field ~default =
+  let open Yojson.Basic.Util in
+  let value_to_int value =
+    match value with
+    | `Int i -> Some i
+    | `String s -> int_of_string_opt s
+    | _ -> None
+  in
+  try
+    let value = obj |> member field in
+    if value = `Null then default
+    else match value_to_int value with Some i -> i | None -> default
+  with _ -> default
+
+let parse_account_stats_response json =
+  let open Yojson.Basic.Util in
+  try
+    let data = json |> member "data" in
+    let user =
+      let user_obj = data |> member "user" in
+      if user_obj = `Null then data else user_obj
+    in
+    Ok {
+      follower_count = read_json_int_field ~obj:user ~field:"follower_count" ~default:0;
+      following_count = read_json_int_field ~obj:user ~field:"following_count" ~default:0;
+      likes_count = read_json_int_field ~obj:user ~field:"likes_count" ~default:0;
+      video_count = read_json_int_field ~obj:user ~field:"video_count" ~default:0;
+    }
+  with e ->
+    Error (Printf.sprintf "Failed to parse account stats: %s" (Printexc.to_string e))
+
+let parse_video_ids_response json =
+  let open Yojson.Basic.Util in
+  try
+    let data = json |> member "data" in
+    let videos = data |> member "videos" |> to_list in
+    let ids =
+      videos
+      |> List.filter_map (fun video ->
+           try
+             let id = video |> member "id" |> to_string in
+             if id = "" then None else Some id
+           with _ -> None)
+    in
+    Ok ids
+  with e ->
+    Error (Printf.sprintf "Failed to parse video IDs: %s" (Printexc.to_string e))
+
+let parse_video_analytics_response json =
+  let open Yojson.Basic.Util in
+  try
+    let data = json |> member "data" in
+    let videos = data |> member "videos" |> to_list in
+    let analytics =
+      videos
+      |> List.filter_map (fun video ->
+           try
+             let id = video |> member "id" |> to_string in
+             if id = "" then None
+             else
+               Some {
+                 id;
+                 like_count = read_json_int_field ~obj:video ~field:"like_count" ~default:0;
+                 comment_count = read_json_int_field ~obj:video ~field:"comment_count" ~default:0;
+                 share_count = read_json_int_field ~obj:video ~field:"share_count" ~default:0;
+                 view_count = read_json_int_field ~obj:video ~field:"view_count" ~default:0;
+               }
+           with _ -> None)
+    in
+    Ok analytics
+  with e ->
+    Error (Printf.sprintf "Failed to parse video analytics: %s" (Printexc.to_string e))
+
+let parse_single_video_analytics_response json =
+  match parse_video_analytics_response json with
+  | Error _ as err -> err
+  | Ok (first :: _) -> Ok first
+  | Ok [] -> Error "No video analytics returned"
+
 (** {1 OAuth URL Generation} *)
 
 let get_authorization_url ~client_id ~redirect_uri ~scope ~state =
@@ -547,6 +731,9 @@ module Make (Config : CONFIG) = struct
   let creator_info_url = api_base_url ^ "/post/publish/creator_info/query/"
   let video_init_url = api_base_url ^ "/post/publish/video/init/"
   let status_fetch_url = api_base_url ^ "/post/publish/status/fetch/"
+  let user_info_analytics_url = api_base_url ^ "/user/info/?fields=follower_count,following_count,likes_count,video_count"
+  let video_list_url = api_base_url ^ "/video/list/?fields=id"
+  let video_query_url = api_base_url ^ "/video/query/?fields=id,like_count,comment_count,share_count,view_count"
   
   (** {1 Validation Functions} *)
   
@@ -983,6 +1170,156 @@ module Make (Config : CONFIG) = struct
               on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body ~response_headers:response.headers ~required_scopes:["video.publish"] ())))
           (fun err -> on_result (Error (Error_types.Internal_error err))))
       (fun err -> on_result (Error err))
+
+  (** Fetch account analytics and recent video engagement metrics.
+
+      Flow:
+      1. GET /user/info for account counters
+      2. POST /video/list to fetch recent video IDs (max_count=20)
+      3. POST /video/query for engagement metrics on those IDs
+  *)
+  let get_account_analytics ~account_id on_result =
+    ensure_valid_token ~account_id
+      (fun access_token ->
+        let auth_headers = [
+          ("Authorization", "Bearer " ^ access_token);
+        ] in
+        let json_headers = auth_headers @ [
+          ("Content-Type", "application/json; charset=UTF-8");
+        ] in
+        Config.Http.get ~headers:auth_headers user_info_analytics_url
+          (fun account_response ->
+            if account_response.status >= 200 && account_response.status < 300 then
+              let parsed_account_stats =
+                try
+                  let account_json = Yojson.Basic.from_string account_response.body in
+                  parse_account_stats_response account_json
+                with e ->
+                  Error (Printf.sprintf "Failed to parse account analytics response: %s" (Printexc.to_string e))
+              in
+              (match parsed_account_stats with
+               | Error msg -> on_result (Error (Error_types.Internal_error msg))
+               | Ok account_stats ->
+                   let video_list_body =
+                     `Assoc [
+                       ("max_count", `Int 20);
+                     ]
+                     |> Yojson.Basic.to_string
+                   in
+                   Config.Http.post ~headers:json_headers ~body:video_list_body video_list_url
+                     (fun list_response ->
+                       if list_response.status >= 200 && list_response.status < 300 then
+                         let parsed_video_ids =
+                           try
+                             let list_json = Yojson.Basic.from_string list_response.body in
+                             parse_video_ids_response list_json
+                           with e ->
+                             Error (Printf.sprintf "Failed to parse video list response: %s" (Printexc.to_string e))
+                         in
+                         (match parsed_video_ids with
+                          | Error msg -> on_result (Error (Error_types.Internal_error msg))
+                          | Ok [] ->
+                              on_result (Ok { account = account_stats; recent_video_analytics = [] })
+                          | Ok video_ids ->
+                              let query_body =
+                                `Assoc [
+                                  ("filters", `Assoc [
+                                    ("video_ids", `List (List.map (fun id -> `String id) video_ids));
+                                  ]);
+                                ]
+                                |> Yojson.Basic.to_string
+                              in
+                              Config.Http.post ~headers:json_headers ~body:query_body video_query_url
+                                (fun query_response ->
+                                  if query_response.status >= 200 && query_response.status < 300 then
+                                    let parsed_video_analytics =
+                                      try
+                                        let query_json = Yojson.Basic.from_string query_response.body in
+                                        parse_video_analytics_response query_json
+                                      with e ->
+                                        Error (Printf.sprintf "Failed to parse video query response: %s" (Printexc.to_string e))
+                                    in
+                                    (match parsed_video_analytics with
+                                     | Ok recent_video_analytics ->
+                                         on_result (Ok { account = account_stats; recent_video_analytics })
+                                     | Error msg -> on_result (Error (Error_types.Internal_error msg)))
+                                  else
+                                    on_result (Error (parse_api_error ~status_code:query_response.status ~response_body:query_response.body ~response_headers:query_response.headers ~required_scopes:["video.list"] ())))
+                                (fun err -> on_result (Error (Error_types.Internal_error err))))
+                       else
+                         on_result (Error (parse_api_error ~status_code:list_response.status ~response_body:list_response.body ~response_headers:list_response.headers ~required_scopes:["video.list"] ())))
+                     (fun err -> on_result (Error (Error_types.Internal_error err))))
+            else
+              on_result (Error (parse_api_error ~status_code:account_response.status ~response_body:account_response.body ~response_headers:account_response.headers ~required_scopes:["user.info.stats"] ())))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error err))
+
+  (** Fetch analytics for a single TikTok video. *)
+  let get_post_analytics ~account_id ~video_id on_result =
+    if String.trim video_id = "" then
+      on_result (Error (Error_types.Internal_error "video_id is required"))
+    else
+      ensure_valid_token ~account_id
+        (fun access_token ->
+          let headers = [
+            ("Authorization", "Bearer " ^ access_token);
+            ("Content-Type", "application/json; charset=UTF-8");
+          ] in
+          let body =
+            `Assoc [
+              ("filters", `Assoc [
+                ("video_ids", `List [`String video_id]);
+              ]);
+            ]
+            |> Yojson.Basic.to_string
+          in
+          Config.Http.post ~headers ~body video_query_url
+            (fun response ->
+              if response.status >= 200 && response.status < 300 then
+                (try
+                   let json = Yojson.Basic.from_string response.body in
+                   (match parse_single_video_analytics_response json with
+                    | Ok video -> on_result (Ok video)
+                    | Error "No video analytics returned" -> on_result (Error (Error_types.Resource_not_found video_id))
+                    | Error msg -> on_result (Error (Error_types.Internal_error msg)))
+                 with e ->
+                   on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse post analytics response: %s" (Printexc.to_string e)))))
+              else
+                on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body ~response_headers:response.headers ~required_scopes:["video.list"] ())))
+            (fun err -> on_result (Error (Error_types.Internal_error err))))
+        (fun err -> on_result (Error err))
+
+  let get_account_analytics_canonical ~account_id on_result =
+    get_account_analytics ~account_id
+      (function
+        | Ok analytics ->
+            on_result (Ok (to_canonical_account_analytics_series analytics))
+        | Error err -> on_result (Error err))
+
+  let get_post_analytics_canonical ~account_id ~video_id on_result =
+    get_post_analytics ~account_id ~video_id
+      (function
+        | Ok analytics ->
+            on_result (Ok (to_canonical_video_analytics_series analytics))
+        | Error err -> on_result (Error err))
+
+  (** Callback-style wrapper for get_account_analytics. *)
+  let get_account_analytics_callbacks ~account_id
+      (on_success : account_analytics_success_callback)
+      (on_error : analytics_error_callback) =
+    get_account_analytics ~account_id
+      (function
+        | Ok analytics -> on_success analytics
+        | Error err -> on_error err)
+
+  (** Callback-style wrapper for get_post_analytics. *)
+  let get_post_analytics_callbacks ~account_id ~video_id
+      (on_success : post_analytics_success_callback)
+      (on_error : analytics_error_callback) =
+    get_post_analytics ~account_id ~video_id
+      (function
+        | Ok analytics -> on_success analytics
+        | Error err -> on_error err)
 
   let validate_post_info_against_creator ~post_info ~creator_info =
     let privacy_allowed =

@@ -348,7 +348,26 @@ module Make (Config : CONFIG) = struct
     listed_count: int;
   }
 
-  (** Tweet-level analytics derived from tweet public metrics. *)
+  type post_metric_set =
+    | Public_metrics_only
+    | Expanded_metrics
+    | Expanded_metrics_with_fallback
+
+  type post_extended_metrics = {
+    like_count: int option;
+    reply_count: int option;
+    retweet_count: int option;
+    quote_count: int option;
+    bookmark_count: int option;
+    impression_count: int option;
+    url_link_clicks: int option;
+    user_profile_clicks: int option;
+    engagements: int option;
+    video_view_count: int option;
+  }
+
+  (** Tweet-level analytics derived from tweet public metrics plus optional
+      expanded metric objects when requested. *)
   type post_analytics = {
     tweet_id: string;
     text: string option;
@@ -358,7 +377,21 @@ module Make (Config : CONFIG) = struct
     quote_count: int;
     bookmark_count: int;
     impression_count: int;
+    non_public_metrics: post_extended_metrics option;
+    organic_metrics: post_extended_metrics option;
+    promoted_metrics: post_extended_metrics option;
   }
+
+  let tweet_fields_for_post_metric_set = function
+    | Public_metrics_only -> "text,public_metrics"
+    | Expanded_metrics
+    | Expanded_metrics_with_fallback ->
+        "text,public_metrics,non_public_metrics,organic_metrics,promoted_metrics"
+
+  let metric_set_allows_fallback = function
+    | Expanded_metrics_with_fallback -> true
+    | Public_metrics_only
+    | Expanded_metrics -> false
 
   let to_canonical_optional_point value_opt =
     match value_opt with
@@ -366,16 +399,19 @@ module Make (Config : CONFIG) = struct
     | None -> []
 
   let to_canonical_x_series ?time_range ~scope ~provider_metric points =
-    match Analytics_normalization.x_metric_to_canonical provider_metric with
-    | Some metric ->
-        Some
-          (Analytics_types.make_series
-             ?time_range
-             ~metric
-             ~scope
-             ~provider_metric
-             points)
-    | None -> None
+    if points = [] then
+      None
+    else
+      match Analytics_normalization.x_metric_to_canonical provider_metric with
+      | Some metric ->
+          Some
+            (Analytics_types.make_series
+               ?time_range
+               ~metric
+               ~scope
+               ~provider_metric
+               points)
+      | None -> None
 
   let to_canonical_account_analytics_series
       (account_analytics : account_analytics) =
@@ -384,23 +420,47 @@ module Make (Config : CONFIG) = struct
       ("tweet_count", to_canonical_optional_point (Some account_analytics.tweet_count));
       ("listed_count", to_canonical_optional_point (Some account_analytics.listed_count)) ]
     |> List.filter_map (fun (provider_metric, points) ->
-           to_canonical_x_series
-             ~scope:Analytics_types.Profile
-             ~provider_metric
-             points)
+            to_canonical_x_series
+              ~scope:Analytics_types.Profile
+              ~provider_metric
+              points)
+
+  let first_some_metric groups get_metric =
+    groups
+    |> List.find_map (fun group_opt ->
+           match group_opt with
+           | None -> None
+           | Some group -> get_metric group)
 
   let to_canonical_post_analytics_series (post_analytics : post_analytics) =
+    let expanded_groups =
+      [ post_analytics.non_public_metrics;
+        post_analytics.organic_metrics;
+        post_analytics.promoted_metrics ]
+    in
     [ ("retweet_count", to_canonical_optional_point (Some post_analytics.retweet_count));
       ("reply_count", to_canonical_optional_point (Some post_analytics.reply_count));
       ("like_count", to_canonical_optional_point (Some post_analytics.like_count));
       ("quote_count", to_canonical_optional_point (Some post_analytics.quote_count));
       ("bookmark_count", to_canonical_optional_point (Some post_analytics.bookmark_count));
-      ("impression_count", to_canonical_optional_point (Some post_analytics.impression_count)) ]
+      ("impression_count", to_canonical_optional_point (Some post_analytics.impression_count));
+      ( "url_link_clicks",
+        to_canonical_optional_point
+          (first_some_metric expanded_groups (fun metric -> metric.url_link_clicks)) );
+      ( "user_profile_clicks",
+        to_canonical_optional_point
+          (first_some_metric expanded_groups (fun metric -> metric.user_profile_clicks)) );
+      ( "engagements",
+        to_canonical_optional_point
+          (first_some_metric expanded_groups (fun metric -> metric.engagements)) );
+      ( "video_view_count",
+        to_canonical_optional_point
+          (first_some_metric expanded_groups (fun metric -> metric.video_view_count)) ) ]
     |> List.filter_map (fun (provider_metric, points) ->
            to_canonical_x_series
-             ~scope:Analytics_types.Post
-             ~provider_metric
-             points)
+              ~scope:Analytics_types.Post
+              ~provider_metric
+              points)
   
   (** Parse rate limit headers from Twitter API response *)
   let parse_rate_limit_headers headers =
@@ -429,19 +489,27 @@ module Make (Config : CONFIG) = struct
     with _ ->
       { next_token = None; previous_token = None; result_count = 0 }
 
+  let json_value_to_int = function
+    | `Int i -> Some i
+    | `String s -> int_of_string_opt (String.trim s)
+    | `Float f -> Some (int_of_float f)
+    | _ -> None
+
+  let read_json_int_field_opt ~obj ~field =
+    let open Yojson.Basic.Util in
+    try
+      let value = obj |> member field in
+      if value = `Null then None
+      else json_value_to_int value
+    with _ -> None
+
   let read_json_int_field ~obj ~field ~default =
     let open Yojson.Basic.Util in
-    let value_to_int = function
-      | `Int i -> Some i
-      | `String s -> int_of_string_opt (String.trim s)
-      | `Float f -> Some (int_of_float f)
-      | _ -> None
-    in
     try
       let value = obj |> member field in
       if value = `Null then default
       else
-        match value_to_int value with
+        match json_value_to_int value with
         | Some i -> i
         | None -> default
     with _ -> default
@@ -477,6 +545,39 @@ module Make (Config : CONFIG) = struct
     with e ->
       Error (`Malformed (Printf.sprintf "Failed to parse account analytics response: %s" (Printexc.to_string e)))
 
+  let parse_post_extended_metrics metrics_obj =
+    if metrics_obj = `Null then
+      None
+    else
+      let metrics =
+        {
+          like_count = read_json_int_field_opt ~obj:metrics_obj ~field:"like_count";
+          reply_count = read_json_int_field_opt ~obj:metrics_obj ~field:"reply_count";
+          retweet_count = read_json_int_field_opt ~obj:metrics_obj ~field:"retweet_count";
+          quote_count = read_json_int_field_opt ~obj:metrics_obj ~field:"quote_count";
+          bookmark_count = read_json_int_field_opt ~obj:metrics_obj ~field:"bookmark_count";
+          impression_count = read_json_int_field_opt ~obj:metrics_obj ~field:"impression_count";
+          url_link_clicks = read_json_int_field_opt ~obj:metrics_obj ~field:"url_link_clicks";
+          user_profile_clicks = read_json_int_field_opt ~obj:metrics_obj ~field:"user_profile_clicks";
+          engagements = read_json_int_field_opt ~obj:metrics_obj ~field:"engagements";
+          video_view_count = read_json_int_field_opt ~obj:metrics_obj ~field:"video_view_count";
+        }
+      in
+      let has_values =
+        [ metrics.like_count;
+          metrics.reply_count;
+          metrics.retweet_count;
+          metrics.quote_count;
+          metrics.bookmark_count;
+          metrics.impression_count;
+          metrics.url_link_clicks;
+          metrics.user_profile_clicks;
+          metrics.engagements;
+          metrics.video_view_count ]
+        |> List.exists Option.is_some
+      in
+      if has_values then Some metrics else None
+
   let parse_post_analytics_response ~tweet_id response_body =
     let open Yojson.Basic.Util in
     try
@@ -486,6 +587,9 @@ module Make (Config : CONFIG) = struct
         Error (`Not_found tweet_id)
       else
         let public_metrics = data |> member "public_metrics" in
+        let non_public_metrics = data |> member "non_public_metrics" |> parse_post_extended_metrics in
+        let organic_metrics = data |> member "organic_metrics" |> parse_post_extended_metrics in
+        let promoted_metrics = data |> member "promoted_metrics" |> parse_post_extended_metrics in
         Ok {
           tweet_id =
             (read_json_string_field_opt ~obj:data ~field:"id"
@@ -497,6 +601,9 @@ module Make (Config : CONFIG) = struct
           quote_count = read_json_int_field ~obj:public_metrics ~field:"quote_count" ~default:0;
           bookmark_count = read_json_int_field ~obj:public_metrics ~field:"bookmark_count" ~default:0;
           impression_count = read_json_int_field ~obj:public_metrics ~field:"impression_count" ~default:0;
+          non_public_metrics;
+          organic_metrics;
+          promoted_metrics;
         }
     with e ->
       Error (`Malformed (Printf.sprintf "Failed to parse post analytics response: %s" (Printexc.to_string e)))
@@ -1887,47 +1994,89 @@ module Make (Config : CONFIG) = struct
               (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
 
-  (** Get tweet analytics from tweet public metrics. *)
-  let get_post_analytics ~account_id ~tweet_id on_result =
+  let should_fallback_post_metric_set ~status_code ~body =
+    let contains_case_insensitive text fragment =
+      let text_l = String.lowercase_ascii text in
+      let fragment_l = String.lowercase_ascii fragment in
+      try
+        ignore (Str.search_forward (Str.regexp_string fragment_l) text_l 0);
+        true
+      with Not_found -> false
+    in
+    status_code = 403
+    ||
+    (status_code = 400
+     && (contains_case_insensitive body "non_public_metrics"
+         || contains_case_insensitive body "organic_metrics"
+         || contains_case_insensitive body "promoted_metrics")
+     && (contains_case_insensitive body "forbidden"
+         || contains_case_insensitive body "unauthorized"
+         || contains_case_insensitive body "not permitted"
+         || contains_case_insensitive body "unsupported"
+         || contains_case_insensitive body "invalid"))
+
+  (** Get tweet analytics from tweet metrics.
+
+      By default, this requests `public_metrics` only. Use [metric_set] to
+      request expanded metric objects and optionally allow a graceful fallback
+      to public-only metrics if expanded fields are unavailable for the caller.
+  *)
+  let get_post_analytics
+      ~account_id
+      ~tweet_id
+      ?(metric_set = Public_metrics_only)
+      on_result =
     let normalized_tweet_id = String.trim tweet_id in
     if normalized_tweet_id = "" then
       on_result (Error (Error_types.Internal_error "tweet_id is required"))
     else
       ensure_valid_token ~account_id
         (fun access_token ->
-          let query =
-            Uri.encoded_of_query
-              [ ("tweet.fields", [ "text,public_metrics" ]) ]
-          in
-          let url =
-            Printf.sprintf "%s/tweets/%s?%s"
-              twitter_api_base
-              normalized_tweet_id
-              query
-          in
           let headers = [
             ("Authorization", Printf.sprintf "Bearer %s" access_token);
           ] in
-
-          Config.Http.get ~headers url
-            (fun response ->
-              if response.status >= 200 && response.status < 300 then
-                match parse_post_analytics_response ~tweet_id:normalized_tweet_id response.body with
-                | Ok analytics -> on_result (Ok analytics)
-                | Error (`Not_found resource) ->
-                    on_result (Error (Error_types.Resource_not_found resource))
-                | Error (`Malformed msg) ->
-                    on_result (Error (Error_types.Internal_error msg))
-              else
+          let rec fetch requested_metric_set ~already_fallback_attempted =
+            let query =
+              Uri.encoded_of_query
+                [ ( "tweet.fields",
+                    [ tweet_fields_for_post_metric_set requested_metric_set ] ) ]
+            in
+            let url =
+              Printf.sprintf "%s/tweets/%s?%s"
+                twitter_api_base
+                normalized_tweet_id
+                query
+            in
+            Config.Http.get ~headers url
+              (fun response ->
+                if response.status >= 200 && response.status < 300 then
+                  match parse_post_analytics_response ~tweet_id:normalized_tweet_id response.body with
+                  | Ok analytics -> on_result (Ok analytics)
+                  | Error (`Not_found resource) ->
+                      on_result (Error (Error_types.Resource_not_found resource))
+                  | Error (`Malformed msg) ->
+                      on_result (Error (Error_types.Internal_error msg))
+                else if
+                  not already_fallback_attempted
+                  && requested_metric_set <> Public_metrics_only
+                  && metric_set_allows_fallback metric_set
+                  && should_fallback_post_metric_set
+                       ~status_code:response.status
+                       ~body:response.body
+                then
+                  fetch Public_metrics_only ~already_fallback_attempted:true
+                else
+                  on_result
+                    (Error
+                       (parse_api_error
+                          ~status_code:response.status
+                          ~body:response.body
+                          ~headers:response.headers)))
+              (fun err ->
                 on_result
-                  (Error
-                     (parse_api_error
-                        ~status_code:response.status
-                        ~body:response.body
-                        ~headers:response.headers)))
-            (fun err ->
-              on_result
-                (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+                  (Error (Error_types.Network_error (Error_types.Connection_failed err))))
+          in
+          fetch metric_set ~already_fallback_attempted:false)
         (fun err -> on_result (Error err))
 
   let get_account_analytics_canonical ~account_id on_result =
@@ -1937,8 +2086,8 @@ module Make (Config : CONFIG) = struct
             on_result (Ok (to_canonical_account_analytics_series analytics))
         | Error err -> on_result (Error err))
 
-  let get_post_analytics_canonical ~account_id ~tweet_id on_result =
-    get_post_analytics ~account_id ~tweet_id
+  let get_post_analytics_canonical ~account_id ~tweet_id ?(metric_set = Public_metrics_only) on_result =
+    get_post_analytics ~account_id ~tweet_id ~metric_set
       (function
         | Ok analytics -> on_result (Ok (to_canonical_post_analytics_series analytics))
         | Error err -> on_result (Error err))

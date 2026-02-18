@@ -344,6 +344,7 @@ end
 module Make (Config : CONFIG) = struct
   let youtube_api_base = "https://www.googleapis.com/youtube/v3"
   let youtube_upload_base = "https://www.googleapis.com/upload/youtube/v3"
+  let youtube_analytics_reports_base = "https://youtubeanalytics.googleapis.com/v2"
   let google_oauth_base = "https://oauth2.googleapis.com"
   
   (** {1 Platform Constants} *)
@@ -567,6 +568,34 @@ module Make (Config : CONFIG) = struct
     comment_count : int;
   }
 
+  type report_column_header = {
+    name : string;
+    column_type : string;
+    data_type : string;
+  }
+
+  type report_row = {
+    day : string;
+    metrics : (string * int) list;
+  }
+
+  type account_analytics_report = {
+    start_date : string;
+    end_date : string;
+    metrics : string list;
+    column_headers : report_column_header list;
+    rows : report_row list;
+  }
+
+  type post_analytics_report = {
+    video_id : string;
+    start_date : string;
+    end_date : string;
+    metrics : string list;
+    column_headers : report_column_header list;
+    rows : report_row list;
+  }
+
   let to_canonical_optional_point value_opt =
     match value_opt with
     | Some value -> [ Analytics_types.make_datapoint value ]
@@ -654,6 +683,255 @@ module Make (Config : CONFIG) = struct
         let s = to_string value in
         if String.trim s = "" then None else Some s
     with _ -> None
+
+  let normalize_report_metrics metrics =
+    metrics
+    |> List.map String.trim
+    |> List.filter (fun metric -> metric <> "")
+
+  let validate_reports_query_inputs ~start_date ~end_date ~metrics =
+    let normalized_start_date = String.trim start_date in
+    let normalized_end_date = String.trim end_date in
+    let normalized_metrics = normalize_report_metrics metrics in
+    if normalized_start_date = "" then
+      Error (Error_types.Internal_error "start_date is required")
+    else if normalized_end_date = "" then
+      Error (Error_types.Internal_error "end_date is required")
+    else if normalized_metrics = [] then
+      Error (Error_types.Internal_error "metrics is required")
+    else
+      Ok (normalized_start_date, normalized_end_date, normalized_metrics)
+
+  let account_analytics_report_url ~start_date ~end_date ~metrics =
+    let query =
+      Uri.encoded_of_query
+        [ ("ids", [ "channel==MINE" ]);
+          ("startDate", [ start_date ]);
+          ("endDate", [ end_date ]);
+          ("metrics", [ String.concat "," metrics ]);
+          ("dimensions", [ "day" ]) ]
+    in
+    Printf.sprintf "%s/reports?%s" youtube_analytics_reports_base query
+
+  let post_analytics_report_url ~video_id ~start_date ~end_date ~metrics =
+    let query =
+      Uri.encoded_of_query
+        [ ("ids", [ "channel==MINE" ]);
+          ("startDate", [ start_date ]);
+          ("endDate", [ end_date ]);
+          ("metrics", [ String.concat "," metrics ]);
+          ("dimensions", [ "day" ]);
+          ("filters", [ "video==" ^ video_id ]) ]
+    in
+    Printf.sprintf "%s/reports?%s" youtube_analytics_reports_base query
+
+  let parse_report_column_headers json =
+    let open Yojson.Basic.Util in
+    try
+      let headers = json |> member "columnHeaders" |> to_list in
+      headers
+      |> List.map (fun header ->
+             {
+               name = header |> member "name" |> to_string;
+               column_type = header |> member "columnType" |> to_string;
+               data_type = header |> member "dataType" |> to_string;
+             })
+      |> fun parsed_headers ->
+      if parsed_headers = [] then
+        Error (`Malformed "Report payload is missing column headers")
+      else
+        Ok parsed_headers
+    with e ->
+      Error
+        (`Malformed
+          (Printf.sprintf
+             "Failed to parse report column headers: %s"
+             (Printexc.to_string e)))
+
+  let report_day_column_index column_headers =
+    let rec loop index = function
+      | [] -> None
+      | header :: rest ->
+          if String.lowercase_ascii (String.trim header.name) = "day" then Some index
+          else loop (index + 1) rest
+    in
+    loop 0 column_headers
+
+  let report_metric_columns column_headers =
+    let rec loop index acc = function
+      | [] -> List.rev acc
+      | header :: rest ->
+          let acc' =
+            if String.uppercase_ascii (String.trim header.column_type) = "METRIC" then
+              (index, header) :: acc
+            else
+              acc
+          in
+          loop (index + 1) acc' rest
+    in
+    loop 0 [] column_headers
+
+  let ensure_requested_report_metrics ~requested_metrics ~column_headers =
+    let available_metrics =
+      report_metric_columns column_headers
+      |> List.map (fun (_, header) -> String.lowercase_ascii (String.trim header.name))
+    in
+    let missing_metrics =
+      requested_metrics
+      |> List.filter_map (fun metric ->
+             let normalized_metric = String.lowercase_ascii (String.trim metric) in
+             if normalized_metric = "" || List.mem normalized_metric available_metrics then
+               None
+             else
+               Some metric)
+    in
+    if missing_metrics = [] then
+      Ok ()
+    else
+      Error
+        (`Malformed
+          (Printf.sprintf
+             "Report payload is missing metrics: %s"
+             (String.concat "," missing_metrics)))
+
+  let rec nth_opt values index =
+    match values, index with
+    | [], _ -> None
+    | value :: _, 0 -> Some value
+    | _ :: rest, i when i > 0 -> nth_opt rest (i - 1)
+    | _ -> None
+
+  let report_metric_value_to_int value =
+    match value with
+    | `Int i -> Some i
+    | `String s -> int_of_string_opt (String.trim s)
+    | `Float f -> Some (int_of_float f)
+    | _ -> None
+
+  let parse_report_rows ~column_headers json =
+    let open Yojson.Basic.Util in
+    try
+      let rows_value = json |> member "rows" in
+      let rows =
+        match rows_value with
+        | `Null -> []
+        | `List row_items -> row_items
+        | _ -> failwith "Report rows must be a list"
+      in
+      match report_day_column_index column_headers with
+      | None -> Error (`Malformed "Report column headers are missing day dimension")
+      | Some day_column_index ->
+          let metric_columns = report_metric_columns column_headers in
+          if metric_columns = [] then
+            Error (`Malformed "Report column headers are missing metric columns")
+          else
+          let parse_single_row row_index row_json =
+            let values = row_json |> to_list in
+            let day =
+              match nth_opt values day_column_index with
+              | Some value ->
+                  let day_value = to_string value in
+                  if String.trim day_value = "" then
+                    failwith
+                      (Printf.sprintf "Row %d has empty day value" row_index)
+                  else
+                    day_value
+              | None ->
+                  failwith
+                    (Printf.sprintf
+                       "Row %d is missing day value at index %d"
+                       row_index
+                       day_column_index)
+            in
+            let rec collect_metrics acc = function
+              | [] -> List.rev acc
+              | (metric_index, metric_header) :: rest ->
+                  let metric_value =
+                    match nth_opt values metric_index with
+                    | Some value ->
+                        (match report_metric_value_to_int value with
+                         | Some parsed -> parsed
+                         | None ->
+                             failwith
+                               (Printf.sprintf
+                                  "Row %d metric %s is not an integer"
+                                  row_index
+                                  metric_header.name))
+                    | None ->
+                        failwith
+                          (Printf.sprintf
+                             "Row %d is missing metric %s"
+                             row_index
+                             metric_header.name)
+                  in
+                  collect_metrics ((metric_header.name, metric_value) :: acc) rest
+            in
+            { day; metrics = collect_metrics [] metric_columns }
+          in
+          let rec parse_all_rows row_index acc = function
+            | [] -> Ok (List.rev acc)
+            | row_json :: rest ->
+                let parsed_row = parse_single_row row_index row_json in
+                parse_all_rows (row_index + 1) (parsed_row :: acc) rest
+          in
+          parse_all_rows 0 [] rows
+    with e ->
+      Error
+        (`Malformed
+          (Printf.sprintf "Failed to parse report rows: %s" (Printexc.to_string e)))
+
+  let parse_account_analytics_report_response ~start_date ~end_date ~metrics response_body =
+    try
+      let json = Yojson.Basic.from_string response_body in
+      match parse_report_column_headers json with
+      | Error (`Malformed msg) -> Error (`Malformed msg)
+      | Ok column_headers ->
+          (match ensure_requested_report_metrics ~requested_metrics:metrics ~column_headers with
+           | Error (`Malformed msg) -> Error (`Malformed msg)
+           | Ok () ->
+               (match parse_report_rows ~column_headers json with
+                | Error (`Malformed msg) -> Error (`Malformed msg)
+                | Ok rows ->
+                    Ok
+                      {
+                        start_date;
+                        end_date;
+                        metrics;
+                        column_headers;
+                        rows;
+                      }))
+    with e ->
+      Error
+        (`Malformed
+          (Printf.sprintf
+             "Failed to parse account report response: %s"
+             (Printexc.to_string e)))
+
+  let parse_post_analytics_report_response ~video_id ~start_date ~end_date ~metrics response_body =
+    try
+      let json = Yojson.Basic.from_string response_body in
+      match parse_report_column_headers json with
+      | Error (`Malformed msg) -> Error (`Malformed msg)
+      | Ok column_headers ->
+          (match ensure_requested_report_metrics ~requested_metrics:metrics ~column_headers with
+           | Error (`Malformed msg) -> Error (`Malformed msg)
+           | Ok () ->
+               (match parse_report_rows ~column_headers json with
+                | Error (`Malformed msg) -> Error (`Malformed msg)
+                | Ok rows ->
+                    Ok
+                      {
+                        video_id;
+                        start_date;
+                        end_date;
+                        metrics;
+                        column_headers;
+                        rows;
+                      }))
+    with e ->
+      Error
+        (`Malformed
+          (Printf.sprintf "Failed to parse post report response: %s" (Printexc.to_string e)))
 
   let account_analytics_url () =
     youtube_api_base ^ "/channels?part=id,snippet,statistics&mine=true"
@@ -763,6 +1041,88 @@ module Make (Config : CONFIG) = struct
       (function
         | Ok analytics -> on_result (Ok (to_canonical_post_analytics_series analytics))
         | Error err -> on_result (Error err))
+
+  let get_account_analytics_report ~account_id ~start_date ~end_date ~metrics on_result =
+    match validate_reports_query_inputs ~start_date ~end_date ~metrics with
+    | Error err -> on_result (Error err)
+    | Ok (normalized_start_date, normalized_end_date, normalized_metrics) ->
+        ensure_valid_token ~account_id
+          (fun access_token ->
+            let url =
+              account_analytics_report_url
+                ~start_date:normalized_start_date
+                ~end_date:normalized_end_date
+                ~metrics:normalized_metrics
+            in
+            let headers = [ ("Authorization", "Bearer " ^ access_token) ] in
+            Config.Http.get ~headers url
+              (fun response ->
+                if response.status >= 200 && response.status < 300 then
+                  match
+                    parse_account_analytics_report_response
+                      ~start_date:normalized_start_date
+                      ~end_date:normalized_end_date
+                      ~metrics:normalized_metrics
+                      response.body
+                  with
+                  | Ok report -> on_result (Ok report)
+                  | Error (`Malformed msg) ->
+                      on_result (Error (Error_types.Internal_error msg))
+                else
+                  on_result
+                    (Error
+                       (parse_api_error
+                          ~status_code:response.status
+                          ~response_body:response.body)))
+              (fun err -> on_result (Error (Error_types.Internal_error err))))
+          (fun err -> on_result (Error err))
+
+  let get_post_analytics_report
+      ~account_id
+      ~video_id
+      ~start_date
+      ~end_date
+      ~metrics
+      on_result =
+    let normalized_video_id = String.trim video_id in
+    if normalized_video_id = "" then
+      on_result (Error (Error_types.Internal_error "video_id is required"))
+    else
+      match validate_reports_query_inputs ~start_date ~end_date ~metrics with
+      | Error err -> on_result (Error err)
+      | Ok (normalized_start_date, normalized_end_date, normalized_metrics) ->
+          ensure_valid_token ~account_id
+            (fun access_token ->
+              let url =
+                post_analytics_report_url
+                  ~video_id:normalized_video_id
+                  ~start_date:normalized_start_date
+                  ~end_date:normalized_end_date
+                  ~metrics:normalized_metrics
+              in
+              let headers = [ ("Authorization", "Bearer " ^ access_token) ] in
+              Config.Http.get ~headers url
+                (fun response ->
+                  if response.status >= 200 && response.status < 300 then
+                    match
+                      parse_post_analytics_report_response
+                        ~video_id:normalized_video_id
+                        ~start_date:normalized_start_date
+                        ~end_date:normalized_end_date
+                        ~metrics:normalized_metrics
+                        response.body
+                    with
+                    | Ok report -> on_result (Ok report)
+                    | Error (`Malformed msg) ->
+                        on_result (Error (Error_types.Internal_error msg))
+                  else
+                    on_result
+                      (Error
+                         (parse_api_error
+                            ~status_code:response.status
+                            ~response_body:response.body)))
+                (fun err -> on_result (Error (Error_types.Internal_error err))))
+            (fun err -> on_result (Error err))
 
   let supported_thumbnail_content_types =
     [ "image/jpeg"; "image/jpg"; "image/png"; "image/webp" ]

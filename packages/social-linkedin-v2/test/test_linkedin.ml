@@ -14,6 +14,9 @@ let find_header headers name =
   List.find_opt (fun (k, _) -> String.lowercase_ascii k = String.lowercase_ascii name) headers
   |> Option.map snd
 
+let find_header_exact headers name =
+  List.find_opt (fun (k, _) -> k = name) headers |> Option.map snd
+
 (** Helper to handle outcome results in tests *)
 let handle_outcome on_success on_error outcome =
   match outcome with
@@ -350,7 +353,7 @@ let test_get_organization_access () =
             assert (string_contains url "/rest/organizationAcls");
             assert (string_contains url "q=roleAssignee");
             assert (find_header headers "X-RestLi-Method" = Some "FINDER");
-            assert (find_header headers "Linkedin-Version" = Some "202601")
+            assert (find_header_exact headers "LinkedIn-Version" = Some "202601")
         | [] -> failwith "No requests recorded for get_organization_access");
         print_endline "✓ Get organization access")
       (fun err -> failwith ("Get organization access failed: " ^ err)))
@@ -582,7 +585,7 @@ let test_get_organization_access_uppercases_role_state_filters () =
       )
       (fun err -> failwith ("Get organization access uppercase role/state filters failed: " ^ err)))
 
-(** Test: get_organization_access falls back to default Linkedin-Version header when env is invalid *)
+(** Test: get_organization_access falls back to default LinkedIn-Version header when env is invalid *)
 let test_get_organization_access_invalid_version_fallback () =
   Mock_config.reset ();
   Mock_config.set_env "LINKEDIN_VERSION" "bad-version";
@@ -614,13 +617,13 @@ let test_get_organization_access_invalid_version_fallback () =
         let requests = !Mock_http.requests in
         (match requests with
         | (_, _, headers, _) :: _ ->
-            assert (find_header headers "Linkedin-Version" = Some "202601");
+            assert (find_header_exact headers "LinkedIn-Version" = Some "202601");
             print_endline "✓ Get organization access invalid version falls back"
         | [] -> failwith "No requests recorded")
       )
       (fun err -> failwith ("Get organization access invalid version fallback failed: " ^ err)))
 
-(** Test: get_organization_access uses valid configured Linkedin-Version header *)
+(** Test: get_organization_access uses valid configured LinkedIn-Version header *)
 let test_get_organization_access_valid_version_header () =
   Mock_config.reset ();
   Mock_config.set_env "LINKEDIN_VERSION" "202602";
@@ -652,7 +655,7 @@ let test_get_organization_access_valid_version_header () =
         let requests = !Mock_http.requests in
         (match requests with
         | (_, _, headers, _) :: _ ->
-            assert (find_header headers "Linkedin-Version" = Some "202602");
+            assert (find_header_exact headers "LinkedIn-Version" = Some "202602");
             print_endline "✓ Get organization access uses valid configured version"
         | [] -> failwith "No requests recorded")
       )
@@ -690,7 +693,7 @@ let test_get_organization_access_invalid_month_version_fallback () =
         let requests = !Mock_http.requests in
         (match requests with
         | (_, _, headers, _) :: _ ->
-            assert (find_header headers "Linkedin-Version" = Some "202601");
+            assert (find_header_exact headers "LinkedIn-Version" = Some "202601");
             print_endline "✓ Get organization access invalid month falls back"
         | [] -> failwith "No requests recorded")
       )
@@ -728,7 +731,7 @@ let test_get_organization_access_dotted_version_fallback () =
         let requests = !Mock_http.requests in
         (match requests with
         | (_, _, headers, _) :: _ ->
-            assert (find_header headers "Linkedin-Version" = Some "202601");
+            assert (find_header_exact headers "LinkedIn-Version" = Some "202601");
             print_endline "✓ Get organization access dotted version falls back"
         | [] -> failwith "No requests recorded")
       )
@@ -3322,7 +3325,7 @@ let test_get_account_analytics () =
             assert (find_header follower_headers "X-RestLi-Method" = Some "FINDER");
             assert (find_header share_headers "X-RestLi-Method" = Some "FINDER");
             assert (find_header follower_headers "X-Restli-Protocol-Version" = Some "2.0.0");
-            assert (find_header follower_headers "Linkedin-Version" = Some "202601")
+            assert (find_header_exact follower_headers "LinkedIn-Version" = Some "202601")
         | _ -> failwith "Expected two analytics finder requests");
         print_endline "✓ Get account analytics")
       (fun err -> failwith ("Get account analytics failed: " ^ err)))

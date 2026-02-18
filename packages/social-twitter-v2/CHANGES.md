@@ -40,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### Analytics
 - **`get_account_analytics`** - Account metrics via `/2/users/me` + `public_metrics`
 - **`get_post_analytics`** - Post metrics via `/2/tweets/{id}` + `public_metrics`
+- Added optional `metric_set` parameter for `get_post_analytics` and `get_post_analytics_canonical`:
+  - `Public_metrics_only` (default, backward-compatible behavior)
+  - `Expanded_metrics` (requests `non_public_metrics`, `organic_metrics`, `promoted_metrics`)
+  - `Expanded_metrics_with_fallback` (automatically retries with public-only metrics when expanded metrics are forbidden/unavailable)
+- Added typed parsing for expanded post metric objects (when present), including fields such as `url_link_clicks`, `user_profile_clicks`, and `video_view_count`
 - Added canonical analytics conversion helpers for social-core metric normalization
 
 #### Payload Parity

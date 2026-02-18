@@ -397,8 +397,168 @@ let test_get_post_analytics_contract_and_parsing () =
                assert (List.assoc_opt "Authorization" headers = Some "Bearer valid_token")
            | _ -> failwith "unexpected request count for post analytics");
           print_endline "✓ Post analytics request contract + parsing"
-       | Error err ->
-           failwith ("Post analytics failed: " ^ Error_types.error_to_string err))
+        | Error err ->
+            failwith ("Post analytics failed: " ^ Error_types.error_to_string err))
+
+let test_get_account_analytics_report_contract_and_parsing () =
+  Mock_config.reset ();
+  set_valid_credentials ~account_id:"test_account";
+
+  let response_body = {|{
+    "columnHeaders": [
+      {"name": "day", "columnType": "DIMENSION", "dataType": "STRING"},
+      {"name": "views", "columnType": "METRIC", "dataType": "INTEGER"},
+      {"name": "likes", "columnType": "METRIC", "dataType": "INTEGER"}
+    ],
+    "rows": [
+      ["2026-01-01", 10, 2],
+      ["2026-01-02", "14", "3"]
+    ]
+  }|} in
+
+  Mock_http.set_responses [ { status = 200; body = response_body; headers = [] } ];
+
+  YouTube.get_account_analytics_report
+    ~account_id:"test_account"
+    ~start_date:"2026-01-01"
+    ~end_date:"2026-01-02"
+    ~metrics:[ "views"; "likes" ]
+    (function
+      | Ok report ->
+          assert (report.start_date = "2026-01-01");
+          assert (report.end_date = "2026-01-02");
+          assert (report.metrics = [ "views"; "likes" ]);
+          assert (List.length report.column_headers = 3);
+          assert (List.length report.rows = 2);
+          let first_row = List.hd report.rows in
+          assert (first_row.day = "2026-01-01");
+          assert (List.assoc_opt "views" first_row.metrics = Some 10);
+          assert (List.assoc_opt "likes" first_row.metrics = Some 2);
+          (match List.rev !Mock_http.requests with
+           | [ ("GET", url, headers, _) ] ->
+               assert (string_contains url "youtubeanalytics.googleapis.com/v2/reports?");
+               assert (query_param url "ids" = Some "channel==MINE");
+               assert (query_param url "startDate" = Some "2026-01-01");
+               assert (query_param url "endDate" = Some "2026-01-02");
+               assert (query_param url "metrics" = Some "views,likes");
+               assert (query_param url "dimensions" = Some "day");
+               assert (query_param url "filters" = None);
+               assert (List.assoc_opt "Authorization" headers = Some "Bearer valid_token")
+           | _ -> failwith "unexpected request count for account analytics report");
+          print_endline "✓ Account analytics report request contract + parsing"
+      | Error err ->
+          failwith ("Account analytics report failed: " ^ Error_types.error_to_string err))
+
+let test_get_post_analytics_report_contract_and_parsing () =
+  Mock_config.reset ();
+  set_valid_credentials ~account_id:"test_account";
+
+  let response_body = {|{
+    "columnHeaders": [
+      {"name": "day", "columnType": "DIMENSION", "dataType": "STRING"},
+      {"name": "views", "columnType": "METRIC", "dataType": "INTEGER"}
+    ],
+    "rows": [
+      ["2026-01-03", 22]
+    ]
+  }|} in
+
+  Mock_http.set_responses [ { status = 200; body = response_body; headers = [] } ];
+
+  YouTube.get_post_analytics_report
+    ~account_id:"test_account"
+    ~video_id:"video-42"
+    ~start_date:"2026-01-03"
+    ~end_date:"2026-01-03"
+    ~metrics:[ "views" ]
+    (function
+      | Ok report ->
+          assert (report.video_id = "video-42");
+          assert (report.start_date = "2026-01-03");
+          assert (report.end_date = "2026-01-03");
+          assert (report.metrics = [ "views" ]);
+          assert (List.length report.column_headers = 2);
+          assert (List.length report.rows = 1);
+          let first_row = List.hd report.rows in
+          assert (first_row.day = "2026-01-03");
+          assert (List.assoc_opt "views" first_row.metrics = Some 22);
+          (match List.rev !Mock_http.requests with
+           | [ ("GET", url, headers, _) ] ->
+               assert (string_contains url "youtubeanalytics.googleapis.com/v2/reports?");
+               assert (query_param url "ids" = Some "channel==MINE");
+               assert (query_param url "startDate" = Some "2026-01-03");
+               assert (query_param url "endDate" = Some "2026-01-03");
+               assert (query_param url "metrics" = Some "views");
+               assert (query_param url "dimensions" = Some "day");
+               assert (query_param url "filters" = Some "video==video-42");
+               assert (List.assoc_opt "Authorization" headers = Some "Bearer valid_token")
+           | _ -> failwith "unexpected request count for post analytics report");
+          print_endline "✓ Post analytics report request contract + parsing"
+      | Error err ->
+          failwith ("Post analytics report failed: " ^ Error_types.error_to_string err))
+
+let test_parse_report_helpers_rows_and_column_headers () =
+  let report_json = Yojson.Basic.from_string {|{
+    "columnHeaders": [
+      {"name": "day", "columnType": "DIMENSION", "dataType": "STRING"},
+      {"name": "views", "columnType": "METRIC", "dataType": "INTEGER"},
+      {"name": "comments", "columnType": "METRIC", "dataType": "INTEGER"}
+    ],
+    "rows": [
+      ["2026-01-04", 17, "5"],
+      ["2026-01-05", "23", 7]
+    ]
+  }|} in
+  match YouTube.parse_report_column_headers report_json with
+  | Error (`Malformed msg) -> failwith ("Column header parsing failed: " ^ msg)
+  | Ok column_headers ->
+      assert (List.length column_headers = 3);
+      assert ((List.hd column_headers).name = "day");
+      (match YouTube.parse_report_rows ~column_headers report_json with
+       | Error (`Malformed msg) -> failwith ("Row parsing failed: " ^ msg)
+       | Ok rows ->
+           assert (List.length rows = 2);
+           let second_row = List.hd (List.tl rows) in
+           assert (second_row.day = "2026-01-05");
+           assert (List.assoc_opt "views" second_row.metrics = Some 23);
+           assert (List.assoc_opt "comments" second_row.metrics = Some 7);
+           print_endline "✓ Report parser helpers for rows + headers")
+
+let test_report_parser_malformed_and_partial_payloads () =
+  let malformed_payload = {|{
+    "rows": [["2026-01-01", 10]]
+  }|} in
+  (match
+     YouTube.parse_account_analytics_report_response
+       ~start_date:"2026-01-01"
+       ~end_date:"2026-01-01"
+       ~metrics:[ "views" ]
+       malformed_payload
+   with
+   | Error (`Malformed _) -> ()
+   | Ok _ -> failwith "Expected malformed report payload to fail parsing");
+
+  let partial_payload = {|{
+    "columnHeaders": [
+      {"name": "day", "columnType": "DIMENSION", "dataType": "STRING"},
+      {"name": "views", "columnType": "METRIC", "dataType": "INTEGER"},
+      {"name": "likes", "columnType": "METRIC", "dataType": "INTEGER"}
+    ],
+    "rows": [
+      ["2026-01-01", 10]
+    ]
+  }|} in
+  (match
+     YouTube.parse_post_analytics_report_response
+       ~video_id:"video-42"
+       ~start_date:"2026-01-01"
+       ~end_date:"2026-01-01"
+       ~metrics:[ "views"; "likes" ]
+       partial_payload
+   with
+   | Error (`Malformed _) ->
+       print_endline "✓ Report parser malformed/partial payload handling"
+   | Ok _ -> failwith "Expected partial report payload to fail parsing")
 
 let test_canonical_analytics_adapters () =
   let find_series provider_metric series =
@@ -768,6 +928,10 @@ let () =
   print_endline "--- Analytics & Thumbnail Tests ---";
   test_get_account_analytics_contract_and_parsing ();
   test_get_post_analytics_contract_and_parsing ();
+  test_get_account_analytics_report_contract_and_parsing ();
+  test_get_post_analytics_report_contract_and_parsing ();
+  test_parse_report_helpers_rows_and_column_headers ();
+  test_report_parser_malformed_and_partial_payloads ();
   test_canonical_analytics_adapters ();
   test_build_thumbnail_upload_request_contract ();
   test_upload_thumbnail_contract ();
@@ -789,7 +953,7 @@ let () =
   print_endline "Test Coverage Summary:";
   print_endline "  - OAuth 2.0 with PKCE (3 tests)";
   print_endline "  - Content validation (4 tests)";
-  print_endline "  - Analytics + thumbnail contracts (4 tests)";
+  print_endline "  - Analytics + reports + thumbnail contracts (8 tests)";
   print_endline "  - Video upload/resumable (7 tests)";
   print_endline "";
-  print_endline "Total: 18 test functions"
+  print_endline "Total: 22 test functions"

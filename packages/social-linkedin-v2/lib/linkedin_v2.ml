@@ -761,7 +761,7 @@ module Make (Config : CONFIG) = struct
       [
         ("Authorization", Printf.sprintf "Bearer %s" access_token);
         ("X-Restli-Protocol-Version", "2.0.0");
-        ("Linkedin-Version", linkedin_version_header ());
+        ("LinkedIn-Version", linkedin_version_header ());
         ("X-RestLi-Method", "FINDER");
       ]
     in
@@ -2349,7 +2349,7 @@ module Make (Config : CONFIG) = struct
             let headers =
               [ ("Authorization", Printf.sprintf "Bearer %s" access_token);
                 ("X-Restli-Protocol-Version", "2.0.0");
-                ("Linkedin-Version", linkedin_version_header ());
+                ("LinkedIn-Version", linkedin_version_header ());
                 ("X-RestLi-Method", "FINDER") ]
             in
 

@@ -1616,6 +1616,159 @@ let test_get_post_analytics_request_contract () =
   assert (auth_header = "Bearer test_access_token");
   print_endline "✓ Post analytics request contract test passed"
 
+let test_get_post_analytics_request_contract_expanded_metric_set () =
+  analytics_contract_get_urls := [];
+  analytics_contract_get_headers := [];
+  analytics_contract_responses := [
+    {
+      Social_core.status = 200;
+      headers = [("content-type", "application/json")];
+      body = {|{
+        "data": {
+          "id": "tweet_expanded_42",
+          "text": "hello",
+          "public_metrics": {
+            "retweet_count": 2,
+            "reply_count": 3,
+            "like_count": 4,
+            "quote_count": 5,
+            "bookmark_count": 6,
+            "impression_count": 7
+          },
+          "non_public_metrics": {
+            "impression_count": 77,
+            "url_link_clicks": 9,
+            "user_profile_clicks": 10
+          }
+        }
+      }|};
+    }
+  ];
+
+  let result = ref None in
+  Twitter_analytics_contract.get_post_analytics
+    ~account_id:"test_account"
+    ~tweet_id:"tweet_expanded_42"
+    ~metric_set:Twitter_analytics_contract.Expanded_metrics
+    (function
+      | Ok analytics -> result := Some (Ok analytics)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok analytics) ->
+       assert (analytics.tweet_id = "tweet_expanded_42");
+       (match analytics.non_public_metrics with
+        | Some non_public ->
+            assert (non_public.impression_count = Some 77);
+            assert (non_public.url_link_clicks = Some 9);
+            assert (non_public.user_profile_clicks = Some 10)
+        | None -> failwith "Expected non_public_metrics in expanded response")
+   | Some (Error err) -> failwith ("Expanded post analytics request contract failed: " ^ err)
+   | None -> failwith "No result in expanded post analytics request contract test");
+
+  (match !analytics_contract_get_urls with
+   | [url] ->
+       let uri = Uri.of_string url in
+       assert (Uri.path uri = "/2/tweets/tweet_expanded_42");
+       assert
+         ((Uri.get_query_param uri "tweet.fields" |> Option.value ~default:"")
+          = "text,public_metrics,non_public_metrics,organic_metrics,promoted_metrics")
+   | _ -> failwith "Expected exactly one expanded post analytics GET request");
+
+  let auth_header = List.assoc_opt "Authorization" !analytics_contract_get_headers |> Option.value ~default:"" in
+  assert (auth_header = "Bearer test_access_token");
+  print_endline "✓ Expanded post analytics request contract test passed"
+
+let test_get_post_analytics_expanded_forbidden_fallback () =
+  analytics_contract_get_urls := [];
+  analytics_contract_get_headers := [];
+  analytics_contract_responses := [
+    {
+      Social_core.status = 403;
+      headers = [("content-type", "application/json")];
+      body = {|{"detail":"Forbidden: non_public_metrics requires elevated access"}|};
+    };
+    {
+      Social_core.status = 200;
+      headers = [("content-type", "application/json")];
+      body = {|{
+        "data": {
+          "id": "tweet_fallback_42",
+          "text": "fallback",
+          "public_metrics": {
+            "retweet_count": 10,
+            "reply_count": 11,
+            "like_count": 12,
+            "quote_count": 13,
+            "bookmark_count": 14,
+            "impression_count": 15
+          }
+        }
+      }|};
+    }
+  ];
+
+  let result = ref None in
+  Twitter_analytics_contract.get_post_analytics
+    ~account_id:"test_account"
+    ~tweet_id:"tweet_fallback_42"
+    ~metric_set:Twitter_analytics_contract.Expanded_metrics_with_fallback
+    (function
+      | Ok analytics -> result := Some (Ok analytics)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok analytics) ->
+       assert (analytics.tweet_id = "tweet_fallback_42");
+       assert (analytics.retweet_count = 10);
+       assert (analytics.non_public_metrics = None)
+   | Some (Error err) -> failwith ("Expected fallback success but got error: " ^ err)
+   | None -> failwith "No result in expanded forbidden fallback test");
+
+  (match !analytics_contract_get_urls with
+   | [expanded_url; fallback_url] ->
+       let expanded_uri = Uri.of_string expanded_url in
+       let fallback_uri = Uri.of_string fallback_url in
+       assert
+         ((Uri.get_query_param expanded_uri "tweet.fields" |> Option.value ~default:"")
+          = "text,public_metrics,non_public_metrics,organic_metrics,promoted_metrics");
+       assert
+         ((Uri.get_query_param fallback_uri "tweet.fields" |> Option.value ~default:"")
+          = "text,public_metrics")
+   | _ -> failwith "Expected expanded request followed by fallback request");
+
+  print_endline "✓ Expanded post analytics forbidden fallback test passed"
+
+let test_get_post_analytics_expanded_forbidden_without_fallback_errors () =
+  analytics_contract_get_urls := [];
+  analytics_contract_get_headers := [];
+  analytics_contract_responses := [
+    {
+      Social_core.status = 403;
+      headers = [("content-type", "application/json")];
+      body = {|{"detail":"Forbidden: non_public_metrics requires elevated access"}|};
+    }
+  ];
+
+  let result = ref None in
+  Twitter_analytics_contract.get_post_analytics
+    ~account_id:"test_account"
+    ~tweet_id:"tweet_forbidden_42"
+    ~metric_set:Twitter_analytics_contract.Expanded_metrics
+    (function
+      | Ok _ -> result := Some (Ok ())
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Error _err) -> ()
+   | Some (Ok ()) -> failwith "Expected strict expanded metric set to return forbidden error"
+   | None -> failwith "No result in strict expanded forbidden test");
+
+  (match !analytics_contract_get_urls with
+   | [_url] -> ()
+   | _ -> failwith "Expected exactly one strict expanded analytics request");
+  print_endline "✓ Expanded post analytics forbidden without fallback test passed"
+
 let test_account_analytics_parser_normalization () =
   let body = {|{
     "data": {
@@ -1662,6 +1815,68 @@ let test_post_analytics_parser_normalization () =
       assert (analytics.impression_count = 0);
       print_endline "✓ Post analytics parser normalization test passed"
   | Error _ -> failwith "Post analytics parser normalization failed"
+
+let test_post_analytics_parser_partial_expanded_metrics () =
+  let body = {|{
+    "data": {
+      "id": "tweet_partial_expanded_1",
+      "public_metrics": {
+        "retweet_count": 5,
+        "reply_count": 4,
+        "like_count": 3,
+        "quote_count": 2,
+        "bookmark_count": 1,
+        "impression_count": 99
+      },
+      "non_public_metrics": {
+        "impression_count": "123",
+        "url_link_clicks": 7
+      },
+      "organic_metrics": {
+        "retweet_count": 8,
+        "engagements": "17"
+      },
+      "promoted_metrics": {}
+    }
+  }|} in
+  match Twitter.parse_post_analytics_response ~tweet_id:"tweet_partial_expanded_1" body with
+  | Ok analytics ->
+      (match analytics.non_public_metrics with
+       | Some non_public ->
+           assert (non_public.impression_count = Some 123);
+           assert (non_public.url_link_clicks = Some 7);
+           assert (non_public.user_profile_clicks = None)
+       | None -> failwith "Expected non_public_metrics for partial expanded parser test");
+      (match analytics.organic_metrics with
+       | Some organic ->
+           assert (organic.retweet_count = Some 8);
+           assert (organic.engagements = Some 17)
+       | None -> failwith "Expected organic_metrics for partial expanded parser test");
+      assert (analytics.promoted_metrics = None);
+      print_endline "✓ Post analytics parser partial expanded metrics test passed"
+  | Error _ -> failwith "Post analytics parser partial expanded metrics failed"
+
+let test_post_analytics_parser_missing_expanded_metrics () =
+  let body = {|{
+    "data": {
+      "id": "tweet_missing_expanded_1",
+      "public_metrics": {
+        "retweet_count": 1,
+        "reply_count": 2,
+        "like_count": 3,
+        "quote_count": 4,
+        "bookmark_count": 5,
+        "impression_count": 6
+      }
+    }
+  }|} in
+  match Twitter.parse_post_analytics_response ~tweet_id:"tweet_missing_expanded_1" body with
+  | Ok analytics ->
+      assert (analytics.non_public_metrics = None);
+      assert (analytics.organic_metrics = None);
+      assert (analytics.promoted_metrics = None);
+      print_endline "✓ Post analytics parser missing expanded metrics test passed"
+  | Error _ -> failwith "Post analytics parser missing expanded metrics failed"
 
 let invalid_media_post_calls = ref 0
 
@@ -5272,6 +5487,9 @@ let test_canonical_analytics_adapters () =
     quote_count = 2;
     bookmark_count = 1;
     impression_count = 500;
+    non_public_metrics = None;
+    organic_metrics = None;
+    promoted_metrics = None;
   } in
   let post_series = Twitter.to_canonical_post_analytics_series post_analytics in
   assert (List.length post_series = 6);
@@ -5389,8 +5607,13 @@ let () =
   test_get_me ();
   test_get_account_analytics_request_contract ();
   test_get_post_analytics_request_contract ();
+  test_get_post_analytics_request_contract_expanded_metric_set ();
+  test_get_post_analytics_expanded_forbidden_fallback ();
+  test_get_post_analytics_expanded_forbidden_without_fallback_errors ();
   test_account_analytics_parser_normalization ();
   test_post_analytics_parser_normalization ();
+  test_post_analytics_parser_partial_expanded_metrics ();
+  test_post_analytics_parser_missing_expanded_metrics ();
   test_canonical_analytics_adapters ();
   test_search_users ();
   test_follow_operations ();

@@ -1504,8 +1504,166 @@ let test_get_posts_after_cursor_whitespace_omitted () =
            | [ (_, _, _, _); (_, posts_url, _, _) ] ->
                assert (not (string_contains posts_url "after="));
                print_endline "ok: get posts after whitespace omitted"
-           | _ -> failwith "unexpected request count for get_posts after omit")
+            | _ -> failwith "unexpected request count for get_posts after omit")
       | Error err -> failwith ("unexpected get_posts after omit error: " ^ Error_types.error_to_string err))
+
+let test_get_account_insights_contract () =
+  Mock_config.reset ();
+  Mock_config.credentials_store :=
+    [
+      ( "acct-1",
+        {
+          access_token = "access-xyz";
+          refresh_token = None;
+          expires_at = None;
+          token_type = "Bearer";
+        } );
+    ];
+  Mock_http.set_responses
+    [
+      {
+        status = 200;
+        headers = [];
+        body = "{\"id\":\"user-1\",\"username\":\"alice\"}";
+      };
+      {
+        status = 200;
+        headers = [];
+        body =
+          "{\"data\":[{\"name\":\"views\",\"period\":\"day\",\"values\":[{\"value\":120,\"end_time\":\"2025-01-02T00:00:00+0000\"}]},{\"name\":\"likes\",\"period\":\"day\",\"values\":[{\"value\":7,\"end_time\":\"2025-01-02T00:00:00+0000\"}]}]}";
+      };
+    ];
+  Threads.get_account_insights
+    ~account_id:"acct-1"
+    ~since:"2025-01-01"
+    ~until:"2025-01-02"
+    (function
+      | Ok insights ->
+          assert (List.length insights = 2);
+          let first = List.hd insights in
+          assert (first.metric = Social_threads_v1.Views);
+          assert (List.length first.values = 1);
+          assert ((List.hd first.values).value = 120);
+          let requests = List.rev !Mock_http.requests in
+          (match requests with
+           | [ (_, me_url, _, _); (_, insights_url, _, _) ] ->
+               assert (string_contains me_url "/v1.0/me?");
+               assert (string_contains insights_url "/v1.0/user-1/threads_insights?");
+               assert (query_param insights_url "metric" = Some "views,likes,replies,reposts,quotes");
+               assert (query_param insights_url "period" = Some "day");
+               assert (query_param insights_url "since" = Some "2025-01-01");
+               assert (query_param insights_url "until" = Some "2025-01-02");
+               assert (query_param insights_url "access_token" = Some "access-xyz")
+           | _ -> failwith "unexpected request count for account insights");
+          print_endline "ok: account insights contract"
+      | Error err ->
+          failwith
+            ("unexpected account insights error: " ^ Error_types.error_to_string err))
+
+let test_get_account_insights_malformed_payload_returns_internal_error () =
+  Mock_config.reset ();
+  Mock_config.credentials_store :=
+    [
+      ( "acct-1",
+        {
+          access_token = "access-xyz";
+          refresh_token = None;
+          expires_at = None;
+          token_type = "Bearer";
+        } );
+    ];
+  Mock_http.set_responses
+    [
+      {
+        status = 200;
+        headers = [];
+        body = "{\"id\":\"user-1\",\"username\":\"alice\"}";
+      };
+      {
+        status = 200;
+        headers = [];
+        body = "{\"data\":[{\"period\":\"day\",\"values\":[{\"value\":120}]}]}";
+      };
+    ];
+  Threads.get_account_insights
+    ~account_id:"acct-1"
+    ~since:"2025-01-01"
+    ~until:"2025-01-02"
+    (function
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "Failed to parse account insights response");
+          print_endline "ok: account insights malformed payload mapped internal"
+      | _ -> failwith "expected internal error for malformed account insights payload")
+
+let test_get_post_insights_contract () =
+  Mock_config.reset ();
+  Mock_config.credentials_store :=
+    [
+      ( "acct-1",
+        {
+          access_token = "access-xyz";
+          refresh_token = None;
+          expires_at = None;
+          token_type = "Bearer";
+        } );
+    ];
+  Mock_http.set_responses
+    [
+      {
+        status = 200;
+        headers = [];
+        body =
+          "{\"data\":[{\"name\":\"views\",\"period\":\"lifetime\",\"values\":[{\"value\":55}]},{\"name\":\"quotes\",\"period\":\"lifetime\",\"value\":2}]}";
+      };
+    ];
+  Threads.get_post_insights ~account_id:"acct-1" ~post_id:"post-1"
+    (function
+      | Ok insights ->
+          assert (List.length insights = 2);
+          let first = List.hd insights in
+          assert (first.metric = Social_threads_v1.Views);
+          assert (first.value = 55);
+          let second = List.nth insights 1 in
+          assert (second.metric = Social_threads_v1.Quotes);
+          assert (second.value = 2);
+          let requests = List.rev !Mock_http.requests in
+          (match requests with
+           | [ (_, insights_url, _, _) ] ->
+               assert (string_contains insights_url "/v1.0/post-1/insights?");
+               assert (query_param insights_url "metric" = Some "views,likes,replies,reposts,quotes");
+               assert (query_param insights_url "access_token" = Some "access-xyz")
+           | _ -> failwith "unexpected request count for post insights");
+          print_endline "ok: post insights contract"
+      | Error err ->
+          failwith
+            ("unexpected post insights error: " ^ Error_types.error_to_string err))
+
+let test_get_post_insights_malformed_payload_returns_internal_error () =
+  Mock_config.reset ();
+  Mock_config.credentials_store :=
+    [
+      ( "acct-1",
+        {
+          access_token = "access-xyz";
+          refresh_token = None;
+          expires_at = None;
+          token_type = "Bearer";
+        } );
+    ];
+  Mock_http.set_responses
+    [
+      {
+        status = 200;
+        headers = [];
+        body = "{\"data\":[{\"name\":\"views\",\"period\":\"lifetime\",\"values\":[]}]}";
+      };
+    ];
+  Threads.get_post_insights ~account_id:"acct-1" ~post_id:"post-1"
+    (function
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "Failed to parse post insights response");
+          print_endline "ok: post insights malformed payload mapped internal"
+      | _ -> failwith "expected internal error for malformed post insights payload")
 
 let test_post_single_image_success () =
   Mock_config.reset ();
@@ -2896,6 +3054,49 @@ let test_post_thread_rejects_extra_empty_media_entries () =
           print_endline "ok: thread extra empty media rejected"
       | _ -> failwith "expected validation failure for extra empty media entries")
 
+let test_canonical_insights_adapters () =
+  let find_series provider_metric series =
+    List.find_opt
+      (fun item -> item.Analytics_types.provider_metric = Some provider_metric)
+      series
+  in
+
+  let account_insights : Social_threads_v1.account_insight list =
+    [ { metric = Social_threads_v1.Views;
+        period = Some "day";
+        values =
+          [ { value = 110; end_time = Some "2025-01-02T00:00:00+0000" };
+            { value = 120; end_time = Some "2025-01-03T00:00:00+0000" } ] };
+      { metric = Social_threads_v1.Likes;
+        period = Some "day";
+        values = [ { value = 9; end_time = Some "2025-01-02T00:00:00+0000" } ] } ]
+  in
+  let account_series =
+    Social_threads_v1.to_canonical_account_insights_series account_insights
+  in
+  assert (List.length account_series = 2);
+  (match find_series "views" account_series with
+   | Some item ->
+       assert (Analytics_types.canonical_metric_key item.metric = "views");
+       assert ((List.hd item.points).value = 110)
+   | None -> failwith "Missing views canonical series");
+
+  let post_insights : Social_threads_v1.post_insight list =
+    [ { metric = Social_threads_v1.Reposts; period = Some "day"; value = 4 };
+      { metric = Social_threads_v1.Quotes; period = Some "day"; value = 2 } ]
+  in
+  let post_series =
+    Social_threads_v1.to_canonical_post_insights_series post_insights
+  in
+  assert (List.length post_series = 2);
+  (match find_series "reposts" post_series with
+   | Some item ->
+       assert (Analytics_types.canonical_metric_key item.metric = "reposts");
+       assert ((List.hd item.points).value = 4)
+   | None -> failwith "Missing reposts canonical series");
+
+  print_endline "ok: canonical insights adapters"
+
 let () =
   test_oauth_url ();
   test_oauth_url_encodes_special_characters ();
@@ -2960,6 +3161,11 @@ let () =
   test_get_posts_limit_clamped_to_maximum ();
   test_get_posts_after_cursor_trimmed ();
   test_get_posts_after_cursor_whitespace_omitted ();
+  test_get_account_insights_contract ();
+  test_get_account_insights_malformed_payload_returns_internal_error ();
+  test_get_post_insights_contract ();
+  test_get_post_insights_malformed_payload_returns_internal_error ();
+  test_canonical_insights_adapters ();
   test_post_single_success ();
   test_post_single_text_trimmed_before_send ();
   test_post_single_no_retry_on_publish_500 ();

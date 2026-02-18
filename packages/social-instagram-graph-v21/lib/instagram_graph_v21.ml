@@ -731,7 +731,356 @@ module Make (Config : CONFIG) = struct
             (fun () -> on_success creds.access_token)
             (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
       (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
-  
+
+  (** {1 Insights (P0 Analytics)} *)
+
+  type insight_point = {
+    value : int option;
+    end_time : string option;
+  }
+
+  type account_audience_insights = {
+    account_id : string;
+    since : string;
+    until : string;
+    follower_count : insight_point list;
+    reach : insight_point list;
+  }
+
+  type account_engagement_insights = {
+    account_id : string;
+    since : string;
+    until : string;
+    likes : insight_point list;
+    views : insight_point list;
+    comments : insight_point list;
+    shares : insight_point list;
+    saves : insight_point list;
+    replies : insight_point list;
+  }
+
+  type media_insights = {
+    post_id : string;
+    views : int option;
+    reach : int option;
+    saved : int option;
+    likes : int option;
+    comments : int option;
+    shares : int option;
+  }
+
+  let account_audience_metric_names = [ "follower_count"; "reach" ]
+
+  let account_engagement_metric_names =
+    [ "likes"; "views"; "comments"; "shares"; "saves"; "replies" ]
+
+  let media_insight_metric_names =
+    [ "views"; "reach"; "saved"; "likes"; "comments"; "shares" ]
+
+  let account_audience_canonical_metric_keys =
+    Analytics_normalization.canonical_metric_keys_of_provider_metrics
+      ~provider:Analytics_normalization.Instagram
+      account_audience_metric_names
+
+  let account_engagement_canonical_metric_keys =
+    Analytics_normalization.canonical_metric_keys_of_provider_metrics
+      ~provider:Analytics_normalization.Instagram
+      account_engagement_metric_names
+
+  let media_insight_canonical_metric_keys =
+    Analytics_normalization.canonical_metric_keys_of_provider_metrics
+      ~provider:Analytics_normalization.Instagram
+      media_insight_metric_names
+
+  let to_canonical_insight_points points =
+    points
+    |> List.filter_map (fun point ->
+           match point.value with
+           | Some value ->
+               Some (Analytics_types.make_datapoint ?timestamp:point.end_time value)
+           | None -> None)
+
+  let to_canonical_optional_point value_opt =
+    match value_opt with
+    | Some value -> [ Analytics_types.make_datapoint value ]
+    | None -> []
+
+  let to_canonical_instagram_series ?time_range ~scope ~provider_metric points =
+    match Analytics_normalization.instagram_metric_to_canonical provider_metric with
+    | Some metric ->
+        Some
+          (Analytics_types.make_series
+             ?time_range
+             ~metric
+             ~scope
+             ~provider_metric
+             points)
+    | None -> None
+
+  let to_canonical_account_audience_insights_series
+      (account_insights : account_audience_insights) =
+    let time_range =
+      {
+        Analytics_types.since = Some account_insights.since;
+        until_ = Some account_insights.until;
+        granularity = Some Analytics_types.Day;
+      }
+    in
+    [ ("follower_count", to_canonical_insight_points account_insights.follower_count);
+      ("reach", to_canonical_insight_points account_insights.reach) ]
+    |> List.filter_map (fun (provider_metric, points) ->
+           to_canonical_instagram_series
+             ~time_range
+             ~scope:Analytics_types.Profile
+             ~provider_metric
+             points)
+
+  let to_canonical_account_engagement_insights_series
+      (account_insights : account_engagement_insights) =
+    let time_range =
+      {
+        Analytics_types.since = Some account_insights.since;
+        until_ = Some account_insights.until;
+        granularity = Some Analytics_types.Day;
+      }
+    in
+    [ ("likes", to_canonical_insight_points account_insights.likes);
+      ("views", to_canonical_insight_points account_insights.views);
+      ("comments", to_canonical_insight_points account_insights.comments);
+      ("shares", to_canonical_insight_points account_insights.shares);
+      ("saves", to_canonical_insight_points account_insights.saves);
+      ("replies", to_canonical_insight_points account_insights.replies) ]
+    |> List.filter_map (fun (provider_metric, points) ->
+           to_canonical_instagram_series
+             ~time_range
+             ~scope:Analytics_types.Profile
+             ~provider_metric
+             points)
+
+  let to_canonical_media_insights_series (media_insights : media_insights) =
+    [ ("views", to_canonical_optional_point media_insights.views);
+      ("reach", to_canonical_optional_point media_insights.reach);
+      ("saved", to_canonical_optional_point media_insights.saved);
+      ("likes", to_canonical_optional_point media_insights.likes);
+      ("comments", to_canonical_optional_point media_insights.comments);
+      ("shares", to_canonical_optional_point media_insights.shares) ]
+    |> List.filter_map (fun (provider_metric, points) ->
+           to_canonical_instagram_series
+             ~scope:Analytics_types.Media
+             ~provider_metric
+             points)
+
+  let int_of_json = function
+    | `Int n -> Some n
+    | `Float f -> Some (int_of_float f)
+    | `String s -> (try Some (int_of_string s) with _ -> None)
+    | _ -> None
+
+  let parse_insight_point json =
+    let open Yojson.Basic.Util in
+    {
+      value = int_of_json (json |> member "value");
+      end_time = json |> member "end_time" |> to_string_option;
+    }
+
+  let parse_metric_points metric_json =
+    let open Yojson.Basic.Util in
+    let values =
+      match metric_json |> member "values" with
+      | `List items -> List.map parse_insight_point items
+      | _ -> []
+    in
+    if values <> [] then values
+    else
+      match metric_json |> member "total_value" |> member "value" |> int_of_json with
+      | Some value -> [ { value = Some value; end_time = None } ]
+      | None -> []
+
+  let find_metric_points metric_name metric_items =
+    List.find_map
+      (fun metric_json ->
+        let open Yojson.Basic.Util in
+        match metric_json |> member "name" |> to_string_option with
+        | Some name when name = metric_name -> Some (parse_metric_points metric_json)
+        | _ -> None)
+      metric_items
+    |> Option.value ~default:[]
+
+  let first_metric_value metric_name metric_items =
+    let points = find_metric_points metric_name metric_items in
+    List.find_map (fun point -> point.value) points
+
+  let parse_account_audience_insights_response ~account_id ~since ~until response_body =
+    try
+      let open Yojson.Basic.Util in
+      let json = Yojson.Basic.from_string response_body in
+      let metric_items = json |> member "data" |> to_list in
+      Ok
+        {
+          account_id;
+          since;
+          until;
+          follower_count = find_metric_points "follower_count" metric_items;
+          reach = find_metric_points "reach" metric_items;
+        }
+    with e ->
+      Error
+        (Error_types.Internal_error
+           (Printf.sprintf "Failed to parse account audience insights: %s"
+              (Printexc.to_string e)))
+
+  let parse_account_engagement_insights_response ~account_id ~since ~until response_body =
+    try
+      let open Yojson.Basic.Util in
+      let json = Yojson.Basic.from_string response_body in
+      let metric_items = json |> member "data" |> to_list in
+      Ok
+        {
+          account_id;
+          since;
+          until;
+          likes = find_metric_points "likes" metric_items;
+          views = find_metric_points "views" metric_items;
+          comments = find_metric_points "comments" metric_items;
+          shares = find_metric_points "shares" metric_items;
+          saves = find_metric_points "saves" metric_items;
+          replies = find_metric_points "replies" metric_items;
+        }
+    with e ->
+      Error
+        (Error_types.Internal_error
+           (Printf.sprintf "Failed to parse account engagement insights: %s"
+              (Printexc.to_string e)))
+
+  let parse_media_insights_response ~post_id response_body =
+    try
+      let open Yojson.Basic.Util in
+      let json = Yojson.Basic.from_string response_body in
+      let metric_items = json |> member "data" |> to_list in
+      Ok
+        {
+          post_id;
+          views = first_metric_value "views" metric_items;
+          reach = first_metric_value "reach" metric_items;
+          saved = first_metric_value "saved" metric_items;
+          likes = first_metric_value "likes" metric_items;
+          comments = first_metric_value "comments" metric_items;
+          shares = first_metric_value "shares" metric_items;
+        }
+    with e ->
+      Error
+        (Error_types.Internal_error
+           (Printf.sprintf "Failed to parse media insights: %s" (Printexc.to_string e)))
+
+  let get_account_audience_insights ~id ~access_token ~since ~until on_result =
+    let params =
+      [
+        ("metric", [ String.concat "," account_audience_metric_names ]);
+        ("period", [ "day" ]);
+        ("since", [ since ]);
+        ("until", [ until ]);
+        ("access_token", [ access_token ]);
+      ]
+    in
+    let query = Uri.encoded_of_query params in
+    let url = Printf.sprintf "%s/%s/insights?%s" graph_api_base id query in
+    Config.Http.get url
+      (fun response ->
+        update_rate_limits response;
+        if response.status >= 200 && response.status < 300 then
+          on_result
+            (parse_account_audience_insights_response ~account_id:id ~since ~until
+               response.body)
+        else on_result (Error (api_error_of_response response)))
+      (fun err -> on_result (Error (network_error_of_string err)))
+
+  let get_account_audience_insights_canonical ~id ~access_token ~since ~until on_result =
+    get_account_audience_insights ~id ~access_token ~since ~until
+      (function
+        | Ok insights ->
+            on_result (Ok (to_canonical_account_audience_insights_series insights))
+        | Error err -> on_result (Error err))
+
+  let get_account_engagement_insights ~id ~access_token ~since ~until on_result =
+    let params =
+      [
+        ("metric_type", [ "total_value" ]);
+        ("metric", [ String.concat "," account_engagement_metric_names ]);
+        ("period", [ "day" ]);
+        ("since", [ since ]);
+        ("until", [ until ]);
+        ("access_token", [ access_token ]);
+      ]
+    in
+    let query = Uri.encoded_of_query params in
+    let url = Printf.sprintf "%s/%s/insights?%s" graph_api_base id query in
+    Config.Http.get url
+      (fun response ->
+        update_rate_limits response;
+        if response.status >= 200 && response.status < 300 then
+          on_result
+            (parse_account_engagement_insights_response ~account_id:id ~since ~until
+               response.body)
+        else on_result (Error (api_error_of_response response)))
+      (fun err -> on_result (Error (network_error_of_string err)))
+
+  let get_account_engagement_insights_canonical ~id ~access_token ~since ~until on_result =
+    get_account_engagement_insights ~id ~access_token ~since ~until
+      (function
+        | Ok insights ->
+            on_result (Ok (to_canonical_account_engagement_insights_series insights))
+        | Error err -> on_result (Error err))
+
+  let get_media_insights ~post_id ~access_token on_result =
+    let params =
+      [
+        ("metric", [ String.concat "," media_insight_metric_names ]);
+        ("access_token", [ access_token ]);
+      ]
+    in
+    let query = Uri.encoded_of_query params in
+    let url = Printf.sprintf "%s/%s/insights?%s" graph_api_base post_id query in
+    Config.Http.get url
+      (fun response ->
+        update_rate_limits response;
+        if response.status >= 200 && response.status < 300 then
+          on_result (parse_media_insights_response ~post_id response.body)
+        else on_result (Error (api_error_of_response response)))
+      (fun err -> on_result (Error (network_error_of_string err)))
+
+  let get_media_insights_canonical ~post_id ~access_token on_result =
+    get_media_insights ~post_id ~access_token
+      (function
+        | Ok insights -> on_result (Ok (to_canonical_media_insights_series insights))
+        | Error err -> on_result (Error err))
+
+  let get_account_audience_insights_for_account ~account_id ~since ~until on_result =
+    ensure_valid_token ~account_id
+      (fun access_token ->
+        Config.get_ig_user_id ~account_id
+          (fun id ->
+            get_account_audience_insights ~id ~access_token ~since ~until on_result)
+          (fun err ->
+            on_result
+              (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  let get_account_engagement_insights_for_account ~account_id ~since ~until on_result =
+    ensure_valid_token ~account_id
+      (fun access_token ->
+        Config.get_ig_user_id ~account_id
+          (fun id ->
+            get_account_engagement_insights ~id ~access_token ~since ~until on_result)
+          (fun err ->
+            on_result
+              (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  let get_media_insights_for_account ~account_id ~post_id on_result =
+    ensure_valid_token ~account_id
+      (fun access_token -> get_media_insights ~post_id ~access_token on_result)
+      (fun err -> on_result (Error err))
+
   (** Media type detection from URL *)
   let classify_media_url url =
     let url_lower = String.lowercase_ascii url in

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1 - Unreleased
+
+- Added account analytics API `get_account_insights` for `/v1.0/{id}/threads_insights`.
+- Added post analytics API `get_post_insights` for `/v1.0/{post_id}/insights`.
+- Added typed analytics parsing for account/post insight payloads.
+- Added canonical analytics conversion helpers for social-core metric normalization.
+- Added request-contract and malformed-payload tests for analytics endpoints.
+
 ## 0.1.0 - 2026-02-12
 
 - Added new `social-threads-v1` package scaffold.

@@ -1676,6 +1676,309 @@ module Make (Config : CONFIG) = struct
       Error (Printf.sprintf "Facebook posts should be under 5000 characters for best engagement (current: %d)" len)
     else
       Ok ()
+
+  (** {1 Insights / Analytics} *)
+
+  type insight_timeseries_point = {
+    end_time : string option;
+    value : int;
+  }
+
+  type account_analytics = {
+    page_impressions_unique : insight_timeseries_point list;
+    page_posts_impressions_unique : insight_timeseries_point list;
+    page_post_engagements : insight_timeseries_point list;
+    page_daily_follows : insight_timeseries_point list;
+    page_video_views : insight_timeseries_point list;
+  }
+
+  type post_analytics = {
+    post_impressions_unique : int option;
+    post_reactions_by_type_total : (string * int) list;
+    post_clicks : int option;
+    post_clicks_by_type : (string * int) list;
+  }
+
+  let account_analytics_metrics =
+    "page_impressions_unique,page_posts_impressions_unique,page_post_engagements,page_daily_follows,page_video_views"
+
+  let post_analytics_metrics =
+    "post_impressions_unique,post_reactions_by_type_total,post_clicks,post_clicks_by_type"
+
+  let account_analytics_canonical_metric_keys =
+    Analytics_normalization.canonical_metric_keys_of_provider_metrics
+      ~provider:Analytics_normalization.Facebook
+      [ "page_impressions_unique";
+        "page_posts_impressions_unique";
+        "page_post_engagements";
+        "page_daily_follows";
+        "page_video_views" ]
+
+  let post_analytics_canonical_metric_keys =
+    Analytics_normalization.canonical_metric_keys_of_provider_metrics
+      ~provider:Analytics_normalization.Facebook
+      [ "post_impressions_unique";
+        "post_reactions_by_type_total";
+        "post_clicks";
+        "post_clicks_by_type" ]
+
+  let to_canonical_timeseries_points points =
+    List.map
+      (fun point -> Analytics_types.make_datapoint ?timestamp:point.end_time point.value)
+      points
+
+  let to_canonical_optional_point value_opt =
+    match value_opt with
+    | Some value -> [ Analytics_types.make_datapoint value ]
+    | None -> []
+
+  let to_canonical_assoc_total_points values =
+    if values = [] then
+      []
+    else
+      let total = List.fold_left (fun acc (_, value) -> acc + value) 0 values in
+      [ Analytics_types.make_datapoint total ]
+
+  let to_canonical_facebook_series ?time_range ~scope ~provider_metric points =
+    match Analytics_normalization.facebook_metric_to_canonical provider_metric with
+    | Some metric ->
+        Some
+          (Analytics_types.make_series
+             ?time_range
+             ~metric
+             ~scope
+             ~provider_metric
+             points)
+    | None -> None
+
+  let to_canonical_account_analytics_series ?time_range account_analytics =
+    [ ("page_impressions_unique",
+       to_canonical_timeseries_points account_analytics.page_impressions_unique);
+      ("page_posts_impressions_unique",
+       to_canonical_timeseries_points account_analytics.page_posts_impressions_unique);
+      ("page_post_engagements",
+       to_canonical_timeseries_points account_analytics.page_post_engagements);
+      ("page_daily_follows",
+       to_canonical_timeseries_points account_analytics.page_daily_follows);
+      ("page_video_views",
+       to_canonical_timeseries_points account_analytics.page_video_views) ]
+    |> List.filter_map (fun (provider_metric, points) ->
+           to_canonical_facebook_series
+             ?time_range
+             ~scope:Analytics_types.Page
+             ~provider_metric
+             points)
+
+  let to_canonical_post_analytics_series ?time_range post_analytics =
+    [ ("post_impressions_unique",
+       to_canonical_optional_point post_analytics.post_impressions_unique);
+      ("post_reactions_by_type_total",
+       to_canonical_assoc_total_points post_analytics.post_reactions_by_type_total);
+      ("post_clicks",
+       to_canonical_optional_point post_analytics.post_clicks);
+      ("post_clicks_by_type",
+       to_canonical_assoc_total_points post_analytics.post_clicks_by_type) ]
+    |> List.filter_map (fun (provider_metric, points) ->
+           to_canonical_facebook_series
+             ?time_range
+             ~scope:Analytics_types.Post
+             ~provider_metric
+             points)
+
+  let int_of_json_safe json =
+    try Some (Yojson.Basic.Util.to_int json)
+    with _ ->
+      try Some (int_of_float (Yojson.Basic.Util.to_float json))
+      with _ -> None
+
+  let int_assoc_of_json json =
+    try
+      json
+      |> Yojson.Basic.Util.to_assoc
+      |> List.filter_map (fun (name, value_json) ->
+          match int_of_json_safe value_json with
+          | Some value -> Some (name, value)
+          | None -> None)
+    with _ -> []
+
+  let find_insight_by_name ~name insights =
+    List.find_opt
+      (fun metric_json ->
+        try
+          let metric_name =
+            metric_json |> Yojson.Basic.Util.member "name" |> Yojson.Basic.Util.to_string
+          in
+          metric_name = name
+        with _ -> false)
+      insights
+
+  let parse_timeseries_points metric_json =
+    let open Yojson.Basic.Util in
+    metric_json
+    |> member "values"
+    |> to_list
+    |> List.map (fun value_json ->
+           let value =
+             match int_of_json_safe (value_json |> member "value") with
+             | Some v -> v
+             | None -> 0
+           in
+           {
+             end_time = value_json |> member "end_time" |> to_string_option;
+             value;
+           })
+
+  let parse_account_analytics json =
+    let open Yojson.Basic.Util in
+    let insights = json |> member "data" |> to_list in
+    let metric_points metric_name =
+      match find_insight_by_name ~name:metric_name insights with
+      | Some metric_json -> parse_timeseries_points metric_json
+      | None -> []
+    in
+    {
+      page_impressions_unique = metric_points "page_impressions_unique";
+      page_posts_impressions_unique = metric_points "page_posts_impressions_unique";
+      page_post_engagements = metric_points "page_post_engagements";
+      page_daily_follows = metric_points "page_daily_follows";
+      page_video_views = metric_points "page_video_views";
+    }
+
+  let parse_post_analytics json =
+    let open Yojson.Basic.Util in
+    let insights = json |> member "data" |> to_list in
+    let first_metric_value metric_name =
+      match find_insight_by_name ~name:metric_name insights with
+      | None -> None
+      | Some metric_json ->
+          (match metric_json |> member "values" |> to_list with
+          | value_json :: _ -> Some (value_json |> member "value")
+          | [] -> None)
+    in
+    {
+      post_impressions_unique =
+        (match first_metric_value "post_impressions_unique" with
+        | Some json_value -> int_of_json_safe json_value
+        | None -> None);
+      post_reactions_by_type_total =
+        (match first_metric_value "post_reactions_by_type_total" with
+        | Some json_value -> int_assoc_of_json json_value
+        | None -> []);
+      post_clicks =
+        (match first_metric_value "post_clicks" with
+        | Some json_value -> int_of_json_safe json_value
+        | None -> None);
+      post_clicks_by_type =
+        (match first_metric_value "post_clicks_by_type" with
+        | Some json_value -> int_assoc_of_json json_value
+        | None -> []);
+    }
+
+  (** Account analytics via page insights endpoint.
+
+      Contract:
+      GET https://graph.facebook.com/v20.0/{id}/insights
+          ?metric=page_impressions_unique,page_posts_impressions_unique,page_post_engagements,page_daily_follows,page_video_views
+          &period=day
+          &since=...
+          &until=...
+          &access_token=...
+  *)
+  let get_account_analytics ~id ~since ~until ~access_token on_result =
+    let url =
+      Printf.sprintf
+        "https://graph.facebook.com/v20.0/%s/insights?metric=%s&period=day&since=%s&until=%s&access_token=%s"
+        id
+        account_analytics_metrics
+        since
+        until
+        access_token
+    in
+    Config.Http.get url
+      (fun response ->
+        update_rate_limits response;
+        if response.status >= 200 && response.status < 300 then
+          try
+            let json = Yojson.Basic.from_string response.body in
+            on_result (Ok (parse_account_analytics json))
+          with e ->
+            on_result
+              (Error
+                 (Error_types.Internal_error
+                    (Printf.sprintf
+                       "Failed to parse account analytics response: %s"
+                       (Printexc.to_string e))))
+        else
+          on_result
+            (Error
+               (parse_api_error_with_permissions
+                  ~required_permissions:[ "pages_read_engagement" ]
+                  ~status_code:response.status
+                  ~response_body:response.body)))
+      (fun err -> on_result (Error (Error_types.Internal_error err)))
+
+  let get_account_analytics_canonical ~id ~since ~until ~access_token on_result =
+    let time_range =
+      {
+        Analytics_types.since = Some since;
+        until_ = Some until;
+        granularity = Some Analytics_types.Day;
+      }
+    in
+    get_account_analytics ~id ~since ~until ~access_token
+      (function
+        | Ok analytics ->
+            on_result
+              (Ok
+                 (to_canonical_account_analytics_series
+                    ~time_range
+                    analytics))
+        | Error err -> on_result (Error err))
+
+  (** Post analytics via post insights endpoint.
+
+      Contract:
+      GET https://graph.facebook.com/v20.0/{post_id}/insights
+          ?metric=post_impressions_unique,post_reactions_by_type_total,post_clicks,post_clicks_by_type
+          &access_token=...
+  *)
+  let get_post_analytics ~post_id ~access_token on_result =
+    let url =
+      Printf.sprintf
+        "https://graph.facebook.com/v20.0/%s/insights?metric=%s&access_token=%s"
+        post_id
+        post_analytics_metrics
+        access_token
+    in
+    Config.Http.get url
+      (fun response ->
+        update_rate_limits response;
+        if response.status >= 200 && response.status < 300 then
+          try
+            let json = Yojson.Basic.from_string response.body in
+            on_result (Ok (parse_post_analytics json))
+          with e ->
+            on_result
+              (Error
+                 (Error_types.Internal_error
+                    (Printf.sprintf
+                       "Failed to parse post analytics response: %s"
+                       (Printexc.to_string e))))
+        else
+          on_result
+            (Error
+               (parse_api_error_with_permissions
+                  ~required_permissions:[ "pages_read_engagement" ]
+                  ~status_code:response.status
+                  ~response_body:response.body)))
+      (fun err -> on_result (Error (Error_types.Internal_error err)))
+
+  let get_post_analytics_canonical ~post_id ~access_token on_result =
+    get_post_analytics ~post_id ~access_token
+      (function
+        | Ok analytics ->
+            on_result (Ok (to_canonical_post_analytics_series analytics))
+        | Error err -> on_result (Error err))
   
   (** {1 Generic API Methods} *)
   

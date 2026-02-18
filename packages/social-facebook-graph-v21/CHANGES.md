@@ -51,6 +51,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `post` - POST any endpoint
 - `delete` - DELETE any resource
 
+#### Analytics
+- Added account analytics endpoint support:
+  - `get_account_analytics` for `/v20.0/{id}/insights` with day-bucket metrics
+- Added post analytics endpoint support:
+  - `get_post_analytics` for `/v20.0/{post_id}/insights`
+- Added canonical analytics conversion helpers for social-core metric normalization
+- Added request-contract and parser tests for account/post analytics flows
+
 #### Structured Error Handling
 - Posting operations use `outcome` type with Success/Partial_success/Failure
 - Non-posting operations use `api_result` type with Ok/Error

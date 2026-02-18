@@ -366,6 +366,104 @@ type thread_post = {
   permalink : string option;
 }
 
+type insight_metric =
+  | Views
+  | Likes
+  | Replies
+  | Reposts
+  | Quotes
+
+type account_insight_value = {
+  value : int;
+  end_time : string option;
+}
+
+type account_insight = {
+  metric : insight_metric;
+  period : string option;
+  values : account_insight_value list;
+}
+
+type post_insight = {
+  metric : insight_metric;
+  period : string option;
+  value : int;
+}
+
+let insight_metric_names = [ "views"; "likes"; "replies"; "reposts"; "quotes" ]
+
+let string_of_insight_metric = function
+  | Views -> "views"
+  | Likes -> "likes"
+  | Replies -> "replies"
+  | Reposts -> "reposts"
+  | Quotes -> "quotes"
+
+let insight_canonical_metric_keys =
+  Analytics_normalization.canonical_metric_keys_of_provider_metrics
+    ~provider:Analytics_normalization.Threads
+    insight_metric_names
+
+let canonical_metric_of_insight_metric metric =
+  Analytics_normalization.threads_metric_to_canonical
+    (string_of_insight_metric metric)
+
+let canonical_time_granularity_of_period = function
+  | None -> None
+  | Some period ->
+      (match String.lowercase_ascii (String.trim period) with
+       | "hour" -> Some Analytics_types.Hour
+       | "day" -> Some Analytics_types.Day
+       | "week" -> Some Analytics_types.Week
+       | "month" -> Some Analytics_types.Month
+       | "lifetime" -> Some Analytics_types.Lifetime
+       | _ -> None)
+
+let canonical_time_range_of_period period =
+  match canonical_time_granularity_of_period period with
+  | None -> None
+  | Some granularity ->
+      Some
+        {
+          Analytics_types.since = None;
+          until_ = None;
+          granularity = Some granularity;
+        }
+
+let to_canonical_account_insights_series (account_insights : account_insight list) =
+  account_insights
+  |> List.filter_map (fun (insight : account_insight) ->
+         match canonical_metric_of_insight_metric insight.metric with
+         | None -> None
+         | Some metric ->
+              let points =
+                List.map
+                  (fun (value : account_insight_value) ->
+                    Analytics_types.make_datapoint ?timestamp:value.end_time value.value)
+                  insight.values
+              in
+             Some
+               (Analytics_types.make_series
+                  ?time_range:(canonical_time_range_of_period insight.period)
+                  ~metric
+                  ~scope:Analytics_types.Account
+                  ~provider_metric:(string_of_insight_metric insight.metric)
+                  points))
+
+let to_canonical_post_insights_series (post_insights : post_insight list) =
+  post_insights
+  |> List.filter_map (fun (insight : post_insight) ->
+         match canonical_metric_of_insight_metric insight.metric with
+         | None -> None
+         | Some metric ->
+             Some
+               (Analytics_types.make_series
+                  ?time_range:(canonical_time_range_of_period insight.period)
+                  ~metric
+                  ~scope:Analytics_types.Post
+                  ~provider_metric:(string_of_insight_metric insight.metric)
+                  [ Analytics_types.make_datapoint insight.value ]))
+
 type media_kind =
   | Image
   | Video
@@ -599,6 +697,77 @@ module Make (Config : CONFIG) = struct
            | None -> Some (Error_types.Media_unsupported_format normalized))
     | urls ->
         Some (Error_types.Too_many_media { count = List.length urls; max = 1 })
+
+  let insight_metric_of_string raw_metric =
+    match String.lowercase_ascii (String.trim raw_metric) with
+    | "views" -> Some Views
+    | "likes" -> Some Likes
+    | "replies" -> Some Replies
+    | "reposts" -> Some Reposts
+    | "quotes" -> Some Quotes
+    | _ -> None
+
+  let parse_int_value json =
+    let open Yojson.Basic.Util in
+    try json |> to_int
+    with _ -> int_of_float (json |> to_float)
+
+  let parse_account_insights_response response_body =
+    let open Yojson.Basic.Util in
+    let json = Yojson.Basic.from_string response_body in
+    json |> member "data" |> to_list
+    |> List.map (fun item ->
+           let metric_name = item |> member "name" |> to_string in
+           let metric =
+             match insight_metric_of_string metric_name with
+             | Some metric -> metric
+             | None -> failwith ("Unsupported insight metric: " ^ metric_name)
+           in
+           let period =
+             try Some (item |> member "period" |> to_string)
+             with _ -> None
+           in
+           let values =
+             item |> member "values" |> to_list
+             |> List.map (fun value_item ->
+                    let value =
+                      try parse_int_value (value_item |> member "value")
+                      with _ -> parse_int_value value_item
+                    in
+                    let end_time =
+                      try Some (value_item |> member "end_time" |> to_string)
+                      with _ -> None
+                    in
+                    { value; end_time })
+           in
+           { metric; period; values })
+
+  let parse_post_insights_response response_body =
+    let open Yojson.Basic.Util in
+    let json = Yojson.Basic.from_string response_body in
+    json |> member "data" |> to_list
+    |> List.map (fun item ->
+           let metric_name = item |> member "name" |> to_string in
+           let metric =
+             match insight_metric_of_string metric_name with
+             | Some metric -> metric
+             | None -> failwith ("Unsupported insight metric: " ^ metric_name)
+           in
+           let period =
+             try Some (item |> member "period" |> to_string)
+             with _ -> None
+           in
+           let value =
+             try parse_int_value (item |> member "value")
+             with _ ->
+               let values = item |> member "values" |> to_list in
+               match values with
+               | first :: _ ->
+                   (try parse_int_value (first |> member "value")
+                    with _ -> parse_int_value first)
+               | [] -> failwith "Missing post insight value"
+           in
+           { metric; period; value })
 
   let fetch_me_with_access_token ~access_token on_result =
     let query =
@@ -1040,6 +1209,99 @@ module Make (Config : CONFIG) = struct
                               ~response_body:response.body)))
                   (fun err -> on_result (Error (network_error err)))))
       (fun err -> on_result (Error err))
+
+  let get_account_insights ~account_id ~since ~until on_result =
+    with_valid_credentials ~account_id
+      (fun creds ->
+        get_user_id ~access_token:creds.access_token
+          (function
+            | Error err -> on_result (Error err)
+            | Ok user_id ->
+                let metrics_param = String.concat "," insight_metric_names in
+                let query =
+                  Uri.encoded_of_query
+                    [ ("metric", [metrics_param]);
+                      ("period", ["day"]);
+                      ("since", [String.trim since]);
+                      ("until", [String.trim until]);
+                      ("access_token", [creds.access_token]) ]
+                in
+                let url =
+                  Printf.sprintf "%s/%s/threads_insights?%s" threads_api_base user_id query
+                in
+                http_get_with_retry url
+                  (fun response ->
+                    if response.status >= 200 && response.status < 300 then
+                      try
+                        let insights = parse_account_insights_response response.body in
+                        on_result (Ok insights)
+                      with exn ->
+                        on_result
+                          (Error
+                             (Error_types.Internal_error
+                                (Printf.sprintf
+                                   "Failed to parse account insights response: %s"
+                                   (Printexc.to_string exn))))
+                    else
+                      on_result
+                        (Error
+                           (parse_api_error
+                              ~status_code:response.status
+                              ~headers:response.headers
+                              ~response_body:response.body)))
+                  (fun err -> on_result (Error (network_error err)))))
+      (fun err -> on_result (Error err))
+
+  let get_account_insights_canonical ~account_id ~since ~until on_result =
+    get_account_insights ~account_id ~since ~until
+      (function
+        | Ok insights -> on_result (Ok (to_canonical_account_insights_series insights))
+        | Error err -> on_result (Error err))
+
+  let get_post_insights ~account_id ~post_id on_result =
+    with_valid_credentials ~account_id
+      (fun creds ->
+        let metrics_param = String.concat "," insight_metric_names in
+        let query =
+          Uri.encoded_of_query
+            [ ("metric", [metrics_param]);
+              ("access_token", [creds.access_token]) ]
+        in
+        let url =
+          Printf.sprintf
+            "%s/%s/insights?%s"
+            threads_api_base
+            (String.trim post_id)
+            query
+        in
+        http_get_with_retry url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              try
+                let insights = parse_post_insights_response response.body in
+                on_result (Ok insights)
+              with exn ->
+                on_result
+                  (Error
+                     (Error_types.Internal_error
+                        (Printf.sprintf
+                           "Failed to parse post insights response: %s"
+                           (Printexc.to_string exn))))
+            else
+              on_result
+                (Error
+                   (parse_api_error
+                      ~status_code:response.status
+                      ~headers:response.headers
+                      ~response_body:response.body)))
+          (fun err -> on_result (Error (network_error err))))
+      (fun err -> on_result (Error err))
+
+  let get_post_insights_canonical ~account_id ~post_id on_result =
+    get_post_insights ~account_id ~post_id
+      (function
+        | Ok insights -> on_result (Ok (to_canonical_post_insights_series insights))
+        | Error err -> on_result (Error err))
 
   let post_single ~account_id ~text ~media_urls ?idempotency_key ?reply_control on_result =
     let validation_errors =

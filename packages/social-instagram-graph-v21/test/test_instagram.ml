@@ -1388,6 +1388,243 @@ let test_video_processing_error () =
       | Error_types.Failure _ -> print_endline "✓ Video processing error handled"
       | _ -> failwith "Expected failure for processing error")
 
+(** {1 Insights Tests} *)
+
+(** Test: Account audience insights request contract *)
+let test_account_audience_insights_request_contract () =
+  Mock_config.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"data": []}|};
+    headers = [];
+  };
+
+  Instagram.get_account_audience_insights
+    ~id:"ig_user_123"
+    ~access_token:"tok+en/=="
+    ~since:"2025-01-01"
+    ~until:"2025-01-07"
+    (handle_result
+      (fun _insights ->
+        let requests = !Mock_http.requests in
+        let has_contract = List.exists (fun (meth, url, _, _) ->
+          meth = "GET"
+          && Uri.path (Uri.of_string url) = "/v21.0/ig_user_123/insights"
+          && query_param url "metric" = Some "follower_count,reach"
+          && query_param url "period" = Some "day"
+          && query_param url "since" = Some "2025-01-01"
+          && query_param url "until" = Some "2025-01-07"
+          && query_param url "access_token" = Some "tok+en/=="
+        ) requests in
+        assert has_contract;
+        print_endline "✓ Account audience insights request contract")
+      (fun err -> failwith ("Account audience insights request contract failed: " ^ err)))
+
+(** Test: Account engagement insights request contract *)
+let test_account_engagement_insights_request_contract () =
+  Mock_config.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"data": []}|};
+    headers = [];
+  };
+
+  Instagram.get_account_engagement_insights
+    ~id:"ig_user_123"
+    ~access_token:"tok+en/=="
+    ~since:"2025-01-01"
+    ~until:"2025-01-07"
+    (handle_result
+      (fun _insights ->
+        let requests = !Mock_http.requests in
+        let has_contract = List.exists (fun (meth, url, _, _) ->
+          meth = "GET"
+          && Uri.path (Uri.of_string url) = "/v21.0/ig_user_123/insights"
+          && query_param url "metric_type" = Some "total_value"
+          && query_param url "metric" = Some "likes,views,comments,shares,saves,replies"
+          && query_param url "period" = Some "day"
+          && query_param url "since" = Some "2025-01-01"
+          && query_param url "until" = Some "2025-01-07"
+          && query_param url "access_token" = Some "tok+en/=="
+        ) requests in
+        assert has_contract;
+        print_endline "✓ Account engagement insights request contract")
+      (fun err -> failwith ("Account engagement insights request contract failed: " ^ err)))
+
+(** Test: Media insights request contract *)
+let test_media_insights_request_contract () =
+  Mock_config.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"data": []}|};
+    headers = [];
+  };
+
+  Instagram.get_media_insights
+    ~post_id:"post_123"
+    ~access_token:"tok+en/=="
+    (handle_result
+      (fun _insights ->
+        let requests = !Mock_http.requests in
+        let has_contract = List.exists (fun (meth, url, _, _) ->
+          meth = "GET"
+          && Uri.path (Uri.of_string url) = "/v21.0/post_123/insights"
+          && query_param url "metric" = Some "views,reach,saved,likes,comments,shares"
+          && query_param url "access_token" = Some "tok+en/=="
+        ) requests in
+        assert has_contract;
+        print_endline "✓ Media insights request contract")
+      (fun err -> failwith ("Media insights request contract failed: " ^ err)))
+
+(** Test: Account audience insights parser handles timeseries values *)
+let test_account_audience_insights_parser () =
+  let response_body = {|{
+    "data": [
+      {
+        "name": "follower_count",
+        "period": "day",
+        "values": [
+          {"value": 101, "end_time": "2025-01-01T08:00:00+0000"},
+          {"value": 102, "end_time": "2025-01-02T08:00:00+0000"}
+        ]
+      },
+      {
+        "name": "reach",
+        "period": "day",
+        "values": [
+          {"value": 500, "end_time": "2025-01-01T08:00:00+0000"}
+        ]
+      }
+    ]
+  }|} in
+  match Instagram.parse_account_audience_insights_response
+          ~account_id:"ig_user_123"
+          ~since:"2025-01-01"
+          ~until:"2025-01-02"
+          response_body with
+  | Ok insights ->
+      assert (List.length insights.follower_count = 2);
+      assert ((List.nth insights.follower_count 0).value = Some 101);
+      assert ((List.nth insights.follower_count 1).value = Some 102);
+      assert (List.length insights.reach = 1);
+      assert ((List.nth insights.reach 0).value = Some 500);
+      print_endline "✓ Account audience insights parser"
+  | Error err -> failwith ("Account audience insights parser failed: " ^ Error_types.error_to_string err)
+
+(** Test: Account engagement parser handles metric_type=total_value payloads *)
+let test_account_engagement_insights_parser_total_value () =
+  let response_body = {|{
+    "data": [
+      {"name": "likes", "total_value": {"value": 41}},
+      {"name": "views", "total_value": {"value": 900}},
+      {"name": "comments", "total_value": {"value": 7}},
+      {"name": "shares", "total_value": {"value": 4}},
+      {"name": "saves", "total_value": {"value": 11}},
+      {"name": "replies", "total_value": {"value": 2}}
+    ]
+  }|} in
+  match Instagram.parse_account_engagement_insights_response
+          ~account_id:"ig_user_123"
+          ~since:"2025-01-01"
+          ~until:"2025-01-07"
+          response_body with
+  | Ok insights ->
+      assert ((List.hd insights.likes).value = Some 41);
+      assert ((List.hd insights.views).value = Some 900);
+      assert ((List.hd insights.comments).value = Some 7);
+      assert ((List.hd insights.shares).value = Some 4);
+      assert ((List.hd insights.saves).value = Some 11);
+      assert ((List.hd insights.replies).value = Some 2);
+      print_endline "✓ Account engagement insights parser (total_value)"
+  | Error err -> failwith ("Account engagement insights parser failed: " ^ Error_types.error_to_string err)
+
+(** Test: Media insights parser extracts metric values *)
+let test_media_insights_parser () =
+  let response_body = {|{
+    "data": [
+      {"name": "views", "values": [{"value": 1200}]},
+      {"name": "reach", "values": [{"value": 980}]},
+      {"name": "saved", "values": [{"value": 31}]},
+      {"name": "likes", "values": [{"value": 77}]},
+      {"name": "comments", "values": [{"value": 15}]},
+      {"name": "shares", "values": [{"value": 8}]}
+    ]
+  }|} in
+  match Instagram.parse_media_insights_response ~post_id:"post_123" response_body with
+  | Ok insights ->
+      assert (insights.views = Some 1200);
+      assert (insights.reach = Some 980);
+      assert (insights.saved = Some 31);
+      assert (insights.likes = Some 77);
+      assert (insights.comments = Some 15);
+      assert (insights.shares = Some 8);
+      print_endline "✓ Media insights parser"
+  | Error err -> failwith ("Media insights parser failed: " ^ Error_types.error_to_string err)
+
+let test_canonical_insights_adapters () =
+  let find_series provider_metric series =
+    List.find_opt
+      (fun item -> item.Analytics_types.provider_metric = Some provider_metric)
+      series
+  in
+
+  let audience : Instagram.account_audience_insights = {
+    account_id = "ig_user_123";
+    since = "2025-01-01";
+    until = "2025-01-07";
+    follower_count = [ { value = Some 301; end_time = Some "2025-01-07T00:00:00+0000" } ];
+    reach = [ { value = Some 902; end_time = Some "2025-01-07T00:00:00+0000" } ];
+  } in
+  let audience_series =
+    Instagram.to_canonical_account_audience_insights_series audience
+  in
+  assert (List.length audience_series = 2);
+  (match find_series "follower_count" audience_series with
+   | Some item ->
+       assert (Analytics_types.canonical_metric_key item.metric = "followers");
+       assert ((List.hd item.points).value = 301)
+   | None -> failwith "Missing follower_count canonical series");
+
+  let engagement : Instagram.account_engagement_insights = {
+    account_id = "ig_user_123";
+    since = "2025-01-01";
+    until = "2025-01-07";
+    likes = [ { value = Some 41; end_time = Some "2025-01-07T00:00:00+0000" } ];
+    views = [ { value = Some 501; end_time = Some "2025-01-07T00:00:00+0000" } ];
+    comments = [ { value = Some 7; end_time = Some "2025-01-07T00:00:00+0000" } ];
+    shares = [ { value = Some 3; end_time = Some "2025-01-07T00:00:00+0000" } ];
+    saves = [ { value = Some 11; end_time = Some "2025-01-07T00:00:00+0000" } ];
+    replies = [ { value = Some 2; end_time = Some "2025-01-07T00:00:00+0000" } ];
+  } in
+  let engagement_series =
+    Instagram.to_canonical_account_engagement_insights_series engagement
+  in
+  assert (List.length engagement_series = 6);
+  (match find_series "saves" engagement_series with
+   | Some item ->
+       assert (Analytics_types.canonical_metric_key item.metric = "saves");
+       assert ((List.hd item.points).value = 11)
+   | None -> failwith "Missing saves canonical series");
+
+  let media : Instagram.media_insights = {
+    post_id = "post_123";
+    views = Some 1200;
+    reach = Some 980;
+    saved = Some 31;
+    likes = Some 77;
+    comments = Some 15;
+    shares = Some 8;
+  } in
+  let media_series = Instagram.to_canonical_media_insights_series media in
+  assert (List.length media_series = 6);
+  (match find_series "saved" media_series with
+   | Some item ->
+       assert (Analytics_types.canonical_metric_key item.metric = "saves");
+       assert ((List.hd item.points).value = 31)
+   | None -> failwith "Missing saved canonical series");
+
+  print_endline "✓ Canonical insights adapters"
+
 (** Run all tests *)
 let () =
   print_endline "\n=== Instagram Provider Tests ===\n";
@@ -1450,5 +1687,14 @@ let () =
   test_parse_api_error_rate_limited ();
   test_parse_error_response_token_expired ();
   test_create_container_structured_auth_error ();
+
+  print_endline "\n--- Insights Tests ---";
+  test_account_audience_insights_request_contract ();
+  test_account_engagement_insights_request_contract ();
+  test_media_insights_request_contract ();
+  test_account_audience_insights_parser ();
+  test_account_engagement_insights_parser_total_value ();
+  test_media_insights_parser ();
+  test_canonical_insights_adapters ();
 
   print_endline "\n=== All tests passed! ===\n"

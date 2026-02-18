@@ -41,6 +41,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Posting operations use `outcome` type with Success/Partial_success/Failure
   - Non-posting operations use `api_result` type with Ok/Error
 
+#### Analytics
+- Added account audience insights API:
+  - `get_account_audience_insights` for `follower_count` and `reach`
+- Added account engagement insights API:
+  - `get_account_engagement_insights` with `metric_type=total_value`
+- Added media/post insights API:
+  - `get_media_insights` for views/reach/saves/likes/comments/shares
+- Added account-scoped convenience wrappers and canonical analytics conversion helpers
+- Added request-contract and parser tests for all insights flows
+
 #### Architecture
 - CPS (Continuation Passing Style) implementation
 - Runtime agnostic

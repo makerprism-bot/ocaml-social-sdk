@@ -701,8 +701,194 @@ let test_authorization_header () =
               ) headers in
               assert has_auth;
               print_endline "✓ Authorization header"
-          | [] -> failwith "No requests made")
+           | [] -> failwith "No requests made")
       | Error e -> failwith ("Authorization header test failed: " ^ Error_types.error_to_string e))
+
+(** Test: Account analytics request contract (v20 insights endpoint) *)
+let test_account_analytics_request_contract () =
+  Mock_config.reset ();
+
+  let response_body = {|{
+    "data": [
+      {"name": "page_impressions_unique", "values": [{"value": 10, "end_time": "2024-01-02T08:00:00+0000"}]},
+      {"name": "page_posts_impressions_unique", "values": [{"value": 9, "end_time": "2024-01-02T08:00:00+0000"}]},
+      {"name": "page_post_engagements", "values": [{"value": 8, "end_time": "2024-01-02T08:00:00+0000"}]},
+      {"name": "page_daily_follows", "values": [{"value": 7, "end_time": "2024-01-02T08:00:00+0000"}]},
+      {"name": "page_video_views", "values": [{"value": 6, "end_time": "2024-01-02T08:00:00+0000"}]}
+    ]
+  }|} in
+
+  Mock_http.set_response { status = 200; body = response_body; headers = [] };
+
+  Facebook.get_account_analytics
+    ~id:"12345"
+    ~since:"2024-01-01"
+    ~until:"2024-01-07"
+    ~access_token:"acct_token"
+    (function
+      | Ok _analytics ->
+          (match !Mock_http.requests with
+          | (method_, url, headers, body) :: _ ->
+              assert (method_ = "GET");
+              assert (headers = []);
+              assert (body = "");
+              assert (url =
+                "https://graph.facebook.com/v20.0/12345/insights?metric=page_impressions_unique,page_posts_impressions_unique,page_post_engagements,page_daily_follows,page_video_views&period=day&since=2024-01-01&until=2024-01-07&access_token=acct_token");
+              print_endline "✓ Account analytics request contract"
+          | [] -> failwith "No requests made")
+      | Error e -> failwith ("Account analytics contract test failed: " ^ Error_types.error_to_string e))
+
+(** Test: Post analytics request contract (v20 insights endpoint) *)
+let test_post_analytics_request_contract () =
+  Mock_config.reset ();
+
+  let response_body = {|{
+    "data": [
+      {"name": "post_impressions_unique", "values": [{"value": 100}]},
+      {"name": "post_reactions_by_type_total", "values": [{"value": {"like": 5}}]},
+      {"name": "post_clicks", "values": [{"value": 11}]},
+      {"name": "post_clicks_by_type", "values": [{"value": {"other clicks": 4}}]}
+    ]
+  }|} in
+
+  Mock_http.set_response { status = 200; body = response_body; headers = [] };
+
+  Facebook.get_post_analytics
+    ~post_id:"12345_67890"
+    ~access_token:"post_token"
+    (function
+      | Ok _analytics ->
+          (match !Mock_http.requests with
+          | (method_, url, headers, body) :: _ ->
+              assert (method_ = "GET");
+              assert (headers = []);
+              assert (body = "");
+              assert (url =
+                "https://graph.facebook.com/v20.0/12345_67890/insights?metric=post_impressions_unique,post_reactions_by_type_total,post_clicks,post_clicks_by_type&access_token=post_token");
+              print_endline "✓ Post analytics request contract"
+          | [] -> failwith "No requests made")
+      | Error e -> failwith ("Post analytics contract test failed: " ^ Error_types.error_to_string e))
+
+(** Test: Account analytics parsing *)
+let test_account_analytics_parsing () =
+  Mock_config.reset ();
+
+  let response_body = {|{
+    "data": [
+      {"name": "page_impressions_unique", "values": [
+        {"value": 101, "end_time": "2024-01-02T08:00:00+0000"},
+        {"value": 102, "end_time": "2024-01-03T08:00:00+0000"}
+      ]},
+      {"name": "page_posts_impressions_unique", "values": [
+        {"value": 201, "end_time": "2024-01-02T08:00:00+0000"}
+      ]},
+      {"name": "page_post_engagements", "values": [
+        {"value": 301, "end_time": "2024-01-02T08:00:00+0000"}
+      ]},
+      {"name": "page_daily_follows", "values": [
+        {"value": 401, "end_time": "2024-01-02T08:00:00+0000"}
+      ]},
+      {"name": "page_video_views", "values": [
+        {"value": 501, "end_time": "2024-01-02T08:00:00+0000"}
+      ]}
+    ]
+  }|} in
+
+  Mock_http.set_response { status = 200; body = response_body; headers = [] };
+
+  Facebook.get_account_analytics
+    ~id:"page_123"
+    ~since:"2024-01-01"
+    ~until:"2024-01-07"
+    ~access_token:"token"
+    (function
+      | Ok analytics ->
+          assert (List.length analytics.page_impressions_unique = 2);
+          assert ((List.hd analytics.page_impressions_unique).value = 101);
+          assert ((List.hd analytics.page_impressions_unique).end_time = Some "2024-01-02T08:00:00+0000");
+          assert ((List.hd analytics.page_posts_impressions_unique).value = 201);
+          assert ((List.hd analytics.page_post_engagements).value = 301);
+          assert ((List.hd analytics.page_daily_follows).value = 401);
+          assert ((List.hd analytics.page_video_views).value = 501);
+          print_endline "✓ Account analytics parsing"
+      | Error e -> failwith ("Account analytics parsing failed: " ^ Error_types.error_to_string e))
+
+(** Test: Post analytics parsing *)
+let test_post_analytics_parsing () =
+  Mock_config.reset ();
+
+  let response_body = {|{
+    "data": [
+      {"name": "post_impressions_unique", "values": [{"value": 1234}]},
+      {"name": "post_reactions_by_type_total", "values": [{"value": {"like": 10, "love": 3}}]},
+      {"name": "post_clicks", "values": [{"value": 345}]},
+      {"name": "post_clicks_by_type", "values": [{"value": {"other clicks": 12, "photo view": 9}}]}
+    ]
+  }|} in
+
+  Mock_http.set_response { status = 200; body = response_body; headers = [] };
+
+  Facebook.get_post_analytics
+    ~post_id:"post_123"
+    ~access_token:"token"
+    (function
+      | Ok analytics ->
+          assert (analytics.post_impressions_unique = Some 1234);
+          assert (analytics.post_clicks = Some 345);
+          assert (List.assoc_opt "like" analytics.post_reactions_by_type_total = Some 10);
+          assert (List.assoc_opt "love" analytics.post_reactions_by_type_total = Some 3);
+          assert (List.assoc_opt "other clicks" analytics.post_clicks_by_type = Some 12);
+          assert (List.assoc_opt "photo view" analytics.post_clicks_by_type = Some 9);
+          print_endline "✓ Post analytics parsing"
+       | Error e -> failwith ("Post analytics parsing failed: " ^ Error_types.error_to_string e))
+
+let test_canonical_analytics_adapters () =
+  let find_series provider_metric series =
+    List.find_opt
+      (fun item -> item.Analytics_types.provider_metric = Some provider_metric)
+      series
+  in
+
+  let account_analytics : Facebook.account_analytics = {
+    page_impressions_unique = [ { end_time = Some "2024-01-02T08:00:00+0000"; value = 11 } ];
+    page_posts_impressions_unique = [ { end_time = Some "2024-01-02T08:00:00+0000"; value = 9 } ];
+    page_post_engagements = [ { end_time = Some "2024-01-02T08:00:00+0000"; value = 7 } ];
+    page_daily_follows = [ { end_time = Some "2024-01-02T08:00:00+0000"; value = 5 } ];
+    page_video_views = [ { end_time = Some "2024-01-02T08:00:00+0000"; value = 3 } ];
+  } in
+  let account_series = Facebook.to_canonical_account_analytics_series account_analytics in
+  assert (List.length account_series = 5);
+  (match find_series "page_impressions_unique" account_series with
+   | Some item ->
+       assert (Analytics_types.canonical_metric_key item.metric = "impressions");
+       assert ((List.hd item.points).value = 11)
+   | None -> failwith "Missing page_impressions_unique canonical series");
+  (match find_series "page_daily_follows" account_series with
+   | Some item ->
+       assert (Analytics_types.canonical_metric_key item.metric = "follows");
+       assert ((List.hd item.points).value = 5)
+   | None -> failwith "Missing page_daily_follows canonical series");
+
+  let post_analytics : Facebook.post_analytics = {
+    post_impressions_unique = Some 120;
+    post_reactions_by_type_total = [ ("like", 4); ("love", 2) ];
+    post_clicks = Some 15;
+    post_clicks_by_type = [ ("link", 6); ("photo", 1) ];
+  } in
+  let post_series = Facebook.to_canonical_post_analytics_series post_analytics in
+  assert (List.length post_series = 4);
+  (match find_series "post_reactions_by_type_total" post_series with
+   | Some item ->
+       assert (Analytics_types.canonical_metric_key item.metric = "reactions");
+       assert ((List.hd item.points).value = 6)
+   | None -> failwith "Missing post_reactions_by_type_total canonical series");
+  (match find_series "post_clicks_by_type" post_series with
+   | Some item ->
+       assert (Analytics_types.canonical_metric_key item.metric = "clicks");
+       assert ((List.hd item.points).value = 7)
+   | None -> failwith "Missing post_clicks_by_type canonical series");
+
+  print_endline "✓ Canonical analytics adapters"
 
 (** Test: OAuth URL with required permissions *)
 let test_oauth_url_permissions () =
@@ -2151,6 +2337,11 @@ let () =
   test_batch_required_permissions_override ();
   test_app_secret_proof ();
   test_authorization_header ();
+  test_account_analytics_request_contract ();
+  test_post_analytics_request_contract ();
+  test_account_analytics_parsing ();
+  test_post_analytics_parsing ();
+  test_canonical_analytics_adapters ();
   
   print_endline "\n--- Alt-Text Tests ---";
   test_upload_photo_with_alt_text ();
@@ -2190,4 +2381,4 @@ let () =
   test_video_media_validation ();
   test_rate_limit_error_code_80001 ();
   
-  print_endline "\n=== All 63 tests passed! ===\n"
+  print_endline "\n=== All 67 tests passed! ===\n"

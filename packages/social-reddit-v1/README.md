@@ -97,7 +97,7 @@ Reddit.submit_image_post
   ()
   on_result
 
-(* Native video post (upload lease + S3 upload + /api/submit kind=video) *)
+(* Native video post (upload lease + S3 upload + submit kind=video) *)
 Reddit.submit_video_post
   ~account_id:"account123"
   ~subreddit:"your_subreddit"
@@ -126,14 +126,13 @@ Reddit.post_single
   on_result
 ```
 
-### Video Posting Notes
+### Video Caveats
 
-- Use exactly one posting mode per `post_single` call: self (`body`), link (`url`), or media (`media_urls`)
-- `post_single` routes media to native video flow for known video extensions (`.mp4`, `.mov`, `.webm`, etc.)
-- For unknown URL extensions, the provider downloads media and decides by `content-type` (video stays video, image routes to image post)
-- Extension-based routing is best-effort detection; successful publish still depends on Reddit media acceptance rules
-- No silent fallback that treats video as an image post
-- Optional thumbnail (`media_urls` second URL or `thumbnail_url`) is uploaded as poster image when valid; invalid/non-image thumbnails are ignored so the video can still publish
+- Native video posting is used for video media (no image fallback for real video content).
+- `post_single` treats the first media URL as the primary video source; if a second URL is present and is image-like, it is used as `video_poster_url`.
+- Video limits are enforced before upload: max 1GB, max 15 minutes, `video/mp4`.
+- Unknown-extension media is content-type checked; non-image/non-video media fails with structured validation errors.
+- Use exactly one posting mode per `post_single` call: self (`body`), link (`url`), or media (`media_urls`).
 
 ### Subreddit Management
 

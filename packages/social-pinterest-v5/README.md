@@ -92,6 +92,14 @@ Pinterest.post_single
 
 Note: `post_single` resolves the first available board automatically; if the account has no boards, posting fails until a board exists.
 
+### Video Caveats
+
+- Video posts use native Pinterest video media flow (`media_type=video`, `source_type=video_id`), not image pin fallback.
+- `post_single` uses first media URL as primary media. If first URL resolves to video content-type, video flow is used.
+- If a second media URL is present and is image-like, it is used as `cover_image_url`; non-image thumbnail candidates are ignored.
+- Unknown file extensions are resolved by content-type sniffing from downloaded media.
+- Video processing is asynchronous; posting waits for processing completion and fails with structured errors on timeout/failure.
+
 ## Video Flow Details
 
 - Video pins use Pinterest native upload semantics:

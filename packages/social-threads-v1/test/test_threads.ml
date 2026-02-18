@@ -24,13 +24,18 @@ let query_param url key =
 module Mock_http = struct
   let requests = ref []
   let response_queue = ref []
+  let error_queue = ref []
 
   let reset () =
     requests := [];
-    response_queue := []
+    response_queue := [];
+    error_queue := []
 
   let set_responses responses =
     response_queue := responses
+
+  let set_errors errors =
+    error_queue := errors
 
   let next_response () =
     match !response_queue with
@@ -39,37 +44,59 @@ module Mock_http = struct
         response_queue := rest;
         Some response
 
+  let next_error () =
+    match !error_queue with
+    | [] -> None
+    | err :: rest ->
+        error_queue := rest;
+        Some err
+
   include
     (struct
       let get ?(headers = []) url on_success on_error =
         requests := ("GET", url, headers, "") :: !requests;
         match next_response () with
         | Some response -> on_success response
-        | None -> on_error "No mock response set"
+        | None ->
+            (match next_error () with
+             | Some err -> on_error err
+             | None -> on_error "No mock response set")
 
       let post ?(headers = []) ?(body = "") url on_success on_error =
         requests := ("POST", url, headers, body) :: !requests;
         match next_response () with
         | Some response -> on_success response
-        | None -> on_error "No mock response set"
+        | None ->
+            (match next_error () with
+             | Some err -> on_error err
+             | None -> on_error "No mock response set")
 
       let post_multipart ?(headers = []) ~parts:_ url on_success on_error =
         requests := ("POST_MULTIPART", url, headers, "") :: !requests;
         match next_response () with
         | Some response -> on_success response
-        | None -> on_error "No mock response set"
+        | None ->
+            (match next_error () with
+             | Some err -> on_error err
+             | None -> on_error "No mock response set")
 
       let put ?(headers = []) ?(body = "") url on_success on_error =
         requests := ("PUT", url, headers, body) :: !requests;
         match next_response () with
         | Some response -> on_success response
-        | None -> on_error "No mock response set"
+        | None ->
+            (match next_error () with
+             | Some err -> on_error err
+             | None -> on_error "No mock response set")
 
       let delete ?(headers = []) url on_success on_error =
         requests := ("DELETE", url, headers, "") :: !requests;
         match next_response () with
         | Some response -> on_success response
-        | None -> on_error "No mock response set"
+        | None ->
+            (match next_error () with
+             | Some err -> on_error err
+             | None -> on_error "No mock response set")
     end : HTTP_CLIENT)
 end
 
@@ -1665,6 +1692,33 @@ let test_get_post_insights_malformed_payload_returns_internal_error () =
           print_endline "ok: post insights malformed payload mapped internal"
       | _ -> failwith "expected internal error for malformed post insights payload")
 
+let test_insights_network_error_redacts_query_token () =
+  Mock_config.reset ();
+  Mock_config.credentials_store :=
+    [
+      ( "acct-1",
+        {
+          access_token = "access-xyz";
+          refresh_token = None;
+          expires_at = None;
+          token_type = "Bearer";
+        } );
+    ];
+  Mock_http.set_errors
+    [ "GET https://graph.threads.net/v1.0/me?access_token=access-xyz failed" ];
+  Threads.get_account_insights
+    ~account_id:"acct-1"
+    ~since:"2025-01-01"
+    ~until:"2025-01-02"
+    (function
+      | Error (Error_types.Network_error (Error_types.Connection_failed msg)) ->
+          if string_contains msg "access-xyz" then
+            failwith ("Token was not redacted: " ^ msg);
+          if not (msg = "[REDACTED_SENSITIVE_TEXT]" || msg = "No mock response set") then
+            failwith ("Unexpected redaction message: " ^ msg);
+          print_endline "ok: insights network error redacts query token"
+      | _ -> failwith "expected redacted network error for insights")
+
 let test_post_single_image_success () =
   Mock_config.reset ();
   Mock_config.credentials_store :=
@@ -3165,6 +3219,7 @@ let () =
   test_get_account_insights_malformed_payload_returns_internal_error ();
   test_get_post_insights_contract ();
   test_get_post_insights_malformed_payload_returns_internal_error ();
+  test_insights_network_error_redacts_query_token ();
   test_canonical_insights_adapters ();
   test_post_single_success ();
   test_post_single_text_trimmed_before_send ();

@@ -3136,7 +3136,7 @@ let test_get_post_engagement () =
 
   LinkedIn.get_post_engagement ~account_id:"test_account" ~post_urn:"urn:li:share:123"
     (handle_result
-      (fun engagement ->
+      (fun (engagement : engagement_info) ->
         assert (engagement.like_count = Some 12);
         assert (engagement.comment_count = Some 3);
         assert (engagement.share_count = Some 2);
@@ -3177,7 +3177,7 @@ let test_get_post_engagement_missing_fields () =
 
   LinkedIn.get_post_engagement ~account_id:"test_account" ~post_urn:"urn:li:share:123"
     (handle_result
-      (fun engagement ->
+      (fun (engagement : engagement_info) ->
         assert (engagement.like_count = Some 5);
         assert (engagement.comment_count = None);
         assert (engagement.share_count = None);
@@ -3260,6 +3260,87 @@ let test_get_post_engagement_rejects_malformed_delimiter_urn () =
           assert (!Mock_http.requests = []);
           print_endline "✓ Get post engagement rejects malformed delimiter URN"
       | Ok _ -> failwith "Expected malformed delimiter URN rejection"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: Get account analytics metrics for organization entity *)
+let test_get_account_analytics () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_http.set_responses [
+    {
+      status = 200;
+      headers = [];
+      body =
+        {|{"elements":[{"followerCounts":{"organicFollowerCount":321}}]}|};
+    };
+    {
+      status = 200;
+      headers = [];
+      body =
+        {|{"elements":[{"totalShareStatistics":{"impressionCount":2100,"uniqueImpressionsCount":1700,"shareCount":12,"clickCount":88,"likeCount":40,"commentCount":9}}]}|};
+    };
+  ];
+
+  LinkedIn.get_account_analytics
+    ~account_id:"test_account"
+    ~entity_urn:"urn:li:organization:2414183"
+    (handle_result
+      (fun (analytics : account_analytics) ->
+        assert (analytics.entity_urn = "urn:li:organization:2414183");
+        assert (analytics.follower_count = Some 321);
+        assert (analytics.impression_count = Some 2100);
+        assert (analytics.unique_impression_count = Some 1700);
+        assert (analytics.share_count = Some 12);
+        assert (analytics.click_count = Some 88);
+        assert (analytics.like_count = Some 40);
+        assert (analytics.comment_count = Some 9);
+        let requests = List.rev !Mock_http.requests in
+        (match requests with
+        | [ ("GET", follower_url, follower_headers, _);
+            ("GET", share_url, share_headers, _) ] ->
+            assert (string_contains follower_url "organizationalEntityFollowerStatistics");
+            assert (string_contains share_url "organizationalEntityShareStatistics");
+            assert (string_contains follower_url "q=organizationalEntity");
+            assert (string_contains share_url "q=organizationalEntity");
+            assert (string_contains follower_url "organizationalEntity=");
+            assert (string_contains follower_url "2414183");
+            assert (find_header follower_headers "X-RestLi-Method" = Some "FINDER");
+            assert (find_header share_headers "X-RestLi-Method" = Some "FINDER");
+            assert (find_header follower_headers "X-Restli-Protocol-Version" = Some "2.0.0");
+            assert (find_header follower_headers "Linkedin-Version" = Some "202601")
+        | _ -> failwith "Expected two analytics finder requests");
+        print_endline "✓ Get account analytics")
+      (fun err -> failwith ("Get account analytics failed: " ^ err)))
+
+(** Test: get_account_analytics rejects invalid entity URN before network call *)
+let test_get_account_analytics_rejects_invalid_entity_urn () =
+  Mock_config.reset ();
+
+  LinkedIn.get_account_analytics
+    ~account_id:"test_account"
+    ~entity_urn:"organization:2414183"
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          assert (string_contains msg "author URN");
+          assert (!Mock_http.requests = []);
+          print_endline "✓ Get account analytics rejects invalid entity URN"
+      | Ok _ -> failwith "Expected invalid entity URN rejection"
       | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
 
 (** Test: Post with URL preview (ARTICLE media category) *)
@@ -5275,6 +5356,8 @@ let () =
   test_get_post_engagement_rejects_whitespace_urn ();
   test_get_post_engagement_rejects_blank_urn ();
   test_get_post_engagement_rejects_malformed_delimiter_urn ();
+  test_get_account_analytics ();
+  test_get_account_analytics_rejects_invalid_entity_urn ();
   test_post_with_url_preview ();
   test_post_single_insufficient_permissions_error ();
   test_post_single_with_organization_author ();

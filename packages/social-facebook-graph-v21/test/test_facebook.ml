@@ -21,16 +21,21 @@ let handle_outcome on_success on_error outcome =
 module Mock_http = struct
   let requests = ref []
   let response_queue = ref []
+  let error_queue = ref []
   
   let reset () =
     requests := [];
-    response_queue := []
+    response_queue := [];
+    error_queue := []
   
   let set_response response =
     response_queue := [response]
   
   let set_responses responses =
     response_queue := responses
+
+  let set_errors errors =
+    error_queue := errors
   
   let get_next_response () =
     match !response_queue with
@@ -38,38 +43,60 @@ module Mock_http = struct
     | r :: rest ->
         response_queue := rest;
         Some r
+
+  let get_next_error () =
+    match !error_queue with
+    | [] -> None
+    | e :: rest ->
+        error_queue := rest;
+        Some e
   
   include (struct
   let get ?(headers=[]) url on_success on_error =
     requests := ("GET", url, headers, "") :: !requests;
     match get_next_response () with
     | Some response -> on_success response
-    | None -> on_error "No mock response set"
+    | None ->
+        (match get_next_error () with
+         | Some err -> on_error err
+         | None -> on_error "No mock response set")
   
   let post ?(headers=[]) ?(body="") url on_success on_error =
     requests := ("POST", url, headers, body) :: !requests;
     match get_next_response () with
     | Some response -> on_success response
-    | None -> on_error "No mock response set"
+    | None ->
+        (match get_next_error () with
+         | Some err -> on_error err
+         | None -> on_error "No mock response set")
   
   let put ?(headers=[]) ?(body="") url on_success on_error =
     requests := ("PUT", url, headers, body) :: !requests;
     match get_next_response () with
     | Some response -> on_success response
-    | None -> on_error "No mock response set"
+    | None ->
+        (match get_next_error () with
+         | Some err -> on_error err
+         | None -> on_error "No mock response set")
   
   let delete ?(headers=[]) url on_success on_error =
     requests := ("DELETE", url, headers, "") :: !requests;
     match get_next_response () with
     | Some response -> on_success response
-    | None -> on_error "No mock response set"
+    | None ->
+        (match get_next_error () with
+         | Some err -> on_error err
+         | None -> on_error "No mock response set")
   
   let post_multipart ?(headers=[]) ~parts url on_success on_error =
     let body_str = Printf.sprintf "multipart with %d parts" (List.length parts) in
     requests := ("POST_MULTIPART", url, headers, body_str) :: !requests;
     match get_next_response () with
     | Some response -> on_success response
-    | None -> on_error "No mock response set"
+    | None ->
+        (match get_next_error () with
+         | Some err -> on_error err
+         | None -> on_error "No mock response set")
   end : HTTP_CLIENT)
 end
 
@@ -889,6 +916,59 @@ let test_canonical_analytics_adapters () =
    | None -> failwith "Missing post_clicks_by_type canonical series");
 
   print_endline "✓ Canonical analytics adapters"
+
+(** Test: analytics network errors redact query access_token text *)
+let test_analytics_network_error_redacts_query_token () =
+  Mock_config.reset ();
+  Mock_http.set_errors
+    [ "GET https://graph.facebook.com/v20.0/123/insights?access_token=secret_token_123 failed" ];
+
+  Facebook.get_account_analytics
+    ~id:"123"
+    ~since:"2024-01-01"
+    ~until:"2024-01-02"
+    ~access_token:"secret_token_123"
+    (fun result ->
+      match result with
+      | Error (Error_types.Internal_error msg) ->
+          if string_contains msg "secret_token_123" then
+            failwith ("Token was not redacted: " ^ msg);
+          if not (string_contains msg "REDACTED" || msg = "No mock response set") then
+            failwith ("Unexpected redaction message: " ^ msg);
+          print_endline "✓ Analytics network error redacts query token"
+      | Ok _ -> failwith "Expected network error"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: Version policy guard - analytics remain pinned to v20 while OAuth uses v21 *)
+let test_graph_version_policy_guard () =
+  Mock_config.reset ();
+  Mock_config.set_env "FACEBOOK_APP_ID" "app_123";
+  Mock_http.set_responses
+    [ { status = 200; body = {|{"data":[]}|}; headers = [] };
+      { status = 200; body = {|{"data":[]}|}; headers = [] } ];
+
+  let oauth_url = ref "" in
+  Facebook.get_oauth_url ~redirect_uri:"https://example.com/callback" ~state:"state-123"
+    (fun url -> oauth_url := url)
+    (fun err -> failwith ("OAuth URL generation failed: " ^ err));
+
+  Facebook.get_account_analytics
+    ~id:"123"
+    ~since:"2024-01-01"
+    ~until:"2024-01-02"
+    ~access_token:"token_1"
+    (fun _ -> ());
+  Facebook.get_post_analytics ~post_id:"123_456" ~access_token:"token_1"
+    (fun _ -> ());
+
+  let requests = List.rev !Mock_http.requests in
+  (match requests with
+   | [ ("GET", account_url, _, _); ("GET", post_url, _, _) ] ->
+       assert (string_contains !oauth_url "/v21.0/dialog/oauth");
+       assert (string_contains account_url "graph.facebook.com/v20.0/");
+       assert (string_contains post_url "graph.facebook.com/v20.0/");
+       print_endline "✓ Graph version policy guard"
+   | _ -> failwith "Expected two analytics requests for version policy guard")
 
 (** Test: OAuth URL with required permissions *)
 let test_oauth_url_permissions () =
@@ -2342,6 +2422,8 @@ let () =
   test_account_analytics_parsing ();
   test_post_analytics_parsing ();
   test_canonical_analytics_adapters ();
+  test_analytics_network_error_redacts_query_token ();
+  test_graph_version_policy_guard ();
   
   print_endline "\n--- Alt-Text Tests ---";
   test_upload_photo_with_alt_text ();
@@ -2381,4 +2463,4 @@ let () =
   test_video_media_validation ();
   test_rate_limit_error_code_80001 ();
   
-  print_endline "\n=== All 67 tests passed! ===\n"
+  print_endline "\n=== All 69 tests passed! ===\n"

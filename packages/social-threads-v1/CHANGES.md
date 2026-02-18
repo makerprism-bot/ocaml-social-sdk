@@ -7,6 +7,7 @@
 - Added typed analytics parsing for account/post insight payloads.
 - Added canonical analytics conversion helpers for social-core metric normalization.
 - Added request-contract and malformed-payload tests for analytics endpoints.
+- Added token redaction guard for network errors surfaced from query-token analytics/read URLs.
 
 ## 0.1.0 - 2026-02-12
 

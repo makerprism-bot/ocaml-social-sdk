@@ -109,7 +109,18 @@ module OAuth = struct
       }
 
   let network_error_of_string err =
-    Error_types.Network_error (Error_types.Connection_failed err)
+    let lower = String.lowercase_ascii err in
+    let looks_sensitive =
+      List.exists
+        (fun needle ->
+          try
+            ignore (Str.search_forward (Str.regexp_string needle) lower 0);
+            true
+          with Not_found -> false)
+        [ "access_token="; "access_token"; "client_secret"; "authorization" ]
+    in
+    let safe_err = if looks_sensitive then "[REDACTED_SENSITIVE_TEXT]" else err in
+    Error_types.Network_error (Error_types.Connection_failed safe_err)
 
   (** Scope definitions for Instagram Graph API *)
   module Scopes = struct

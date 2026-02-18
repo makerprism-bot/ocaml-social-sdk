@@ -573,6 +573,29 @@ module Make (Config : CONFIG) = struct
       ~required_permissions:provider_required_permissions
       ~status_code
       ~response_body
+
+  let contains_substring haystack needle =
+    let h_len = String.length haystack in
+    let n_len = String.length needle in
+    if n_len = 0 then true
+    else if n_len > h_len then false
+    else
+      let rec loop i =
+        if i + n_len > h_len then false
+        else if String.sub haystack i n_len = needle then true
+        else loop (i + 1)
+      in
+      loop 0
+
+  let redact_sensitive_text_if_needed text =
+    let lower = String.lowercase_ascii text in
+    if List.exists (contains_substring lower)
+         [ "access_token=";
+           "access_token";
+           "client_secret";
+           "authorization" ]
+    then "[REDACTED_SENSITIVE_TEXT]"
+    else text
   
   (** {1 Rate Limiting} *)
   
@@ -692,7 +715,9 @@ module Make (Config : CONFIG) = struct
             ~required_permissions:(permissions_for_path path)
             ~status_code:response.status
             ~response_body:response.body)))
-      (fun err -> on_result (Error (Error_types.Internal_error err)))
+      (fun err ->
+        on_result
+          (Error (Error_types.Internal_error (redact_sensitive_text_if_needed err))))
   
   (** {1 Token Management} *)
   
@@ -954,7 +979,9 @@ module Make (Config : CONFIG) = struct
                 (fun err -> on_result (Error (Error_types.Internal_error err))))
         else
           on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to download image from %s (%d)" image_url image_response.status))))
-      (fun err -> on_result (Error (Error_types.Internal_error err)))
+      (fun err ->
+        on_result
+          (Error (Error_types.Internal_error (redact_sensitive_text_if_needed err))))
   
   (** Upload video to Facebook Page for Reels 
       
@@ -1171,7 +1198,9 @@ module Make (Config : CONFIG) = struct
             (fun err -> on_result (Error (Error_types.Internal_error err)))
         else
           on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to download image from %s (%d)" image_url image_response.status))))
-      (fun err -> on_result (Error (Error_types.Internal_error err)))
+      (fun err ->
+        on_result
+          (Error (Error_types.Internal_error (redact_sensitive_text_if_needed err))))
   
   (** Post video story to Facebook Page
       
@@ -1295,7 +1324,9 @@ module Make (Config : CONFIG) = struct
             (fun err -> on_result (Error (Error_types.Internal_error err)))
         else
           on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to download video from %s (%d)" video_url video_response.status))))
-      (fun err -> on_result (Error (Error_types.Internal_error err)))
+      (fun err ->
+        on_result
+          (Error (Error_types.Internal_error (redact_sensitive_text_if_needed err))))
   
   (** Post photo story to Facebook Page (high-level)
       
@@ -1915,7 +1946,9 @@ module Make (Config : CONFIG) = struct
                   ~required_permissions:[ "pages_read_engagement" ]
                   ~status_code:response.status
                   ~response_body:response.body)))
-      (fun err -> on_result (Error (Error_types.Internal_error err)))
+      (fun err ->
+        on_result
+          (Error (Error_types.Internal_error (redact_sensitive_text_if_needed err))))
 
   let get_account_analytics_canonical ~id ~since ~until ~access_token on_result =
     let time_range =
@@ -1971,7 +2004,9 @@ module Make (Config : CONFIG) = struct
                   ~required_permissions:[ "pages_read_engagement" ]
                   ~status_code:response.status
                   ~response_body:response.body)))
-      (fun err -> on_result (Error (Error_types.Internal_error err)))
+      (fun err ->
+        on_result
+          (Error (Error_types.Internal_error (redact_sensitive_text_if_needed err))))
 
   let get_post_analytics_canonical ~post_id ~access_token on_result =
     get_post_analytics ~post_id ~access_token

@@ -246,7 +246,7 @@ let parse_api_error ~status_code ~headers ~response_body =
       }
 
 let network_error err =
-  Error_types.Network_error (Error_types.Connection_failed err)
+  Error_types.Network_error (Error_types.Connection_failed (sanitize_text_if_sensitive err))
 
 module OAuth = struct
   module Scopes = struct

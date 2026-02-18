@@ -33,16 +33,21 @@ let handle_result on_success on_error result =
 module Mock_http = struct
   let requests = ref []
   let response_queue = ref []
+  let error_queue = ref []
   
   let reset () =
     requests := [];
-    response_queue := []
+    response_queue := [];
+    error_queue := []
   
   let set_response response =
     response_queue := [response]
   
   let set_responses responses =
     response_queue := responses
+
+  let set_errors errors =
+    error_queue := errors
   
   let get_next_response () =
     match !response_queue with
@@ -50,38 +55,60 @@ module Mock_http = struct
     | r :: rest ->
         response_queue := rest;
         Some r
+
+  let get_next_error () =
+    match !error_queue with
+    | [] -> None
+    | e :: rest ->
+        error_queue := rest;
+        Some e
   
   include (struct
   let get ?(headers=[]) url on_success on_error =
     requests := ("GET", url, headers, "") :: !requests;
     match get_next_response () with
     | Some response -> on_success response
-    | None -> on_error "No mock response set"
+    | None ->
+        (match get_next_error () with
+         | Some err -> on_error err
+         | None -> on_error "No mock response set")
   
   let post ?(headers=[]) ?(body="") url on_success on_error =
     requests := ("POST", url, headers, body) :: !requests;
     match get_next_response () with
     | Some response -> on_success response
-    | None -> on_error "No mock response set"
+    | None ->
+        (match get_next_error () with
+         | Some err -> on_error err
+         | None -> on_error "No mock response set")
   
   let put ?(headers=[]) ?(body="") url on_success on_error =
     requests := ("PUT", url, headers, body) :: !requests;
     match get_next_response () with
     | Some response -> on_success response
-    | None -> on_error "No mock response set"
+    | None ->
+        (match get_next_error () with
+         | Some err -> on_error err
+         | None -> on_error "No mock response set")
   
   let delete ?(headers=[]) url on_success on_error =
     requests := ("DELETE", url, headers, "") :: !requests;
     match get_next_response () with
     | Some response -> on_success response
-    | None -> on_error "No mock response set"
+    | None ->
+        (match get_next_error () with
+         | Some err -> on_error err
+         | None -> on_error "No mock response set")
   
   let post_multipart ?(headers=[]) ~parts url on_success on_error =
     let body_str = Printf.sprintf "multipart with %d parts" (List.length parts) in
     requests := ("POST_MULTIPART", url, headers, body_str) :: !requests;
     match get_next_response () with
     | Some response -> on_success response
-    | None -> on_error "No mock response set"
+    | None ->
+        (match get_next_error () with
+         | Some err -> on_error err
+         | None -> on_error "No mock response set")
   end : HTTP_CLIENT)
 end
 
@@ -1625,6 +1652,25 @@ let test_canonical_insights_adapters () =
 
   print_endline "✓ Canonical insights adapters"
 
+let test_insights_network_error_redacts_query_token () =
+  Mock_config.reset ();
+  Mock_http.set_errors
+    [ "GET https://graph.facebook.com/v21.0/ig_user_123/insights?access_token=secret_ig_token failed" ];
+
+  Instagram.get_account_audience_insights
+    ~id:"ig_user_123"
+    ~access_token:"secret_ig_token"
+    ~since:"2025-01-01"
+    ~until:"2025-01-02"
+    (fun result ->
+      match result with
+      | Error (Error_types.Network_error (Error_types.Connection_failed msg)) ->
+          assert (msg = "[REDACTED_SENSITIVE_TEXT]");
+          assert (not (string_contains msg "secret_ig_token"));
+          print_endline "✓ Insights network error redacts query token"
+      | Ok _ -> failwith "Expected network error"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
 (** Run all tests *)
 let () =
   print_endline "\n=== Instagram Provider Tests ===\n";
@@ -1696,5 +1742,6 @@ let () =
   test_account_engagement_insights_parser_total_value ();
   test_media_insights_parser ();
   test_canonical_insights_adapters ();
+  test_insights_network_error_redacts_query_token ();
 
   print_endline "\n=== All tests passed! ===\n"

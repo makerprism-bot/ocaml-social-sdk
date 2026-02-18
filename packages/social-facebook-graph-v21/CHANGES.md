@@ -58,6 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_post_analytics` for `/v20.0/{post_id}/insights`
 - Added canonical analytics conversion helpers for social-core metric normalization
 - Added request-contract and parser tests for account/post analytics flows
+- Added redaction guard for analytics network errors so query-token text is not surfaced in internal errors
 
 #### Structured Error Handling
 - Posting operations use `outcome` type with Success/Partial_success/Failure

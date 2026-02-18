@@ -73,13 +73,14 @@ Known subtle bug traps:
 | OAuth code exchange | POST | `https://www.linkedin.com/oauth/v2/accessToken` | `Content-Type: application/x-www-form-urlencoded` | form body: `grant_type=authorization_code`, `code`, `redirect_uri`, `client_id`, `client_secret` | `LinkedIn.exchange_code` | `test_token_exchange` |
 | OAuth refresh | POST | `https://www.linkedin.com/oauth/v2/accessToken` | `Content-Type: application/x-www-form-urlencoded` | form body: `grant_type=refresh_token`, `refresh_token`, `client_id`, `client_secret` | `LinkedIn.refresh_token` | `test_token_refresh_standard` |
 | Publish post (UGC) | POST | `https://api.linkedin.com/v2/ugcPosts` | `Authorization: Bearer <token>`, `Content-Type: application/json`, `X-Restli-Protocol-Version: 2.0.0` | JSON body with `author`, `lifecycleState=PUBLISHED`, `specificContent.com.linkedin.ugc.ShareContent`, `visibility` | `LinkedIn.post_single` | `test_ugcpost_request_body_structure`, `test_post_single_with_organization_author` |
-| Account analytics | n/a | Not implemented in current LinkedIn provider | n/a | n/a | n/a | none |
+| Account analytics | GET + GET | `https://api.linkedin.com/v2/organizationalEntityFollowerStatistics?q=organizationalEntity&organizationalEntity={urn}` then `https://api.linkedin.com/v2/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity={urn}` | `Authorization: Bearer <token>`, `X-Restli-Protocol-Version: 2.0.0`, `Linkedin-Version: YYYYMM`, `X-RestLi-Method: FINDER` | none | `LinkedIn.get_account_analytics` | `test_get_account_analytics` |
 | Post analytics (engagement proxy) | GET | `https://api.linkedin.com/v2/socialMetadata/{urlencoded_post_urn}` | `Authorization: Bearer <token>`, `X-Restli-Protocol-Version: 2.0.0` | none | `LinkedIn.get_post_engagement` | `test_get_post_engagement` |
 
 Known subtle bug traps:
 - REST.li headers are mandatory on many calls (`X-Restli-Protocol-Version`, finder/batch method headers where applicable).
 - URN validation is strict (whitespace and malformed delimiters are rejected before network calls).
 - OAuth redirect URI must exactly match configured `LINKEDIN_REDIRECT_URI` when configured.
+- Account analytics currently targets organization/entity finder statistics endpoints and aggregates metrics from two requests.
 
 ## TikTok
 

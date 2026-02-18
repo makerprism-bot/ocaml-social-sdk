@@ -50,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `get_media_insights` for views/reach/saves/likes/comments/shares
 - Added account-scoped convenience wrappers and canonical analytics conversion helpers
 - Added request-contract and parser tests for all insights flows
+- Added redaction guard for network error text containing token-bearing query fragments
 
 #### Architecture
 - CPS (Continuation Passing Style) implementation

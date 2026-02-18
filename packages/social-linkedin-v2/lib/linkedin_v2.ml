@@ -390,6 +390,17 @@ type engagement_info = {
   impression_count: int option;
 }
 
+type account_analytics = {
+  entity_urn: string;
+  follower_count: int option;
+  impression_count: int option;
+  unique_impression_count: int option;
+  share_count: int option;
+  click_count: int option;
+  like_count: int option;
+  comment_count: int option;
+}
+
 (** Comment on a post *)
 type comment_info = {
   id: string;
@@ -2300,7 +2311,7 @@ module Make (Config : CONFIG) = struct
                 let json = Yojson.Basic.from_string response.body in
                 let open Yojson.Basic.Util in
                 
-                let engagement = {
+                let engagement : engagement_info = {
                   like_count = json |> member "totalLikes" |> to_int_option;
                   comment_count = json |> member "totalComments" |> to_int_option;
                   share_count = json |> member "totalShares" |> to_int_option;
@@ -2313,4 +2324,138 @@ module Make (Config : CONFIG) = struct
               on_result (Error (parse_api_error ~required_scopes:["r_member_social"] ~status_code:response.status ~body:response.body)))
           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
+
+  let get_account_analytics ~account_id ~entity_urn on_result =
+    match validate_author_urn entity_urn with
+    | Some err -> on_result (Error (Error_types.Internal_error err))
+    | None ->
+        ensure_valid_token ~account_id
+          (fun access_token ->
+            let finder_query =
+              Uri.encoded_of_query
+                [ ("q", ["organizationalEntity"]);
+                  ("organizationalEntity", [entity_urn]) ]
+            in
+            let follower_url =
+              Printf.sprintf "%s/organizationalEntityFollowerStatistics?%s"
+                linkedin_api_base
+                finder_query
+            in
+            let share_url =
+              Printf.sprintf "%s/organizationalEntityShareStatistics?%s"
+                linkedin_api_base
+                finder_query
+            in
+            let headers =
+              [ ("Authorization", Printf.sprintf "Bearer %s" access_token);
+                ("X-Restli-Protocol-Version", "2.0.0");
+                ("Linkedin-Version", linkedin_version_header ());
+                ("X-RestLi-Method", "FINDER") ]
+            in
+
+            let int_of_json_option json =
+              let open Yojson.Basic.Util in
+              try Some (json |> to_int)
+              with _ ->
+                try Some (json |> to_float |> int_of_float)
+                with _ ->
+                  try Some (json |> to_string |> int_of_string)
+                  with _ -> None
+            in
+
+            let member_path json path =
+              List.fold_left
+                (fun acc key ->
+                  let open Yojson.Basic.Util in
+                  acc |> member key)
+                json
+                path
+            in
+
+            let first_element json =
+              let open Yojson.Basic.Util in
+              match json |> member "elements" |> to_list with
+              | first :: _ -> Some first
+              | [] -> None
+            in
+
+            let parse_follower_count body =
+              try
+                let json = Yojson.Basic.from_string body in
+                match first_element json with
+                | None -> None
+                | Some elem ->
+                    [ ["followerCounts"; "organicFollowerCount"];
+                      ["followerCounts"; "followerCounts"];
+                      ["followerCounts"; "totalFollowerCounts"];
+                      ["followerCounts"; "totalFollowerCount"] ]
+                    |> List.find_map (fun path -> int_of_json_option (member_path elem path))
+              with _ -> None
+            in
+
+            let parse_share_metrics body =
+              try
+                let json = Yojson.Basic.from_string body in
+                match first_element json with
+                | None -> (None, None, None, None, None, None)
+                | Some elem ->
+                    let stats = member_path elem ["totalShareStatistics"] in
+                    let impressions = int_of_json_option (member_path stats ["impressionCount"]) in
+                    let unique_impressions =
+                      int_of_json_option (member_path stats ["uniqueImpressionsCount"])
+                    in
+                    let shares = int_of_json_option (member_path stats ["shareCount"]) in
+                    let clicks = int_of_json_option (member_path stats ["clickCount"]) in
+                    let likes = int_of_json_option (member_path stats ["likeCount"]) in
+                    let comments = int_of_json_option (member_path stats ["commentCount"]) in
+                    (impressions, unique_impressions, shares, clicks, likes, comments)
+              with _ -> (None, None, None, None, None, None)
+            in
+
+            Config.Http.get ~headers follower_url
+              (fun follower_response ->
+                if follower_response.status >= 200 && follower_response.status < 300 then
+                  let follower_count = parse_follower_count follower_response.body in
+                  Config.Http.get ~headers share_url
+                    (fun share_response ->
+                      if share_response.status >= 200 && share_response.status < 300 then
+                        let impression_count, unique_impression_count, share_count, click_count,
+                            like_count, comment_count =
+                          parse_share_metrics share_response.body
+                        in
+                        let analytics : account_analytics =
+                          {
+                            entity_urn;
+                            follower_count;
+                            impression_count;
+                            unique_impression_count;
+                            share_count;
+                            click_count;
+                            like_count;
+                            comment_count;
+                          }
+                        in
+                        on_result (Ok analytics)
+                      else
+                        on_result
+                          (Error
+                             (parse_api_error
+                                ~required_scopes:[ "r_organization_admin"; "r_member_social" ]
+                                ~status_code:share_response.status
+                                ~body:share_response.body)))
+                    (fun err ->
+                      on_result
+                        (Error (Error_types.Network_error (Error_types.Connection_failed err))))
+                else
+                  on_result
+                    (Error
+                       (parse_api_error
+                          ~required_scopes:[ "r_organization_admin"; "r_member_social" ]
+                          ~status_code:follower_response.status
+                          ~body:follower_response.body)))
+              (fun err ->
+                on_result
+                  (Error (Error_types.Network_error (Error_types.Connection_failed err))))
+          )
+          (fun err -> on_result (Error err))
 end

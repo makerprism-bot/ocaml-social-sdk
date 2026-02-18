@@ -63,6 +63,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Account analytics API:
+  - `get_account_analytics` aggregating follower and share/impression statistics from LinkedIn finder endpoints.
+- Contract tests for LinkedIn account analytics request shape and parsing.
 - OAuth 2.0 authentication with OpenID Connect
 - Token refresh support (partner and standard flows)
 - Profile API:

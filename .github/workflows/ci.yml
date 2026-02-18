@@ -63,6 +63,11 @@ jobs:
             social-threads-v1
           do
             echo "Checking $pkg"
-            dune pkg lock --only-packages="$pkg"
-            dune build --only-packages="$pkg" @pkg-install
+            if [ "$pkg" = "social-core" ]; then
+              only_packages="$pkg"
+            else
+              only_packages="social-core,$pkg"
+            fi
+            dune pkg lock --only-packages="$only_packages"
+            dune build --only-packages="$only_packages" @pkg-install
           done

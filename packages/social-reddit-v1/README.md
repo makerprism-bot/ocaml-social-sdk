@@ -19,7 +19,7 @@ Reddit API v1 client for OCaml. Supports posting to subreddits where the authent
 | Title | 300 characters |
 | Body (self-post) | 40,000 characters |
 | Images | 20MB max, jpg/png/gif |
-| Video | 1GB max, 15 minutes, mp4 only |
+| Video | 1GB max, 15 minutes |
 | Gallery | up to 20 images |
 
 ## Installation
@@ -97,6 +97,16 @@ Reddit.submit_image_post
   ()
   on_result
 
+(* Native video post (upload lease + S3 upload + /api/submit kind=video) *)
+Reddit.submit_video_post
+  ~account_id:"account123"
+  ~subreddit:"your_subreddit"
+  ~title:"My video"
+  ~video_url:"https://example.com/video.mp4"
+  ~thumbnail_url:"https://example.com/poster.jpg"  (* Optional *)
+  ()
+  on_result
+
 (* Crosspost *)
 Reddit.submit_crosspost
   ~account_id:"account123"
@@ -106,17 +116,24 @@ Reddit.submit_crosspost
   ()
   on_result
 
-(* Unified post_single (auto-detects type) *)
+(* Unified post_single (auto-detects type; choose one mode per call) *)
 Reddit.post_single
   ~account_id:"account123"
   ~subreddit:"your_subreddit"
-  ~title:"Title"
-  ~body:"For self-posts"
-  ~url:"For link posts"
-  ~media_urls:["For image posts"]
+  ~title:"Video example"
+  ~media_urls:["https://example.com/video.mp4"; "https://example.com/poster.jpg"]
   ()
   on_result
 ```
+
+### Video Posting Notes
+
+- Use exactly one posting mode per `post_single` call: self (`body`), link (`url`), or media (`media_urls`)
+- `post_single` routes media to native video flow for known video extensions (`.mp4`, `.mov`, `.webm`, etc.)
+- For unknown URL extensions, the provider downloads media and decides by `content-type` (video stays video, image routes to image post)
+- Extension-based routing is best-effort detection; successful publish still depends on Reddit media acceptance rules
+- No silent fallback that treats video as an image post
+- Optional thumbnail (`media_urls` second URL or `thumbnail_url`) is uploaded as poster image when valid; invalid/non-image thumbnails are ignored so the video can still publish
 
 ### Subreddit Management
 

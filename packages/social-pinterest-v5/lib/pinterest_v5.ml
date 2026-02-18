@@ -441,14 +441,53 @@ module Make (Config : CONFIG) = struct
       with Not_found -> lowered
     in
     String.trim without_params
+
+  let token_needs_refresh (creds : credentials) =
+    match creds.expires_at with
+    | None -> false
+    | Some expires_at_str ->
+        (match Ptime.of_rfc3339 expires_at_str with
+         | Ok (exp_time, _, _) ->
+             let now = Ptime_clock.now () in
+             let buffer = Ptime.Span.of_int_s OAuth.Metadata.refresh_buffer_seconds in
+             (match Ptime.sub_span exp_time buffer with
+              | Some threshold -> Ptime.is_earlier now ~than:threshold |> not
+              | None -> true)
+         | Error _ -> false)
   
-  (** Ensure valid access token (Pinterest tokens are long-lived) *)
+  (** Ensure valid access token, refreshing when near expiry *)
   let ensure_valid_token ~account_id on_success on_error =
     Config.get_credentials ~account_id
       (fun creds ->
-        Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
-          (fun () -> on_success creds.access_token)
-          (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
+        if token_needs_refresh creds then
+          match creds.refresh_token with
+          | None -> on_error (Error_types.Auth_error Error_types.Token_expired)
+          | Some refresh_tok ->
+              let client_id = Config.get_env "PINTEREST_CLIENT_ID" |> Option.value ~default:"" in
+              let client_secret = Config.get_env "PINTEREST_CLIENT_SECRET" |> Option.value ~default:"" in
+              if client_id = "" || client_secret = "" then
+                on_error (Error_types.Auth_error Error_types.Missing_credentials)
+              else
+                let module OAuthHttp = OAuth.Make(Config.Http) in
+                OAuthHttp.refresh_token ~client_id ~client_secret ~refresh_token:refresh_tok
+                  (fun new_creds ->
+                    Config.update_credentials ~account_id ~credentials:new_creds
+                      (fun () ->
+                        Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
+                          (fun () -> on_success new_creds.access_token)
+                          (fun _ -> on_success new_creds.access_token))
+                      (fun err ->
+                        Config.update_health_status ~account_id ~status:"refresh_failed" ~error_message:(Some err)
+                          (fun () -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err)))
+                          (fun _ -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err)))))
+                  (fun err ->
+                    Config.update_health_status ~account_id ~status:"refresh_failed" ~error_message:(Some err)
+                      (fun () -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err)))
+                      (fun _ -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err))))
+        else
+          Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
+            (fun () -> on_success creds.access_token)
+            (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
       (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
   
   (** Get user's default board *)
@@ -974,15 +1013,52 @@ module Make (Config : CONFIG) = struct
               let json = Yojson.Basic.from_string response.body in
               let open Yojson.Basic.Util in
               let access_token = json |> member "access_token" |> to_string in
-              let refresh_token = 
+              let refresh_token =
                 try Some (json |> member "refresh_token" |> to_string)
                 with _ -> None
               in
-              (* Pinterest tokens are long-lived (no expiry) *)
+              let expires_in =
+                try json |> member "expires_in" |> to_int
+                with _ -> 2592000
+              in
+              let granted_scope_raw =
+                try Some (json |> member "scope" |> to_string)
+                with _ -> None
+              in
+              let required_scopes = [
+                "boards:read";
+                "pins:read";
+                "pins:write";
+                "user_accounts:read";
+              ] in
+              let missing_scopes =
+                match granted_scope_raw with
+                | None -> required_scopes
+                | Some scope_str ->
+                    let granted_scopes =
+                      scope_str
+                      |> String.map (fun c -> if c = ',' then ' ' else c)
+                      |> String.split_on_char ' '
+                      |> List.map String.trim
+                      |> List.filter (fun s -> String.length s > 0)
+                    in
+                    List.filter (fun required -> not (List.mem required granted_scopes)) required_scopes
+              in
+              if missing_scopes <> [] then
+                on_error (Printf.sprintf
+                  "Missing required Pinterest OAuth scopes: %s"
+                  (String.concat ", " missing_scopes))
+              else
+              let expires_at =
+                let now = Ptime_clock.now () in
+                match Ptime.add_span now (Ptime.Span.of_int_s expires_in) with
+                | Some exp -> Some (Ptime.to_rfc3339 exp)
+                | None -> None
+              in
               let credentials = {
                 access_token;
                 refresh_token;
-                expires_at = None;
+                expires_at;
                 token_type = "Bearer";
               } in
               on_success credentials

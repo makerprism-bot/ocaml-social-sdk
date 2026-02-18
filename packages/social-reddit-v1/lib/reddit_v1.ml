@@ -1534,9 +1534,75 @@ module Make (Config : CONFIG) = struct
     if client_id = "" || client_secret = "" then
       on_error "Reddit OAuth credentials not configured"
     else
-      let module OAuthHttp = OAuth.Make(Config.Http) in
-      OAuthHttp.exchange_code ~client_id ~client_secret ~redirect_uri ~code
-        on_success
+      let expected_scopes = OAuth.Scopes.moderation in
+      let body = Printf.sprintf
+        "grant_type=authorization_code&code=%s&redirect_uri=%s"
+        (Uri.pct_encode code)
+        (Uri.pct_encode redirect_uri)
+      in
+      let auth_string = String.trim client_id ^ ":" ^ String.trim client_secret in
+      let headers = [
+        ("Content-Type", "application/x-www-form-urlencoded");
+        ("Authorization", "Basic " ^ Base64.encode_exn auth_string);
+      ] in
+      Config.Http.post ~headers ~body OAuth.Metadata.token_endpoint
+        (fun response ->
+          if response.status >= 200 && response.status < 300 then
+            try
+              let json = Yojson.Basic.from_string response.body in
+              let open Yojson.Basic.Util in
+              let access_token = json |> member "access_token" |> to_string in
+              let refresh_token =
+                try Some (json |> member "refresh_token" |> to_string)
+                with _ -> None
+              in
+              let expires_in =
+                try json |> member "expires_in" |> to_int
+                with _ -> 3600
+              in
+              let token_type =
+                try json |> member "token_type" |> to_string
+                with _ -> "bearer"
+              in
+              let granted_scope_raw =
+                try Some (json |> member "scope" |> to_string)
+                with _ -> None
+              in
+              let missing_scopes =
+                match granted_scope_raw with
+                | None -> expected_scopes
+                | Some scope_str ->
+                    let granted_scopes =
+                      scope_str
+                      |> String.map (fun c -> if c = ',' then ' ' else c)
+                      |> String.split_on_char ' '
+                      |> List.map String.trim
+                      |> List.filter (fun s -> String.length s > 0)
+                    in
+                    List.filter (fun required -> not (List.mem required granted_scopes)) expected_scopes
+              in
+              if missing_scopes <> [] then
+                on_error (Printf.sprintf
+                  "Missing required Reddit OAuth scopes: %s"
+                  (String.concat ", " missing_scopes))
+              else
+                let expires_at =
+                  let now = Ptime_clock.now () in
+                  match Ptime.add_span now (Ptime.Span.of_int_s expires_in) with
+                  | Some exp -> Some (Ptime.to_rfc3339 exp)
+                  | None -> None
+                in
+                let credentials = {
+                  access_token;
+                  refresh_token;
+                  expires_at;
+                  token_type;
+                } in
+                on_success credentials
+            with e ->
+              on_error (Printf.sprintf "Failed to parse OAuth response: %s" (Printexc.to_string e))
+          else
+            on_error (Printf.sprintf "OAuth exchange failed (%d): %s" response.status response.body))
         on_error
   
   (** Get user info with the current credentials *)

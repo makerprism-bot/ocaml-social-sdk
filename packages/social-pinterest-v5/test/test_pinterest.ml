@@ -153,6 +153,9 @@ let setup_valid_credentials ?(account_id="test_account") () =
       token_type = "Bearer";
     }
 
+let past_expiry () =
+  "2000-01-01T00:00:00Z"
+
 (** Test: OAuth URL generation *)
 let test_oauth_url () =
   Mock_config.reset ();
@@ -179,7 +182,8 @@ let test_token_exchange () =
     "access_token": "new_access_token_123",
     "refresh_token": "refresh_token_456",
     "token_type": "bearer",
-    "expires_in": 2592000
+    "expires_in": 2592000,
+    "scope": "boards:read,pins:read,pins:write,user_accounts:read"
   }|} in
   
   Mock_http.set_responses [{ status = 200; body = response_body; headers = [] }];
@@ -191,10 +195,116 @@ let test_token_exchange () =
       assert (creds.access_token = "new_access_token_123");
       assert (creds.refresh_token = Some "refresh_token_456");
       assert (creds.token_type = "Bearer");
-      (* Pinterest tokens are long-lived with no defined expiration *)
-      assert (creds.expires_at = None);
+      assert (creds.expires_at <> None);
       print_endline "✓ Token exchange")
     (fun err -> failwith ("Token exchange failed: " ^ err))
+
+let test_token_exchange_rejects_missing_scopes () =
+  Mock_config.reset ();
+  Mock_config.set_env "PINTEREST_CLIENT_ID" "test_client";
+  Mock_config.set_env "PINTEREST_CLIENT_SECRET" "test_secret";
+
+  let response_body = {|{
+    "access_token": "new_access_token_123",
+    "refresh_token": "refresh_token_456",
+    "token_type": "bearer",
+    "expires_in": 2592000,
+    "scope": "boards:read,pins:read,user_accounts:read"
+  }|} in
+
+  Mock_http.set_responses [{ status = 200; body = response_body; headers = [] }];
+
+  Pinterest.exchange_code
+    ~code:"test_code"
+    ~redirect_uri:"https://example.com/callback"
+    (fun _ -> failwith "Token exchange should fail when required scopes are missing")
+    (fun err ->
+      assert (string_contains err "Missing required Pinterest OAuth scopes");
+      assert (string_contains err "pins:write");
+      print_endline "✓ Token exchange rejects missing required scopes")
+
+let test_post_single_refreshes_expired_token () =
+  Mock_config.reset ();
+  Mock_config.set_env "PINTEREST_CLIENT_ID" "test_client";
+  Mock_config.set_env "PINTEREST_CLIENT_SECRET" "test_secret";
+  Mock_config._set_credentials
+    ~account_id:"test_account"
+    ~credentials:{
+      access_token = "expired_access_token";
+      refresh_token = Some "refresh_token_456";
+      expires_at = Some (past_expiry ());
+      token_type = "Bearer";
+    };
+
+  let refresh_response =
+    { status = 200; body = {|{"access_token":"fresh_access","refresh_token":"fresh_refresh","token_type":"Bearer","expires_in":2592000}|}; headers = [] }
+  in
+  let boards_response =
+    { status = 200; body = {|{"items":[{"id":"board_123"}]}|}; headers = [] }
+  in
+  let image_download_response =
+    { status = 200; body = "fake_image_binary"; headers = [ ("content-type", "image/jpeg") ] }
+  in
+  let media_upload_response =
+    { status = 201; body = {|{"media_id":"media_456"}|}; headers = [] }
+  in
+  let pin_create_response =
+    { status = 201; body = {|{"id":"pin_789"}|}; headers = [] }
+  in
+
+  Mock_http.set_responses [
+    refresh_response;
+    boards_response;
+    image_download_response;
+    media_upload_response;
+    pin_create_response;
+  ];
+
+  Pinterest.post_single
+    ~account_id:"test_account"
+    ~text:"Refresh token path"
+    ~media_urls:["https://example.com/image.jpg"]
+    (fun outcome ->
+      match outcome with
+      | Error_types.Success pin_id ->
+          assert (pin_id = "pin_789");
+          let chronological = List.rev !Mock_http.requests in
+          let (m1, u1, h1, b1) = List.nth chronological 0 in
+          assert (m1 = "POST");
+          assert (string_contains u1 "/oauth/token");
+          assert (List.assoc_opt "Authorization" h1 <> None);
+          assert (string_contains b1 "grant_type=refresh_token");
+          print_endline "✓ Expired Pinterest token is refreshed before posting"
+      | Error_types.Failure err ->
+          failwith ("Expected refreshed post flow to succeed: " ^ Error_types.error_to_string err)
+      | Error_types.Partial_success _ ->
+          failwith "Expected full success for refreshed token flow")
+
+let test_post_single_expired_token_without_refresh_fails () =
+  Mock_config.reset ();
+  Mock_config._set_credentials
+    ~account_id:"test_account"
+    ~credentials:{
+      access_token = "expired_access_token";
+      refresh_token = None;
+      expires_at = Some (past_expiry ());
+      token_type = "Bearer";
+    };
+
+  Pinterest.post_single
+    ~account_id:"test_account"
+    ~text:"No refresh token"
+    ~media_urls:["https://example.com/image.jpg"]
+    (fun outcome ->
+      match outcome with
+      | Error_types.Failure (Error_types.Auth_error Error_types.Token_expired) ->
+          print_endline "✓ Expired token without refresh token fails with auth error"
+      | Error_types.Failure err ->
+          failwith ("Expected token expired auth error: " ^ Error_types.error_to_string err)
+      | Error_types.Success _ ->
+          failwith "Expected failure when refresh token is unavailable"
+      | Error_types.Partial_success _ ->
+          failwith "Expected failure, not partial success")
 
 (** Test: Get all boards *)
 (* TODO: Function get_all_boards not implemented yet
@@ -865,6 +975,9 @@ let () =
   print_endline "\n=== Pinterest Provider Tests ===\n";
   test_oauth_url ();
   test_token_exchange ();
+  test_token_exchange_rejects_missing_scopes ();
+  test_post_single_refreshes_expired_token ();
+  test_post_single_expired_token_without_refresh_fails ();
   (* test_get_all_boards (); *) (* TODO: Function not implemented *)
   test_content_validation ();
   test_post_requires_image ();

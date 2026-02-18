@@ -219,7 +219,7 @@ let test_token_exchange () =
     "refresh_token": "refresh_token_456",
     "token_type": "bearer",
     "expires_in": 3600,
-    "scope": "submit read mysubreddits flair"
+    "scope": "submit read mysubreddits flair modposts"
   }|} in
   
   Mock_http.set_response { status = 200; body = response_body; headers = [] };
@@ -240,7 +240,7 @@ let test_token_exchange_basic_auth () =
   Mock_config.set_env "REDDIT_CLIENT_ID" "my_client";
   Mock_config.set_env "REDDIT_CLIENT_SECRET" "my_secret";
   
-  let response_body = {|{"access_token": "tok", "token_type": "bearer", "expires_in": 3600}|} in
+  let response_body = {|{"access_token": "tok", "token_type": "bearer", "expires_in": 3600, "scope": "submit read mysubreddits flair modposts"}|} in
   Mock_http.set_response { status = 200; body = response_body; headers = [] };
   
   Reddit.exchange_code 
@@ -255,6 +255,30 @@ let test_token_exchange_basic_auth () =
       assert (String.sub auth 0 6 = "Basic ");
       print_endline "✓ Token exchange uses Basic Auth")
     (fun err -> failwith ("Token exchange failed: " ^ err))
+
+let test_token_exchange_rejects_missing_scopes () =
+  Mock_config.reset ();
+  Mock_config.set_env "REDDIT_CLIENT_ID" "test_client";
+  Mock_config.set_env "REDDIT_CLIENT_SECRET" "test_secret";
+
+  let response_body = {|{
+    "access_token": "new_access_token_123",
+    "refresh_token": "refresh_token_456",
+    "token_type": "bearer",
+    "expires_in": 3600,
+    "scope": "submit read mysubreddits flair"
+  }|} in
+
+  Mock_http.set_response { status = 200; body = response_body; headers = [] };
+
+  Reddit.exchange_code
+    ~code:"test_auth_code"
+    ~redirect_uri:"https://example.com/callback"
+    (fun _ -> failwith "Token exchange should fail when required scopes are missing")
+    (fun err ->
+      assert (string_contains err "Missing required Reddit OAuth scopes");
+      assert (string_contains err "modposts");
+      print_endline "✓ Token exchange rejects missing required scopes")
 
 (** {1 Validation Tests} *)
 
@@ -1619,6 +1643,7 @@ let () =
   test_oauth_url_custom_scopes ();
   test_token_exchange ();
   test_token_exchange_basic_auth ();
+  test_token_exchange_rejects_missing_scopes ();
   
   print_endline "\n--- Validation Tests ---";
   test_validate_title_empty ();
@@ -1684,7 +1709,7 @@ let () =
   
   print_endline "\n=== All tests passed! ===";
   print_endline "\nTest Coverage Summary:";
-  print_endline "  - OAuth 2.0 with Basic Auth (4 tests)";
+  print_endline "  - OAuth 2.0 with Basic Auth (5 tests)";
   print_endline "  - Content validation (7 tests)";
   print_endline "  - Post submission (4 tests)";
   print_endline "  - Subreddit operations (3 tests)";
@@ -1696,4 +1721,4 @@ let () =
   print_endline "  - Header verification (2 tests)";
   print_endline "  - Credentials handling (2 tests)";
   print_endline "";
-  print_endline "Total: 46 test functions\n"
+  print_endline "Total: 47 test functions\n"

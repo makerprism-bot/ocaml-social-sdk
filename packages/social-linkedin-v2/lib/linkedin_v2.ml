@@ -172,8 +172,11 @@ module OAuth = struct
         ("client_id", [client_id]);
         ("client_secret", [client_secret]);
       ] in
-      let query_string = Uri.encoded_of_query params in
-      let url = Printf.sprintf "%s?%s" Metadata.token_endpoint query_string in
+      let body = Uri.encoded_of_query params in
+      let url = Metadata.token_endpoint in
+      let headers = [
+        ("Content-Type", "application/x-www-form-urlencoded");
+      ] in
 
       let parse_error body =
         try
@@ -192,7 +195,7 @@ module OAuth = struct
           (None, body)
       in
 
-      Http.post ~headers:[] ~body:"" url
+      Http.post ~headers ~body url
         (fun response ->
           if response.status >= 200 && response.status < 300 then
             try
@@ -1481,8 +1484,11 @@ module Make (Config : CONFIG) = struct
         ("client_secret", [client_secret]);
       ] in
 
-      let query_string = Uri.encoded_of_query params in
-      let url = Printf.sprintf "%s/accessToken?%s" linkedin_auth_url query_string in
+      let body = Uri.encoded_of_query params in
+      let url = Printf.sprintf "%s/accessToken" linkedin_auth_url in
+      let headers = [
+        ("Content-Type", "application/x-www-form-urlencoded");
+      ] in
 
       let parse_error body =
         try
@@ -1501,7 +1507,7 @@ module Make (Config : CONFIG) = struct
           (None, body)
       in
 
-      Config.Http.post ~headers:[] ~body:"" url
+      Config.Http.post ~headers ~body url
         (fun response ->
           if response.status >= 200 && response.status < 300 then
             try

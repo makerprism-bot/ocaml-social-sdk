@@ -191,14 +191,19 @@ let test_token_exchange () =
       let requests = !Mock_http.requests in
       (match requests with
       | ("POST", url, headers, body) :: _ ->
-          assert (string_contains url "/oauth/v2/accessToken");
-          assert (string_contains url "grant_type=authorization_code");
-          assert (string_contains url "code=test_code");
-          assert (string_contains url "redirect_uri=");
-          assert (string_contains url "client_id=test_client");
-          assert (string_contains url "client_secret=test_secret");
-          assert (headers = []);
-          assert (body = "")
+          assert (url = "https://www.linkedin.com/oauth/v2/accessToken");
+          assert (not (string_contains url "?"));
+          assert (not (string_contains url "client_id="));
+          assert (not (string_contains url "client_secret="));
+          assert (find_header headers "Content-Type" = Some "application/x-www-form-urlencoded");
+          assert (string_contains body "grant_type=authorization_code");
+          assert (string_contains body "code=test_code");
+          assert (
+            string_contains body "redirect_uri=https%3A%2F%2Fexample.com%2Fcallback"
+            || string_contains body "redirect_uri=https://example.com/callback"
+          );
+          assert (string_contains body "client_id=test_client");
+          assert (string_contains body "client_secret=test_secret")
       | _ -> failwith "Expected OAuth token exchange POST request");
       print_endline "✓ Token exchange")
     (fun err -> failwith ("Token exchange failed: " ^ err))

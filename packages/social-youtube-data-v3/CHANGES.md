@@ -20,3 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Structured error handling:
   - Posting operations use `outcome` type with Success/Partial_success/Failure
   - Non-posting operations use `api_result` type with Ok/Error
+- Added account analytics API `get_account_analytics` using channel statistics.
+- Added post analytics API `get_post_analytics` using video statistics.
+- Added thumbnail upload support:
+  - request-contract builder `build_thumbnail_upload_request`
+  - upload helpers for direct bytes and URL-fetched images
+- Added canonical analytics conversion helpers for social-core metric normalization.
+- Added analytics and thumbnail request-contract tests.

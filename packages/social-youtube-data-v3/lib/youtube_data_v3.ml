@@ -546,6 +546,358 @@ module Make (Config : CONFIG) = struct
             (fun () -> on_success creds.access_token)
             (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
       (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
+
+  (** Channel-level analytics derived from YouTube Data API statistics. *)
+  type account_analytics = {
+    channel_id : string;
+    title : string option;
+    view_count : int;
+    subscriber_count : int;
+    hidden_subscriber_count : bool;
+    video_count : int;
+  }
+
+  (** Video-level analytics derived from YouTube Data API statistics. *)
+  type post_analytics = {
+    video_id : string;
+    title : string option;
+    view_count : int;
+    like_count : int;
+    favorite_count : int;
+    comment_count : int;
+  }
+
+  let to_canonical_optional_point value_opt =
+    match value_opt with
+    | Some value -> [ Analytics_types.make_datapoint value ]
+    | None -> []
+
+  let to_canonical_youtube_series ?time_range ~scope ~provider_metric points =
+    match Analytics_normalization.youtube_metric_to_canonical provider_metric with
+    | Some metric ->
+        Some
+          (Analytics_types.make_series
+             ?time_range
+             ~metric
+             ~scope
+             ~provider_metric
+             points)
+    | None -> None
+
+  let to_canonical_account_analytics_series
+      (account_analytics : account_analytics) =
+    [ ("view_count", to_canonical_optional_point (Some account_analytics.view_count));
+      ("subscriber_count",
+       to_canonical_optional_point (Some account_analytics.subscriber_count));
+      ("video_count", to_canonical_optional_point (Some account_analytics.video_count)) ]
+    |> List.filter_map (fun (provider_metric, points) ->
+           to_canonical_youtube_series
+             ~scope:Analytics_types.Channel
+             ~provider_metric
+             points)
+
+  let to_canonical_post_analytics_series (post_analytics : post_analytics) =
+    [ ("view_count", to_canonical_optional_point (Some post_analytics.view_count));
+      ("like_count", to_canonical_optional_point (Some post_analytics.like_count));
+      ("favorite_count", to_canonical_optional_point (Some post_analytics.favorite_count));
+      ("comment_count", to_canonical_optional_point (Some post_analytics.comment_count)) ]
+    |> List.filter_map (fun (provider_metric, points) ->
+           to_canonical_youtube_series
+             ~scope:Analytics_types.Video
+             ~provider_metric
+             points)
+
+  type thumbnail_upload_request = {
+    url : string;
+    headers : (string * string) list;
+    parts : multipart_part list;
+  }
+
+  let normalize_content_type value =
+    value
+    |> String.trim
+    |> String.lowercase_ascii
+    |> String.split_on_char ';'
+    |> List.hd
+    |> String.trim
+
+  let read_json_int_field ~obj ~field ~default =
+    let open Yojson.Basic.Util in
+    let value_to_int = function
+      | `Int i -> Some i
+      | `String s -> int_of_string_opt s
+      | `Float f -> Some (int_of_float f)
+      | _ -> None
+    in
+    try
+      let value = obj |> member field in
+      if value = `Null then default
+      else
+        match value_to_int value with
+        | Some i -> i
+        | None -> default
+    with _ -> default
+
+  let read_json_bool_field ~obj ~field ~default =
+    let open Yojson.Basic.Util in
+    try
+      let value = obj |> member field in
+      if value = `Null then default else to_bool value
+    with _ -> default
+
+  let read_json_string_field_opt ~obj ~field =
+    let open Yojson.Basic.Util in
+    try
+      let value = obj |> member field in
+      if value = `Null then None
+      else
+        let s = to_string value in
+        if String.trim s = "" then None else Some s
+    with _ -> None
+
+  let account_analytics_url () =
+    youtube_api_base ^ "/channels?part=id,snippet,statistics&mine=true"
+
+  let post_analytics_url ~video_id =
+    let query =
+      Uri.encoded_of_query
+        [ ("part", [ "id,snippet,statistics" ]);
+          ("id", [ String.trim video_id ]) ]
+    in
+    Printf.sprintf "%s/videos?%s" youtube_api_base query
+
+  let parse_account_analytics_response response_body =
+    let open Yojson.Basic.Util in
+    try
+      let json = Yojson.Basic.from_string response_body in
+      let items = json |> member "items" |> to_list in
+      match items with
+      | [] -> Error (`Not_found "channel")
+      | first :: _ ->
+          let statistics = first |> member "statistics" in
+          let snippet = first |> member "snippet" in
+          Ok {
+            channel_id = first |> member "id" |> to_string;
+            title = read_json_string_field_opt ~obj:snippet ~field:"title";
+            view_count = read_json_int_field ~obj:statistics ~field:"viewCount" ~default:0;
+            subscriber_count = read_json_int_field ~obj:statistics ~field:"subscriberCount" ~default:0;
+            hidden_subscriber_count =
+              read_json_bool_field ~obj:statistics ~field:"hiddenSubscriberCount" ~default:false;
+            video_count = read_json_int_field ~obj:statistics ~field:"videoCount" ~default:0;
+          }
+    with e ->
+      Error (`Malformed (Printf.sprintf "Failed to parse account analytics response: %s" (Printexc.to_string e)))
+
+  let parse_post_analytics_response ~video_id response_body =
+    let open Yojson.Basic.Util in
+    try
+      let json = Yojson.Basic.from_string response_body in
+      let items = json |> member "items" |> to_list in
+      match items with
+      | [] -> Error (`Not_found video_id)
+      | first :: _ ->
+          let statistics = first |> member "statistics" in
+          let snippet = first |> member "snippet" in
+          Ok {
+            video_id = first |> member "id" |> to_string;
+            title = read_json_string_field_opt ~obj:snippet ~field:"title";
+            view_count = read_json_int_field ~obj:statistics ~field:"viewCount" ~default:0;
+            like_count = read_json_int_field ~obj:statistics ~field:"likeCount" ~default:0;
+            favorite_count = read_json_int_field ~obj:statistics ~field:"favoriteCount" ~default:0;
+            comment_count = read_json_int_field ~obj:statistics ~field:"commentCount" ~default:0;
+          }
+    with e ->
+      Error (`Malformed (Printf.sprintf "Failed to parse post analytics response: %s" (Printexc.to_string e)))
+
+  let get_account_analytics ~account_id on_result =
+    ensure_valid_token ~account_id
+      (fun access_token ->
+        let url = account_analytics_url () in
+        let headers = [ ("Authorization", "Bearer " ^ access_token) ] in
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              match parse_account_analytics_response response.body with
+              | Ok analytics -> on_result (Ok analytics)
+              | Error (`Not_found resource) -> on_result (Error (Error_types.Resource_not_found resource))
+              | Error (`Malformed msg) -> on_result (Error (Error_types.Internal_error msg))
+            else
+              on_result
+                (Error
+                   (parse_api_error ~status_code:response.status ~response_body:response.body)))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error err))
+
+  let get_account_analytics_canonical ~account_id on_result =
+    get_account_analytics ~account_id
+      (function
+        | Ok analytics ->
+            on_result (Ok (to_canonical_account_analytics_series analytics))
+        | Error err -> on_result (Error err))
+
+  let get_post_analytics ~account_id ~video_id on_result =
+    let normalized_video_id = String.trim video_id in
+    if normalized_video_id = "" then
+      on_result (Error (Error_types.Internal_error "video_id is required"))
+    else
+      ensure_valid_token ~account_id
+        (fun access_token ->
+          let url = post_analytics_url ~video_id:normalized_video_id in
+          let headers = [ ("Authorization", "Bearer " ^ access_token) ] in
+          Config.Http.get ~headers url
+            (fun response ->
+              if response.status >= 200 && response.status < 300 then
+                match parse_post_analytics_response ~video_id:normalized_video_id response.body with
+                | Ok analytics -> on_result (Ok analytics)
+                | Error (`Not_found resource) -> on_result (Error (Error_types.Resource_not_found resource))
+                | Error (`Malformed msg) -> on_result (Error (Error_types.Internal_error msg))
+              else
+                on_result
+                  (Error
+                     (parse_api_error ~status_code:response.status ~response_body:response.body)))
+            (fun err -> on_result (Error (Error_types.Internal_error err))))
+        (fun err -> on_result (Error err))
+
+  let get_post_analytics_canonical ~account_id ~video_id on_result =
+    get_post_analytics ~account_id ~video_id
+      (function
+        | Ok analytics -> on_result (Ok (to_canonical_post_analytics_series analytics))
+        | Error err -> on_result (Error err))
+
+  let supported_thumbnail_content_types =
+    [ "image/jpeg"; "image/jpg"; "image/png"; "image/webp" ]
+
+  let default_thumbnail_filename_for_content_type = function
+    | "image/png" -> "thumbnail.png"
+    | "image/webp" -> "thumbnail.webp"
+    | _ -> "thumbnail.jpg"
+
+  let build_thumbnail_upload_request
+      ~access_token
+      ~video_id
+      ~thumbnail_content
+      ?content_type
+      ?filename
+      () =
+    let normalized_video_id = String.trim video_id in
+    if normalized_video_id = "" then
+      Error (Error_types.Internal_error "video_id is required")
+    else if thumbnail_content = "" then
+      Error (Error_types.Validation_error [ Error_types.Media_required ])
+    else
+      let normalized_content_type =
+        match content_type with
+        | Some value when String.trim value <> "" -> normalize_content_type value
+        | _ -> "image/jpeg"
+      in
+      if not (List.mem normalized_content_type supported_thumbnail_content_types) then
+        Error (Error_types.Validation_error [ Error_types.Media_unsupported_format normalized_content_type ])
+      else
+        let upload_query =
+          Uri.encoded_of_query
+            [ ("videoId", [ normalized_video_id ]);
+              ("uploadType", [ "multipart" ]) ]
+        in
+        let upload_url = Printf.sprintf "%s/thumbnails/set?%s" youtube_upload_base upload_query in
+        let resolved_filename =
+          match filename with
+          | Some name when String.trim name <> "" -> String.trim name
+          | _ -> default_thumbnail_filename_for_content_type normalized_content_type
+        in
+        let request : thumbnail_upload_request = {
+          url = upload_url;
+          headers = [ ("Authorization", "Bearer " ^ access_token) ];
+          parts = [
+            {
+              name = "media";
+              filename = Some resolved_filename;
+              content_type = Some normalized_content_type;
+              content = thumbnail_content;
+            }
+          ];
+        } in
+        Ok request
+
+  let upload_thumbnail
+      ~account_id
+      ~video_id
+      ~thumbnail_content
+      ?content_type
+      ?filename
+      on_result =
+    ensure_valid_token ~account_id
+      (fun access_token ->
+        match build_thumbnail_upload_request
+                ~access_token
+                ~video_id
+                ~thumbnail_content
+                ?content_type
+                ?filename
+                ()
+        with
+        | Error err -> on_result (Error err)
+        | Ok request ->
+            Config.Http.post_multipart ~headers:request.headers ~parts:request.parts request.url
+              (fun response ->
+                if response.status >= 200 && response.status < 300 then
+                  on_result (Ok ())
+                else
+                  on_result
+                    (Error
+                       (parse_api_error ~status_code:response.status ~response_body:response.body)))
+              (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error err))
+
+  let upload_thumbnail_from_url
+      ~account_id
+      ~video_id
+      ~thumbnail_url
+      ?content_type
+      ?filename
+      on_result =
+    let normalized_thumbnail_url = String.trim thumbnail_url in
+    if normalized_thumbnail_url = "" then
+      on_result (Error (Error_types.Validation_error [ Error_types.Invalid_url thumbnail_url ]))
+    else
+      ensure_valid_token ~account_id
+        (fun access_token ->
+          Config.Http.get ~headers:[] normalized_thumbnail_url
+            (fun image_response ->
+              if image_response.status >= 200 && image_response.status < 300 then
+                let inferred_content_type =
+                  match content_type with
+                  | Some value when String.trim value <> "" -> Some value
+                  | _ -> List.assoc_opt "content-type" image_response.headers
+                in
+                (match build_thumbnail_upload_request
+                         ~access_token
+                         ~video_id
+                         ~thumbnail_content:image_response.body
+                         ?content_type:inferred_content_type
+                         ?filename
+                         ()
+                 with
+                 | Error err -> on_result (Error err)
+                 | Ok request ->
+                     Config.Http.post_multipart ~headers:request.headers ~parts:request.parts request.url
+                       (fun response ->
+                         if response.status >= 200 && response.status < 300 then
+                           on_result (Ok ())
+                         else
+                           on_result
+                             (Error
+                                (parse_api_error ~status_code:response.status ~response_body:response.body)))
+                       (fun err -> on_result (Error (Error_types.Internal_error err))))
+              else if image_response.status = 404 then
+                on_result (Error (Error_types.Resource_not_found normalized_thumbnail_url))
+              else
+                on_result
+                  (Error
+                     (Error_types.Network_error
+                        (Error_types.Connection_failed
+                           (Printf.sprintf "Thumbnail download failed (%d)" image_response.status)))))
+            (fun err -> on_result (Error (Error_types.Internal_error err))))
+        (fun err -> on_result (Error err))
   
   (** Upload video to YouTube Shorts
       

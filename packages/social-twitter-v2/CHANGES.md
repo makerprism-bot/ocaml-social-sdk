@@ -37,6 +37,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`block_user`** - Block users
 - **`unblock_user`** - Unblock users
 
+#### Analytics
+- **`get_account_analytics`** - Account metrics via `/2/users/me` + `public_metrics`
+- **`get_post_analytics`** - Post metrics via `/2/tweets/{id}` + `public_metrics`
+- Added canonical analytics conversion helpers for social-core metric normalization
+
+#### Payload Parity
+- Added optional tweet payload parity fields on write helpers:
+  - `reply_settings`
+  - `community_id`
+- Wired parity fields through `post_single`, `reply_to_tweet`, and `quote_tweet`
+- Added request-contract + parser tests for analytics and payload parity fields
+
 #### Engagement Operations
 - **`like_tweet`** - Like tweets
 - **`unlike_tweet`** - Unlike tweets

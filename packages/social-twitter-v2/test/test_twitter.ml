@@ -1218,6 +1218,60 @@ let test_quote_payload_contract () =
    | None -> failwith "Missing quote request body");
   print_endline "✓ Quote payload contract test passed"
 
+let test_reply_payload_contract_includes_reply_settings_and_community_id () =
+  last_reply_quote_body := None;
+  let result = ref None in
+  Twitter_reply_quote_contract.reply_to_tweet
+    ~account_id:"test_account"
+    ~text:"reply with options"
+    ~reply_to_tweet_id:"tweet_parent_2"
+    ~media_urls:[]
+    ~reply_settings:"mentionedUsers"
+    ~community_id:"community_42"
+    (fun _tweet_id -> result := Some (Ok ()))
+    (fun err -> result := Some (Error err));
+
+  (match !result with
+   | Some (Ok ()) -> ()
+   | Some (Error err) -> failwith ("Reply parity payload contract failed: " ^ err)
+   | None -> failwith "No result in reply parity payload contract test");
+
+  (match !last_reply_quote_body with
+   | Some body ->
+       let open Yojson.Basic.Util in
+       let json = Yojson.Basic.from_string body in
+       assert ((json |> member "reply_settings" |> to_string) = "mentionedUsers");
+       assert ((json |> member "community_id" |> to_string) = "community_42")
+   | None -> failwith "Missing reply request body for parity options");
+  print_endline "✓ Reply payload includes reply_settings/community_id contract test passed"
+
+let test_quote_payload_contract_includes_reply_settings_and_community_id () =
+  last_reply_quote_body := None;
+  let result = ref None in
+  Twitter_reply_quote_contract.quote_tweet
+    ~account_id:"test_account"
+    ~text:"quote with options"
+    ~quoted_tweet_id:"tweet_quote_2"
+    ~media_urls:[]
+    ~reply_settings:"following"
+    ~community_id:"community_77"
+    (fun _tweet_id -> result := Some (Ok ()))
+    (fun err -> result := Some (Error err));
+
+  (match !result with
+   | Some (Ok ()) -> ()
+   | Some (Error err) -> failwith ("Quote parity payload contract failed: " ^ err)
+   | None -> failwith "No result in quote parity payload contract test");
+
+  (match !last_reply_quote_body with
+   | Some body ->
+       let open Yojson.Basic.Util in
+       let json = Yojson.Basic.from_string body in
+       assert ((json |> member "reply_settings" |> to_string) = "following");
+       assert ((json |> member "community_id" |> to_string) = "community_77")
+   | None -> failwith "Missing quote request body for parity options");
+  print_endline "✓ Quote payload includes reply_settings/community_id contract test passed"
+
 let captured_get_urls = ref []
 let captured_get_headers = ref []
 let captured_post_bodies = ref []
@@ -1356,6 +1410,36 @@ let test_post_single_payload_contract () =
 
   print_endline "✓ Post single payload contract test passed"
 
+let test_post_single_payload_contract_includes_reply_settings_and_community_id () =
+  captured_post_bodies := [];
+  let result = ref None in
+  Twitter_request_contract.post_single
+    ~account_id:"test_account"
+    ~text:"contract text with parity options"
+    ~media_urls:[]
+    ~reply_settings:"mentionedUsers"
+    ~community_id:"community_501"
+    (fun outcome ->
+      match outcome with
+      | Error_types.Success _ -> result := Some (Ok ())
+      | Error_types.Partial_success _ -> result := Some (Ok ())
+      | Error_types.Failure err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok ()) -> ()
+   | Some (Error err) -> failwith ("Post parity payload contract failed: " ^ err)
+   | None -> failwith "No result in post parity payload contract test");
+
+  (match !captured_post_bodies with
+   | body :: _ ->
+       let open Yojson.Basic.Util in
+       let json = Yojson.Basic.from_string body in
+       assert ((json |> member "reply_settings" |> to_string) = "mentionedUsers");
+       assert ((json |> member "community_id" |> to_string) = "community_501")
+   | [] -> failwith "Expected captured post body for post parity payload contract");
+
+  print_endline "✓ Post single payload includes reply_settings/community_id contract test passed"
+
 let test_user_context_uses_bearer_access_token_header () =
   captured_get_headers := [];
   let result = ref None in
@@ -1371,6 +1455,213 @@ let test_user_context_uses_bearer_access_token_header () =
   assert (String.starts_with ~prefix:"Bearer " auth_header);
   assert (auth_header = "Bearer test_access_token");
   print_endline "✓ User-context bearer token header test passed"
+
+let analytics_contract_get_urls = ref []
+let analytics_contract_get_headers = ref []
+let analytics_contract_responses : Social_core.response list ref = ref []
+
+module Mock_http_analytics_contract : Social_core.HTTP_CLIENT = struct
+  let get ?headers url on_success _on_error =
+    analytics_contract_get_urls := !analytics_contract_get_urls @ [url];
+    analytics_contract_get_headers := Option.value ~default:[] headers;
+    let response =
+      match !analytics_contract_responses with
+      | next :: rest ->
+          analytics_contract_responses := rest;
+          next
+      | [] ->
+          {
+            Social_core.status = 200;
+            headers = [("content-type", "application/json")];
+            body = {|{"data":{}}|};
+          }
+    in
+    on_success response
+
+  let post ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+
+  let put ?headers:_ ?body:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+
+  let delete ?headers:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = []; body = "{}" }
+end
+
+module Mock_config_analytics_contract = struct
+  module Http = Mock_http_analytics_contract
+  let get_env = function
+    | "TWITTER_CLIENT_ID" -> Some "test_client_id"
+    | "TWITTER_CLIENT_SECRET" -> Some "test_client_secret"
+    | "TWITTER_LINK_REDIRECT_URI" -> Some "http://localhost/callback"
+    | _ -> None
+  let get_credentials ~account_id:_ on_success _on_error =
+    on_success {
+      Social_core.access_token = "test_access_token";
+      refresh_token = Some "test_refresh_token";
+      expires_at = Some (rfc3339_in_seconds 4000);
+      token_type = "Bearer";
+    }
+  let update_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success ()
+  let encrypt _data on_success _on_error = on_success "encrypted"
+  let decrypt _data on_success _on_error = on_success "decrypted"
+  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success ()
+end
+
+module Twitter_analytics_contract = Social_twitter_v2.Make(Mock_config_analytics_contract)
+
+let test_get_account_analytics_request_contract () =
+  analytics_contract_get_urls := [];
+  analytics_contract_get_headers := [];
+  analytics_contract_responses := [
+    {
+      Social_core.status = 200;
+      headers = [("content-type", "application/json")];
+      body = {|{
+        "data": {
+          "id": "acct_123",
+          "username": "testuser",
+          "name": "Test User",
+          "public_metrics": {
+            "followers_count": 11,
+            "following_count": 22,
+            "tweet_count": 33,
+            "listed_count": 44
+          }
+        }
+      }|};
+    }
+  ];
+
+  let result = ref None in
+  Twitter_analytics_contract.get_account_analytics ~account_id:"test_account"
+    (function
+      | Ok analytics -> result := Some (Ok analytics)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok analytics) ->
+       assert (analytics.user_id = "acct_123");
+       assert (analytics.followers_count = 11);
+       assert (analytics.following_count = 22);
+       assert (analytics.tweet_count = 33);
+       assert (analytics.listed_count = 44)
+   | Some (Error err) -> failwith ("Account analytics request contract failed: " ^ err)
+   | None -> failwith "No result in account analytics request contract test");
+
+  (match !analytics_contract_get_urls with
+   | [url] ->
+       let uri = Uri.of_string url in
+       assert (Uri.path uri = "/2/users/me");
+       assert ((Uri.get_query_param uri "user.fields" |> Option.value ~default:"") = "id,username,name,public_metrics")
+   | _ -> failwith "Expected exactly one account analytics GET request");
+
+  let auth_header = List.assoc_opt "Authorization" !analytics_contract_get_headers |> Option.value ~default:"" in
+  assert (auth_header = "Bearer test_access_token");
+  print_endline "✓ Account analytics request contract test passed"
+
+let test_get_post_analytics_request_contract () =
+  analytics_contract_get_urls := [];
+  analytics_contract_get_headers := [];
+  analytics_contract_responses := [
+    {
+      Social_core.status = 200;
+      headers = [("content-type", "application/json")];
+      body = {|{
+        "data": {
+          "id": "tweet_analytics_42",
+          "text": "hello",
+          "public_metrics": {
+            "retweet_count": 2,
+            "reply_count": 3,
+            "like_count": 4,
+            "quote_count": 5,
+            "bookmark_count": 6,
+            "impression_count": 7
+          }
+        }
+      }|};
+    }
+  ];
+
+  let result = ref None in
+  Twitter_analytics_contract.get_post_analytics
+    ~account_id:"test_account"
+    ~tweet_id:"tweet_analytics_42"
+    (function
+      | Ok analytics -> result := Some (Ok analytics)
+      | Error err -> result := Some (Error (Error_types.error_to_string err)));
+
+  (match !result with
+   | Some (Ok analytics) ->
+       assert (analytics.tweet_id = "tweet_analytics_42");
+       assert (analytics.retweet_count = 2);
+       assert (analytics.reply_count = 3);
+       assert (analytics.like_count = 4);
+       assert (analytics.quote_count = 5)
+   | Some (Error err) -> failwith ("Post analytics request contract failed: " ^ err)
+   | None -> failwith "No result in post analytics request contract test");
+
+  (match !analytics_contract_get_urls with
+   | [url] ->
+       let uri = Uri.of_string url in
+       assert (Uri.path uri = "/2/tweets/tweet_analytics_42");
+       assert ((Uri.get_query_param uri "tweet.fields" |> Option.value ~default:"") = "text,public_metrics")
+   | _ -> failwith "Expected exactly one post analytics GET request");
+
+  let auth_header = List.assoc_opt "Authorization" !analytics_contract_get_headers |> Option.value ~default:"" in
+  assert (auth_header = "Bearer test_access_token");
+  print_endline "✓ Post analytics request contract test passed"
+
+let test_account_analytics_parser_normalization () =
+  let body = {|{
+    "data": {
+      "id": "acct_norm_1",
+      "username": "normalize_me",
+      "public_metrics": {
+        "followers_count": "101",
+        "following_count": 55.0,
+        "tweet_count": null
+      }
+    }
+  }|} in
+  match Twitter.parse_account_analytics_response body with
+  | Ok analytics ->
+      assert (analytics.user_id = "acct_norm_1");
+      assert (analytics.username = Some "normalize_me");
+      assert (analytics.followers_count = 101);
+      assert (analytics.following_count = 55);
+      assert (analytics.tweet_count = 0);
+      assert (analytics.listed_count = 0);
+      print_endline "✓ Account analytics parser normalization test passed"
+  | Error _ -> failwith "Account analytics parser normalization failed"
+
+let test_post_analytics_parser_normalization () =
+  let body = {|{
+    "data": {
+      "id": "tweet_norm_7",
+      "public_metrics": {
+        "retweet_count": "9",
+        "reply_count": 3.0,
+        "like_count": null,
+        "quote_count": "4"
+      }
+    }
+  }|} in
+  match Twitter.parse_post_analytics_response ~tweet_id:"tweet_norm_7" body with
+  | Ok analytics ->
+      assert (analytics.tweet_id = "tweet_norm_7");
+      assert (analytics.retweet_count = 9);
+      assert (analytics.reply_count = 3);
+      assert (analytics.like_count = 0);
+      assert (analytics.quote_count = 4);
+      assert (analytics.bookmark_count = 0);
+      assert (analytics.impression_count = 0);
+      print_endline "✓ Post analytics parser normalization test passed"
+  | Error _ -> failwith "Post analytics parser normalization failed"
 
 let invalid_media_post_calls = ref 0
 
@@ -4949,6 +5240,53 @@ let test_image_uses_simple_upload_path () =
   assert (!upload_mode_multipart_calls = 0);
   print_endline "✓ Image uses simple upload path test passed"
 
+let test_canonical_analytics_adapters () =
+  let find_series provider_metric series =
+    List.find_opt
+      (fun item -> item.Analytics_types.provider_metric = Some provider_metric)
+      series
+  in
+  let account_analytics : Twitter.account_analytics = {
+    user_id = "u1";
+    username = Some "tester";
+    name = Some "Tester";
+    followers_count = 100;
+    following_count = 50;
+    tweet_count = 7;
+    listed_count = 3;
+  } in
+  let account_series = Twitter.to_canonical_account_analytics_series account_analytics in
+  assert (List.length account_series = 2);
+  (match find_series "follower_count" account_series with
+   | Some item ->
+       assert (Analytics_types.canonical_metric_key item.metric = "followers");
+       assert ((List.hd item.points).value = 100)
+   | None -> failwith "Missing follower_count canonical series");
+
+  let post_analytics : Twitter.post_analytics = {
+    tweet_id = "t1";
+    text = Some "tweet";
+    retweet_count = 4;
+    reply_count = 3;
+    like_count = 20;
+    quote_count = 2;
+    bookmark_count = 1;
+    impression_count = 500;
+  } in
+  let post_series = Twitter.to_canonical_post_analytics_series post_analytics in
+  assert (List.length post_series = 6);
+  (match find_series "retweet_count" post_series with
+   | Some item ->
+       assert (Analytics_types.canonical_metric_key item.metric = "reposts");
+       assert ((List.hd item.points).value = 4)
+   | None -> failwith "Missing retweet_count canonical series");
+  (match find_series "impression_count" post_series with
+   | Some item ->
+       assert (Analytics_types.canonical_metric_key item.metric = "impressions");
+       assert ((List.hd item.points).value = 500)
+   | None -> failwith "Missing impression_count canonical series");
+  print_endline "✓ Canonical analytics adapters test passed"
+
 (** Run all tests *)
 let () =
   print_endline "===========================================";
@@ -5005,6 +5343,8 @@ let () =
   test_oauth_exchange_failure_redacts_sensitive_response ();
   test_reply_payload_contract ();
   test_quote_payload_contract ();
+  test_reply_payload_contract_includes_reply_settings_and_community_id ();
+  test_quote_payload_contract_includes_reply_settings_and_community_id ();
   test_user_context_uses_bearer_access_token_header ();
   test_read_unknown_fields_tolerance ();
   test_read_partial_response_data_null_with_errors ();
@@ -5022,6 +5362,7 @@ let () =
   test_get_tweet_query_contract ();
   test_search_tweets_query_contract ();
   test_post_single_payload_contract ();
+  test_post_single_payload_contract_includes_reply_settings_and_community_id ();
   test_post_invalid_media_id_end_to_end_mapping ();
   test_post_network_failure_does_not_retry_tweet_creation ();
   test_post_too_long_validates_before_api_call ();
@@ -5046,6 +5387,11 @@ let () =
   test_user_operations ();
   test_get_user_by_username ();
   test_get_me ();
+  test_get_account_analytics_request_contract ();
+  test_get_post_analytics_request_contract ();
+  test_account_analytics_parser_normalization ();
+  test_post_analytics_parser_normalization ();
+  test_canonical_analytics_adapters ();
   test_search_users ();
   test_follow_operations ();
   test_unfollow_user ();
@@ -5160,10 +5506,10 @@ let () =
   print_endline "";
   print_endline "Test Coverage Summary:";
   print_endline "  - Content & media validation (7 tests)";
-  print_endline "  - OAuth 2.0 authentication (53 tests)";
-  print_endline "  - Tweet CRUD operations (9 tests)";
+  print_endline "  - OAuth 2.0 authentication (55 tests)";
+  print_endline "  - Tweet CRUD operations (10 tests)";
   print_endline "  - Timeline operations (4 tests)";
-  print_endline "  - User operations (12 tests)";
+  print_endline "  - User operations (16 tests)";
   print_endline "  - Engagement operations (6 tests)";
   print_endline "  - Lists management (12 tests)";
   print_endline "  - Pagination (5 tests)";
@@ -5173,4 +5519,4 @@ let () =
   print_endline "  - Character counting (9 tests)";
   print_endline "  - Video upload (16 tests)";
   print_endline "";
-  print_endline "Total: 145 test functions"
+  print_endline "Total: 152 test functions"

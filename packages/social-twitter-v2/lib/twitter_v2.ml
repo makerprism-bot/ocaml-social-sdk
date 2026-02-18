@@ -336,6 +336,71 @@ module Make (Config : CONFIG) = struct
     previous_token: string option;
     result_count: int;
   }
+
+  (** Account-level analytics derived from user public metrics. *)
+  type account_analytics = {
+    user_id: string;
+    username: string option;
+    name: string option;
+    followers_count: int;
+    following_count: int;
+    tweet_count: int;
+    listed_count: int;
+  }
+
+  (** Tweet-level analytics derived from tweet public metrics. *)
+  type post_analytics = {
+    tweet_id: string;
+    text: string option;
+    retweet_count: int;
+    reply_count: int;
+    like_count: int;
+    quote_count: int;
+    bookmark_count: int;
+    impression_count: int;
+  }
+
+  let to_canonical_optional_point value_opt =
+    match value_opt with
+    | Some value -> [ Analytics_types.make_datapoint value ]
+    | None -> []
+
+  let to_canonical_x_series ?time_range ~scope ~provider_metric points =
+    match Analytics_normalization.x_metric_to_canonical provider_metric with
+    | Some metric ->
+        Some
+          (Analytics_types.make_series
+             ?time_range
+             ~metric
+             ~scope
+             ~provider_metric
+             points)
+    | None -> None
+
+  let to_canonical_account_analytics_series
+      (account_analytics : account_analytics) =
+    [ ("follower_count", to_canonical_optional_point (Some account_analytics.followers_count));
+      ("following_count", to_canonical_optional_point (Some account_analytics.following_count));
+      ("tweet_count", to_canonical_optional_point (Some account_analytics.tweet_count));
+      ("listed_count", to_canonical_optional_point (Some account_analytics.listed_count)) ]
+    |> List.filter_map (fun (provider_metric, points) ->
+           to_canonical_x_series
+             ~scope:Analytics_types.Profile
+             ~provider_metric
+             points)
+
+  let to_canonical_post_analytics_series (post_analytics : post_analytics) =
+    [ ("retweet_count", to_canonical_optional_point (Some post_analytics.retweet_count));
+      ("reply_count", to_canonical_optional_point (Some post_analytics.reply_count));
+      ("like_count", to_canonical_optional_point (Some post_analytics.like_count));
+      ("quote_count", to_canonical_optional_point (Some post_analytics.quote_count));
+      ("bookmark_count", to_canonical_optional_point (Some post_analytics.bookmark_count));
+      ("impression_count", to_canonical_optional_point (Some post_analytics.impression_count)) ]
+    |> List.filter_map (fun (provider_metric, points) ->
+           to_canonical_x_series
+             ~scope:Analytics_types.Post
+             ~provider_metric
+             points)
   
   (** Parse rate limit headers from Twitter API response *)
   let parse_rate_limit_headers headers =
@@ -363,6 +428,83 @@ module Make (Config : CONFIG) = struct
       { next_token; previous_token; result_count }
     with _ ->
       { next_token = None; previous_token = None; result_count = 0 }
+
+  let read_json_int_field ~obj ~field ~default =
+    let open Yojson.Basic.Util in
+    let value_to_int = function
+      | `Int i -> Some i
+      | `String s -> int_of_string_opt (String.trim s)
+      | `Float f -> Some (int_of_float f)
+      | _ -> None
+    in
+    try
+      let value = obj |> member field in
+      if value = `Null then default
+      else
+        match value_to_int value with
+        | Some i -> i
+        | None -> default
+    with _ -> default
+
+  let read_json_string_field_opt ~obj ~field =
+    let open Yojson.Basic.Util in
+    try
+      let value = obj |> member field in
+      if value = `Null then None
+      else
+        let s = to_string value in
+        if String.trim s = "" then None else Some s
+    with _ -> None
+
+  let parse_account_analytics_response response_body =
+    let open Yojson.Basic.Util in
+    try
+      let json = Yojson.Basic.from_string response_body in
+      let data = json |> member "data" in
+      if data = `Null then
+        Error (`Not_found "account")
+      else
+        let public_metrics = data |> member "public_metrics" in
+        Ok {
+          user_id = data |> member "id" |> to_string;
+          username = read_json_string_field_opt ~obj:data ~field:"username";
+          name = read_json_string_field_opt ~obj:data ~field:"name";
+          followers_count = read_json_int_field ~obj:public_metrics ~field:"followers_count" ~default:0;
+          following_count = read_json_int_field ~obj:public_metrics ~field:"following_count" ~default:0;
+          tweet_count = read_json_int_field ~obj:public_metrics ~field:"tweet_count" ~default:0;
+          listed_count = read_json_int_field ~obj:public_metrics ~field:"listed_count" ~default:0;
+        }
+    with e ->
+      Error (`Malformed (Printf.sprintf "Failed to parse account analytics response: %s" (Printexc.to_string e)))
+
+  let parse_post_analytics_response ~tweet_id response_body =
+    let open Yojson.Basic.Util in
+    try
+      let json = Yojson.Basic.from_string response_body in
+      let data = json |> member "data" in
+      if data = `Null then
+        Error (`Not_found tweet_id)
+      else
+        let public_metrics = data |> member "public_metrics" in
+        Ok {
+          tweet_id =
+            (read_json_string_field_opt ~obj:data ~field:"id"
+             |> Option.value ~default:tweet_id);
+          text = read_json_string_field_opt ~obj:data ~field:"text";
+          retweet_count = read_json_int_field ~obj:public_metrics ~field:"retweet_count" ~default:0;
+          reply_count = read_json_int_field ~obj:public_metrics ~field:"reply_count" ~default:0;
+          like_count = read_json_int_field ~obj:public_metrics ~field:"like_count" ~default:0;
+          quote_count = read_json_int_field ~obj:public_metrics ~field:"quote_count" ~default:0;
+          bookmark_count = read_json_int_field ~obj:public_metrics ~field:"bookmark_count" ~default:0;
+          impression_count = read_json_int_field ~obj:public_metrics ~field:"impression_count" ~default:0;
+        }
+    with e ->
+      Error (`Malformed (Printf.sprintf "Failed to parse post analytics response: %s" (Printexc.to_string e)))
+
+  let add_optional_string_field key value_opt fields =
+    match value_opt with
+    | Some value when String.trim value <> "" -> (key, `String value) :: fields
+    | _ -> fields
   
   let check_rate_limit () =
     let now = Ptime_clock.now () in
@@ -982,7 +1124,7 @@ module Make (Config : CONFIG) = struct
              Default: false (for backward compatibility)
       @param on_result Callback receiving the outcome with tweet ID
   *)
-  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) ?(validate_media_before_upload=false) on_result =
+  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) ?(validate_media_before_upload=false) ?reply_settings ?community_id on_result =
     (* Validate before making any API calls *)
     let media_count = List.length media_urls in
     match validate_post ~text ~media_count () with
@@ -1084,7 +1226,11 @@ module Make (Config : CONFIG) = struct
                     (* Create tweet *)
                     let url = Printf.sprintf "%s/tweets" twitter_api_base in
                     
-                    let base_fields = [("text", `String text)] in
+                    let base_fields =
+                      [("text", `String text)]
+                      |> add_optional_string_field "reply_settings" reply_settings
+                      |> add_optional_string_field "community_id" community_id
+                    in
                     let body_json = 
                       if List.length media_ids > 0 then
                         `Assoc (("media", `Assoc [
@@ -1703,9 +1849,99 @@ module Make (Config : CONFIG) = struct
               with e ->
                 on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse user response: %s" (Printexc.to_string e))))
             else
-              on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
-          (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+               on_result (Error (parse_api_error ~status_code:response.status ~body:response.body ~headers:response.headers)))
+           (fun err -> on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))
+
+  (** Get account analytics from authenticated user public metrics. *)
+  let get_account_analytics ~account_id on_result =
+    ensure_valid_token ~account_id
+      (fun access_token ->
+        let query =
+          Uri.encoded_of_query
+            [ ("user.fields", [ "id,username,name,public_metrics" ]) ]
+        in
+        let url = Printf.sprintf "%s/users/me?%s" twitter_api_base query in
+        let headers = [
+          ("Authorization", Printf.sprintf "Bearer %s" access_token);
+        ] in
+
+        Config.Http.get ~headers url
+          (fun response ->
+            if response.status >= 200 && response.status < 300 then
+              match parse_account_analytics_response response.body with
+              | Ok analytics -> on_result (Ok analytics)
+              | Error (`Not_found resource) ->
+                  on_result (Error (Error_types.Resource_not_found resource))
+              | Error (`Malformed msg) ->
+                  on_result (Error (Error_types.Internal_error msg))
+            else
+              on_result
+                (Error
+                   (parse_api_error
+                      ~status_code:response.status
+                      ~body:response.body
+                      ~headers:response.headers)))
+          (fun err ->
+            on_result
+              (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+      (fun err -> on_result (Error err))
+
+  (** Get tweet analytics from tweet public metrics. *)
+  let get_post_analytics ~account_id ~tweet_id on_result =
+    let normalized_tweet_id = String.trim tweet_id in
+    if normalized_tweet_id = "" then
+      on_result (Error (Error_types.Internal_error "tweet_id is required"))
+    else
+      ensure_valid_token ~account_id
+        (fun access_token ->
+          let query =
+            Uri.encoded_of_query
+              [ ("tweet.fields", [ "text,public_metrics" ]) ]
+          in
+          let url =
+            Printf.sprintf "%s/tweets/%s?%s"
+              twitter_api_base
+              normalized_tweet_id
+              query
+          in
+          let headers = [
+            ("Authorization", Printf.sprintf "Bearer %s" access_token);
+          ] in
+
+          Config.Http.get ~headers url
+            (fun response ->
+              if response.status >= 200 && response.status < 300 then
+                match parse_post_analytics_response ~tweet_id:normalized_tweet_id response.body with
+                | Ok analytics -> on_result (Ok analytics)
+                | Error (`Not_found resource) ->
+                    on_result (Error (Error_types.Resource_not_found resource))
+                | Error (`Malformed msg) ->
+                    on_result (Error (Error_types.Internal_error msg))
+              else
+                on_result
+                  (Error
+                     (parse_api_error
+                        ~status_code:response.status
+                        ~body:response.body
+                        ~headers:response.headers)))
+            (fun err ->
+              on_result
+                (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
+        (fun err -> on_result (Error err))
+
+  let get_account_analytics_canonical ~account_id on_result =
+    get_account_analytics ~account_id
+      (function
+        | Ok analytics ->
+            on_result (Ok (to_canonical_account_analytics_series analytics))
+        | Error err -> on_result (Error err))
+
+  let get_post_analytics_canonical ~account_id ~tweet_id on_result =
+    get_post_analytics ~account_id ~tweet_id
+      (function
+        | Ok analytics -> on_result (Ok (to_canonical_post_analytics_series analytics))
+        | Error err -> on_result (Error err))
   
   (** Get mentions timeline for authenticated user *)
   let get_mentions_timeline ~account_id ?(max_results=10) ?(pagination_token=None) ?(expansions=[]) ?(tweet_fields=[]) () on_result =
@@ -2277,7 +2513,7 @@ module Make (Config : CONFIG) = struct
       (fun err -> on_result (Error err))
   
   (** Quote tweet (tweet with quoted tweet reference) *)
-  let quote_tweet ~account_id ~text ~quoted_tweet_id ~media_urls on_success on_error =
+  let quote_tweet ~account_id ~text ~quoted_tweet_id ~media_urls ?reply_settings ?community_id on_success on_error =
     match check_rate_limit () with
     | Error msg -> on_error msg
     | Ok () ->
@@ -2321,10 +2557,14 @@ module Make (Config : CONFIG) = struct
               (fun media_ids ->
                 let url = Printf.sprintf "%s/tweets" twitter_api_base in
                 
-                let base_fields = [
-                  ("text", `String text);
-                  ("quote_tweet_id", `String quoted_tweet_id);
-                ] in
+                let base_fields =
+                  [
+                    ("text", `String text);
+                    ("quote_tweet_id", `String quoted_tweet_id);
+                  ]
+                  |> add_optional_string_field "reply_settings" reply_settings
+                  |> add_optional_string_field "community_id" community_id
+                in
                 let body_json = 
                   if List.length media_ids > 0 then
                     `Assoc (("media", `Assoc [
@@ -2360,7 +2600,7 @@ module Make (Config : CONFIG) = struct
           (fun err -> on_error (Error_types.error_to_string err))
   
   (** Reply to a tweet *)
-  let reply_to_tweet ~account_id ~text ~reply_to_tweet_id ~media_urls on_success on_error =
+  let reply_to_tweet ~account_id ~text ~reply_to_tweet_id ~media_urls ?reply_settings ?community_id on_success on_error =
     match check_rate_limit () with
     | Error msg -> on_error msg
     | Ok () ->
@@ -2403,10 +2643,14 @@ module Make (Config : CONFIG) = struct
               (fun media_ids ->
                 let url = Printf.sprintf "%s/tweets" twitter_api_base in
                 
-                let base_fields = [
-                  ("text", `String text);
-                  ("reply", `Assoc [("in_reply_to_tweet_id", `String reply_to_tweet_id)]);
-                ] in
+                let base_fields =
+                  [
+                    ("text", `String text);
+                    ("reply", `Assoc [("in_reply_to_tweet_id", `String reply_to_tweet_id)]);
+                  ]
+                  |> add_optional_string_field "reply_settings" reply_settings
+                  |> add_optional_string_field "community_id" community_id
+                in
                 let body_json = 
                   if List.length media_ids > 0 then
                     `Assoc (("media", `Assoc [

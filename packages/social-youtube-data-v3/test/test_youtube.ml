@@ -10,6 +10,10 @@ let string_contains s substr =
     true
   with Not_found -> false
 
+let query_param url key =
+  try Uri.get_query_param (Uri.of_string url) key
+  with _ -> None
+
 (** Helper to handle outcome type for tests - unused but kept for consistency *)
 let _handle_outcome on_success on_error outcome =
   match outcome with
@@ -19,11 +23,19 @@ let _handle_outcome on_success on_error outcome =
 
 (** Mock HTTP client for testing *)
 module Mock_http = struct
+  type multipart_call = {
+    url : string;
+    headers : (string * string) list;
+    parts : multipart_part list;
+  }
+
   let requests = ref []
+  let multipart_calls = ref []
   let response_queue = ref []
   
   let reset () =
     requests := [];
+    multipart_calls := [];
     response_queue := []
   
   let set_responses responses =
@@ -64,6 +76,7 @@ module Mock_http = struct
   let post_multipart ?(headers=[]) ~parts url on_success on_error =
     let body_str = Printf.sprintf "multipart with %d parts" (List.length parts) in
     requests := ("POST_MULTIPART", url, headers, body_str) :: !requests;
+    multipart_calls := { url; headers; parts } :: !multipart_calls;
     match get_next_response () with
     | Some response -> on_success response
     | None -> on_error "No mock response set"
@@ -121,6 +134,21 @@ module Mock_config = struct
 end
 
 module YouTube = Make(Mock_config)
+
+let set_valid_credentials ~account_id =
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s 3600) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = Some "refresh_token";
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+  Mock_config.set_credentials ~account_id ~credentials:creds
 
 (** Test: OAuth URL generation with PKCE *)
 let test_oauth_url () =
@@ -290,6 +318,177 @@ let test_post_requires_video () =
           failwith "Should fail without video"
       | _ ->
           failwith "Expected validation error")
+
+let test_get_account_analytics_contract_and_parsing () =
+  Mock_config.reset ();
+  set_valid_credentials ~account_id:"test_account";
+
+  let response_body = {|{
+    "items": [
+      {
+        "id": "UC123",
+        "snippet": {"title": "Channel A"},
+        "statistics": {
+          "viewCount": "101",
+          "subscriberCount": "88",
+          "hiddenSubscriberCount": false,
+          "videoCount": "7"
+        }
+      }
+    ]
+  }|} in
+
+  Mock_http.set_responses [ { status = 200; body = response_body; headers = [] } ];
+
+  YouTube.get_account_analytics ~account_id:"test_account"
+    (function
+      | Ok analytics ->
+          assert (analytics.channel_id = "UC123");
+          assert (analytics.title = Some "Channel A");
+          assert (analytics.view_count = 101);
+          assert (analytics.subscriber_count = 88);
+          assert (analytics.video_count = 7);
+          (match List.rev !Mock_http.requests with
+           | [ ("GET", url, headers, _) ] ->
+               assert (string_contains url "/youtube/v3/channels?");
+               assert (query_param url "part" = Some "id,snippet,statistics");
+               assert (query_param url "mine" = Some "true");
+               assert (List.assoc_opt "Authorization" headers = Some "Bearer valid_token")
+           | _ -> failwith "unexpected request count for account analytics");
+          print_endline "✓ Account analytics request contract + parsing"
+      | Error err ->
+          failwith ("Account analytics failed: " ^ Error_types.error_to_string err))
+
+let test_get_post_analytics_contract_and_parsing () =
+  Mock_config.reset ();
+  set_valid_credentials ~account_id:"test_account";
+
+  let response_body = {|{
+    "items": [
+      {
+        "id": "video-42",
+        "snippet": {"title": "Post Analytics"},
+        "statistics": {
+          "viewCount": "1234",
+          "likeCount": "120",
+          "favoriteCount": "0",
+          "commentCount": "9"
+        }
+      }
+    ]
+  }|} in
+
+  Mock_http.set_responses [ { status = 200; body = response_body; headers = [] } ];
+
+  YouTube.get_post_analytics ~account_id:"test_account" ~video_id:"video-42"
+    (function
+      | Ok analytics ->
+          assert (analytics.video_id = "video-42");
+          assert (analytics.title = Some "Post Analytics");
+          assert (analytics.view_count = 1234);
+          assert (analytics.like_count = 120);
+          assert (analytics.favorite_count = 0);
+          assert (analytics.comment_count = 9);
+          (match List.rev !Mock_http.requests with
+           | [ ("GET", url, headers, _) ] ->
+               assert (string_contains url "/youtube/v3/videos?");
+               assert (query_param url "part" = Some "id,snippet,statistics");
+               assert (query_param url "id" = Some "video-42");
+               assert (List.assoc_opt "Authorization" headers = Some "Bearer valid_token")
+           | _ -> failwith "unexpected request count for post analytics");
+          print_endline "✓ Post analytics request contract + parsing"
+       | Error err ->
+           failwith ("Post analytics failed: " ^ Error_types.error_to_string err))
+
+let test_canonical_analytics_adapters () =
+  let find_series provider_metric series =
+    List.find_opt
+      (fun item -> item.Analytics_types.provider_metric = Some provider_metric)
+      series
+  in
+  let account_analytics : YouTube.account_analytics = {
+    channel_id = "UC1";
+    title = Some "Channel";
+    view_count = 1200;
+    subscriber_count = 330;
+    hidden_subscriber_count = false;
+    video_count = 45;
+  } in
+  let account_series = YouTube.to_canonical_account_analytics_series account_analytics in
+  assert (List.length account_series = 3);
+  (match find_series "subscriber_count" account_series with
+   | Some item ->
+       assert (Analytics_types.canonical_metric_key item.metric = "subscribers");
+       assert ((List.hd item.points).value = 330)
+   | None -> failwith "Missing subscriber_count canonical series");
+
+  let post_analytics : YouTube.post_analytics = {
+    video_id = "video-1";
+    title = Some "Video";
+    view_count = 900;
+    like_count = 80;
+    favorite_count = 2;
+    comment_count = 7;
+  } in
+  let post_series = YouTube.to_canonical_post_analytics_series post_analytics in
+  assert (List.length post_series = 4);
+  (match find_series "favorite_count" post_series with
+   | Some item ->
+       assert (Analytics_types.canonical_metric_key item.metric = "reactions");
+       assert ((List.hd item.points).value = 2)
+   | None -> failwith "Missing favorite_count canonical series");
+  print_endline "✓ Canonical analytics adapters"
+
+let test_build_thumbnail_upload_request_contract () =
+  match
+    YouTube.build_thumbnail_upload_request
+      ~access_token:"access-xyz"
+      ~video_id:"video-99"
+      ~thumbnail_content:"png-bytes"
+      ~content_type:"image/png"
+      ()
+  with
+  | Error err -> failwith ("build_thumbnail_upload_request failed: " ^ Error_types.error_to_string err)
+  | Ok request ->
+      assert (string_contains request.url "/upload/youtube/v3/thumbnails/set?");
+      assert (query_param request.url "videoId" = Some "video-99");
+      assert (query_param request.url "uploadType" = Some "multipart");
+      assert (List.assoc_opt "Authorization" request.headers = Some "Bearer access-xyz");
+      assert (List.length request.parts = 1);
+      let part = List.hd request.parts in
+      assert (part.name = "media");
+      assert (part.filename = Some "thumbnail.png");
+      assert (part.content_type = Some "image/png");
+      assert (part.content = "png-bytes");
+      print_endline "✓ Thumbnail helper request contract"
+
+let test_upload_thumbnail_contract () =
+  Mock_config.reset ();
+  set_valid_credentials ~account_id:"test_account";
+
+  Mock_http.set_responses [ { status = 200; body = "{}"; headers = [] } ];
+
+  YouTube.upload_thumbnail
+    ~account_id:"test_account"
+    ~video_id:"video-1"
+    ~thumbnail_content:"thumbnail-bytes"
+    ~content_type:"image/jpeg"
+    (function
+      | Ok () ->
+          (match List.rev !(Mock_http.multipart_calls) with
+           | [ call ] ->
+               assert (string_contains call.url "/upload/youtube/v3/thumbnails/set?");
+               assert (query_param call.url "videoId" = Some "video-1");
+               assert (query_param call.url "uploadType" = Some "multipart");
+               assert (List.assoc_opt "Authorization" call.headers = Some "Bearer valid_token");
+               assert (List.length call.parts = 1);
+               let part = List.hd call.parts in
+               assert (part.name = "media");
+               assert (part.content_type = Some "image/jpeg")
+           | _ -> failwith "unexpected multipart call count for thumbnail upload");
+          print_endline "✓ Thumbnail upload request contract"
+      | Error err ->
+          failwith ("Thumbnail upload failed: " ^ Error_types.error_to_string err))
 
 (* ============================================ *)
 (* VIDEO UPLOAD TESTS                           *)
@@ -563,6 +762,15 @@ let () =
   test_ensure_valid_token_fresh ();
   test_ensure_valid_token_expired ();
   test_post_requires_video ();
+
+  (* Analytics and thumbnail tests *)
+  print_endline "";
+  print_endline "--- Analytics & Thumbnail Tests ---";
+  test_get_account_analytics_contract_and_parsing ();
+  test_get_post_analytics_contract_and_parsing ();
+  test_canonical_analytics_adapters ();
+  test_build_thumbnail_upload_request_contract ();
+  test_upload_thumbnail_contract ();
   
   (* Video upload tests *)
   print_endline "";
@@ -581,6 +789,7 @@ let () =
   print_endline "Test Coverage Summary:";
   print_endline "  - OAuth 2.0 with PKCE (3 tests)";
   print_endline "  - Content validation (4 tests)";
+  print_endline "  - Analytics + thumbnail contracts (4 tests)";
   print_endline "  - Video upload/resumable (7 tests)";
   print_endline "";
-  print_endline "Total: 14 test functions"
+  print_endline "Total: 18 test functions"

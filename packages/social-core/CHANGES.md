@@ -25,3 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Warning types for partial success scenarios (link card failures, etc.)
   - `thread_result` type for tracking thread posting progress
   - Helper functions: `ok`, `fail`, `api_result_map`, `error_to_string`
+- `Analytics_types` module with canonical analytics primitives:
+  - canonical metric keys
+  - account/post scope modeling
+  - time-range and granularity records
+  - normalized datapoint and series records
+- `Analytics_normalization` module with provider metric mappers for:
+  - Facebook, Instagram, Threads, Pinterest, TikTok, X, YouTube
+  - stable ordering and dedupe helpers for normalized metric lists

@@ -4,6 +4,8 @@
  (wrapped false)
  (modules
   social_core
+  analytics_types
+  analytics_normalization
   platform_types
   content_validator
   url_extractor

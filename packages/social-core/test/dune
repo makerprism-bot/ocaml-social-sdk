@@ -1,0 +1,4 @@
+(test
+ (name test_analytics_normalization)
+ (modules test_analytics_normalization)
+ (libraries social-core))

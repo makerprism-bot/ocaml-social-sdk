@@ -170,6 +170,21 @@ The SDK follows a runtime-agnostic design:
 
 ✅ = Used successfully, ⚠️ = Implemented but untested, ❌ = Not implemented (API available), - = Not applicable
 
+## Development
+
+Build the project:
+
+```bash
+dune build
+```
+
+If the build fails due to missing dependencies, regenerate the lockfile first:
+
+```bash
+dune pkg lock
+dune build
+```
+
 ## License
 
 MIT

@@ -2,6 +2,19 @@
 
 These rules apply to all coding agents working in this repository.
 
+## Building
+
+```bash
+dune build
+```
+
+If the build complains about missing dependencies, regenerate the lockfile first:
+
+```bash
+dune pkg lock
+dune build
+```
+
 ## Dune Lockfile Workflow
 
 - If dependencies may have changed, the lockfile may be stale, or before running broader Dune operations after dependency-related edits, run:

@@ -17,7 +17,7 @@ jobs:
       matrix:
         os:
           - ubicloud-standard-2
-          - ubicloud-standard-2-arm
+          - macos-latest
 
     steps:
       - name: Checkout Repo

@@ -1779,7 +1779,11 @@ module Make (Config : CONFIG) = struct
            ~scopes:OAuth.Scopes.write
            ())
   
-  (** Exchange OAuth code for short-lived access token *)
+  (** Exchange OAuth code for a long-lived access token (~60 days).
+
+      Internally performs two steps: exchanges the code for a short-lived token,
+      then exchanges that for a long-lived token via [exchange_for_long_lived_token].
+      Callers do not need to perform a separate long-lived token exchange. *)
   let rec exchange_code ~code ~redirect_uri on_success on_error =
     let client_id = Config.get_env "FACEBOOK_APP_ID" |> Option.value ~default:"" in
     let client_secret = Config.get_env "FACEBOOK_APP_SECRET" |> Option.value ~default:"" in

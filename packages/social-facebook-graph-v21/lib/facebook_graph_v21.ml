@@ -1633,7 +1633,11 @@ module Make (Config : CONFIG) = struct
       on_success url
     )
   
-  (** Exchange OAuth code for access token *)
+  (** Exchange OAuth code for a long-lived access token (~60 days).
+
+      Internally performs two steps: exchanges the code for a short-lived token,
+      then exchanges that for a long-lived token. Callers do not need to perform
+      a separate long-lived token exchange. *)
   let exchange_code ~code ~redirect_uri on_success on_error =
     let client_id = Config.get_env "FACEBOOK_APP_ID" |> Option.value ~default:"" in
     let client_secret = Config.get_env "FACEBOOK_APP_SECRET" |> Option.value ~default:"" in

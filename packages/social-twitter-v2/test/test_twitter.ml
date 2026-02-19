@@ -4536,30 +4536,30 @@ module Mock_http_video_gate : Social_core.HTTP_CLIENT = struct
         headers = [("content-type", "application/json")];
         body = {|{"data":{"id":"tweet_gate_1"}}|};
       }
-    end else
+    end else if string_contains url "/media/upload/initialize" then
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"media_gate_1"}}|};
+      }
+    else if string_contains url "/finalize" then
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"media_gate_1","processing_info":{"state":"in_progress","check_after_secs":1}}}|};
+      }
+    else
       on_success {
         Social_core.status = 200;
         headers = [("content-type", "application/json")];
         body = {|{"data":{"id":"media_gate_1"}}|};
       }
 
-  let post_multipart ?headers:_ ~parts _url on_success _on_error =
-    let command =
-      List.find_opt (fun part -> part.Social_core.name = "command") parts
-      |> Option.map (fun p -> p.Social_core.content)
-      |> Option.value ~default:""
-    in
-    let body =
-      match command with
-      | "INIT" -> {|{"data":{"id":"media_gate_1"}}|}
-      | "APPEND" -> {|{"data":{}}|}
-      | "FINALIZE" -> {|{"data":{"id":"media_gate_1","processing_info":{"state":"in_progress","check_after_secs":1}}}|}
-      | _ -> {|{"data":{}}|}
-    in
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
     on_success {
       Social_core.status = 200;
       headers = [("content-type", "application/json")];
-      body;
+      body = {|{"data":{}}|};
     }
 
   let put ?headers:_ ?body:_ _url on_success _on_error =
@@ -4657,29 +4657,30 @@ module Mock_http_video_immediate : Social_core.HTTP_CLIENT = struct
 
   let post ?headers:_ ?body:_ url on_success _on_error =
     if string_contains url "/tweets" then incr video_immediate_tweet_posts;
-    on_success {
-      Social_core.status = 200;
-      headers = [("content-type", "application/json")];
-      body = {|{"data":{"id":"tweet_immediate_1"}}|};
-    }
+    if string_contains url "/media/upload/initialize" then
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"media_immediate_1"}}|};
+      }
+    else if string_contains url "/finalize" then
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"media_immediate_1","processing_info":{"state":"succeeded"}}}|};
+      }
+    else
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"tweet_immediate_1"}}|};
+      }
 
-  let post_multipart ?headers:_ ~parts _url on_success _on_error =
-    let command =
-      List.find_opt (fun part -> part.Social_core.name = "command") parts
-      |> Option.map (fun p -> p.Social_core.content)
-      |> Option.value ~default:""
-    in
-    let body =
-      match command with
-      | "INIT" -> {|{"data":{"id":"media_immediate_1"}}|}
-      | "APPEND" -> {|{"data":{}}|}
-      | "FINALIZE" -> {|{"data":{"id":"media_immediate_1","processing_info":{"state":"succeeded"}}}|}
-      | _ -> {|{"data":{}}|}
-    in
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
     on_success {
       Social_core.status = 200;
       headers = [("content-type", "application/json")];
-      body;
+      body = {|{"data":{}}|};
     }
 
   let put ?headers:_ ?body:_ _url on_success _on_error =
@@ -4763,22 +4764,15 @@ module Mock_http_video_fail : Social_core.HTTP_CLIENT = struct
 
   let post ?headers:_ ?body:_ url on_success _on_error =
     if string_contains url "/tweets" then incr video_fail_tweet_posts;
-    on_success { Social_core.status = 200; headers = [("content-type", "application/json")]; body = {|{"data":{"id":"tweet_fail_1"}}|} }
+    if string_contains url "/media/upload/initialize" then
+      on_success { Social_core.status = 200; headers = [("content-type", "application/json")]; body = {|{"data":{"id":"media_fail_1"}}|} }
+    else if string_contains url "/finalize" then
+      on_success { Social_core.status = 200; headers = [("content-type", "application/json")]; body = {|{"data":{"id":"media_fail_1","processing_info":{"state":"in_progress","check_after_secs":0}}}|} }
+    else
+      on_success { Social_core.status = 200; headers = [("content-type", "application/json")]; body = {|{"data":{"id":"tweet_fail_1"}}|} }
 
-  let post_multipart ?headers:_ ~parts _url on_success _on_error =
-    let command =
-      List.find_opt (fun part -> part.Social_core.name = "command") parts
-      |> Option.map (fun p -> p.Social_core.content)
-      |> Option.value ~default:""
-    in
-    let body =
-      match command with
-      | "INIT" -> {|{"data":{"id":"media_fail_1"}}|}
-      | "APPEND" -> {|{"data":{}}|}
-        | "FINALIZE" -> {|{"data":{"id":"media_fail_1","processing_info":{"state":"in_progress","check_after_secs":0}}}|}
-      | _ -> {|{"data":{}}|}
-    in
-    on_success { Social_core.status = 200; headers = [("content-type", "application/json")]; body }
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = [("content-type", "application/json")]; body = {|{"data":{}}|} }
 
   let put ?headers:_ ?body:_ _url on_success _on_error =
     on_success { Social_core.status = 200; headers = []; body = {|{"data":{}}|} }
@@ -4846,22 +4840,15 @@ module Mock_http_video_timeout : Social_core.HTTP_CLIENT = struct
 
   let post ?headers:_ ?body:_ url on_success _on_error =
     if string_contains url "/tweets" then incr video_timeout_tweet_posts;
-    on_success { Social_core.status = 200; headers = [("content-type", "application/json")]; body = {|{"data":{"id":"tweet_timeout_1"}}|} }
+    if string_contains url "/media/upload/initialize" then
+      on_success { Social_core.status = 200; headers = [("content-type", "application/json")]; body = {|{"data":{"id":"media_timeout_1"}}|} }
+    else if string_contains url "/finalize" then
+      on_success { Social_core.status = 200; headers = [("content-type", "application/json")]; body = {|{"data":{"id":"media_timeout_1","processing_info":{"state":"in_progress","check_after_secs":0}}}|} }
+    else
+      on_success { Social_core.status = 200; headers = [("content-type", "application/json")]; body = {|{"data":{"id":"tweet_timeout_1"}}|} }
 
-  let post_multipart ?headers:_ ~parts _url on_success _on_error =
-    let command =
-      List.find_opt (fun part -> part.Social_core.name = "command") parts
-      |> Option.map (fun p -> p.Social_core.content)
-      |> Option.value ~default:""
-    in
-    let body =
-      match command with
-      | "INIT" -> {|{"data":{"id":"media_timeout_1"}}|}
-      | "APPEND" -> {|{"data":{}}|}
-      | "FINALIZE" -> {|{"data":{"id":"media_timeout_1","processing_info":{"state":"in_progress","check_after_secs":0}}}|}
-      | _ -> {|{"data":{}}|}
-    in
-    on_success { Social_core.status = 200; headers = [("content-type", "application/json")]; body }
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = [("content-type", "application/json")]; body = {|{"data":{}}|} }
 
   let put ?headers:_ ?body:_ _url on_success _on_error =
     on_success { Social_core.status = 200; headers = []; body = {|{"data":{}}|} }
@@ -4939,49 +4926,41 @@ module Mock_http_video_interrupt : Social_core.HTTP_CLIENT = struct
 
   let post ?headers:_ ?body:_ url on_success _on_error =
     if string_contains url "/tweets" then incr video_interrupt_tweet_posts;
-    on_success {
-      Social_core.status = 200;
-      headers = [("content-type", "application/json")];
-      body = {|{"data":{"id":"tweet_interrupt_1"}}|};
-    }
+    if string_contains url "/media/upload/initialize" then
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"media_interrupt_1"}}|};
+      }
+    else if string_contains url "/finalize" then
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"media_interrupt_1","processing_info":{"state":"succeeded"}}}|};
+      }
+    else
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"tweet_interrupt_1"}}|};
+      }
 
   let post_multipart ?headers:_ ~parts _url on_success on_error =
-    let command =
-      List.find_opt (fun part -> part.Social_core.name = "command") parts
-      |> Option.map (fun p -> p.Social_core.content)
-      |> Option.value ~default:""
-    in
     let seg =
       List.find_opt (fun part -> part.Social_core.name = "segment_index") parts
       |> Option.map (fun p -> int_of_string p.Social_core.content)
       |> Option.value ~default:(-1)
     in
-
-    match command with
-    | "INIT" ->
-        on_success {
-          Social_core.status = 200;
-          headers = [("content-type", "application/json")];
-          body = {|{"data":{"id":"media_interrupt_1"}}|};
-        }
-    | "APPEND" ->
-        incr video_interrupt_append_calls;
-        if !video_interrupt_fail_once && seg = 1 then begin
-          video_interrupt_fail_once := false;
-          on_error "simulated append interruption"
-        end else
-          on_success {
-            Social_core.status = 200;
-            headers = [("content-type", "application/json")];
-            body = {|{"data":{}}|};
-          }
-    | "FINALIZE" ->
-        on_success {
-          Social_core.status = 200;
-          headers = [("content-type", "application/json")];
-          body = {|{"data":{"id":"media_interrupt_1","processing_info":{"state":"succeeded"}}}|};
-        }
-    | _ -> on_error ("Unexpected command: " ^ command)
+    incr video_interrupt_append_calls;
+    if !video_interrupt_fail_once && seg = 1 then begin
+      video_interrupt_fail_once := false;
+      on_error "simulated append interruption"
+    end else
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{}}|};
+      }
 
   let put ?headers:_ ?body:_ _url on_success _on_error =
     on_success { Social_core.status = 200; headers = []; body = "{}" }
@@ -5073,22 +5052,15 @@ module Mock_http_video_codec : Social_core.HTTP_CLIENT = struct
 
   let post ?headers:_ ?body:_ url on_success _on_error =
     if string_contains url "/tweets" then incr video_codec_tweet_posts;
-    on_success { Social_core.status = 200; headers = []; body = {|{"data":{"id":"tweet_codec_1"}}|} }
+    if string_contains url "/media/upload/initialize" then
+      on_success { Social_core.status = 200; headers = [("content-type", "application/json")]; body = {|{"data":{"id":"media_codec_1"}}|} }
+    else if string_contains url "/finalize" then
+      on_success { Social_core.status = 200; headers = [("content-type", "application/json")]; body = {|{"data":{"id":"media_codec_1","processing_info":{"state":"in_progress","check_after_secs":0}}}|} }
+    else
+      on_success { Social_core.status = 200; headers = []; body = {|{"data":{"id":"tweet_codec_1"}}|} }
 
-  let post_multipart ?headers:_ ~parts _url on_success _on_error =
-    let command =
-      List.find_opt (fun part -> part.Social_core.name = "command") parts
-      |> Option.map (fun p -> p.Social_core.content)
-      |> Option.value ~default:""
-    in
-    let body =
-      match command with
-      | "INIT" -> {|{"data":{"id":"media_codec_1"}}|}
-      | "APPEND" -> {|{"data":{}}|}
-      | "FINALIZE" -> {|{"data":{"id":"media_codec_1","processing_info":{"state":"in_progress","check_after_secs":0}}}|}
-      | _ -> {|{"data":{}}|}
-    in
-    on_success { Social_core.status = 200; headers = []; body }
+  let post_multipart ?headers:_ ~parts:_ _url on_success _on_error =
+    on_success { Social_core.status = 200; headers = [("content-type", "application/json")]; body = {|{"data":{}}|} }
 
   let put ?headers:_ ?body:_ _url on_success _on_error =
     on_success { Social_core.status = 200; headers = []; body = "{}" }
@@ -5137,7 +5109,7 @@ let test_video_codec_container_failure_mapping () =
   assert (!video_codec_tweet_posts = 0);
   print_endline "✓ Video codec/container failure mapping test passed"
 
-let contract_seen_commands = ref []
+let contract_seen_phases = ref []
 let contract_seen_segments = ref []
 let contract_init_total_bytes = ref None
 let contract_init_media_type = ref None
@@ -5181,6 +5153,27 @@ module Mock_http_chunked_contract : Social_core.HTTP_CLIENT = struct
         headers = [("content-type", "application/json")];
         body = {|{"data":{"id":"tweet_contract_1"}}|};
       }
+    end else if string_contains url "/media/upload/initialize" then begin
+      contract_seen_phases := !contract_seen_phases @ ["INIT"];
+      (match body with
+       | Some b ->
+           let json = Yojson.Basic.from_string b in
+           contract_init_total_bytes := Some (json |> Yojson.Basic.Util.member "total_bytes" |> Yojson.Basic.Util.to_int);
+           contract_init_media_type := Some (json |> Yojson.Basic.Util.member "media_type" |> Yojson.Basic.Util.to_string);
+           contract_init_media_category := Some (json |> Yojson.Basic.Util.member "media_category" |> Yojson.Basic.Util.to_string)
+       | None -> failwith "Expected INIT body for contract test");
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"media_contract_1"}}|};
+      }
+    end else if string_contains url "/finalize" then begin
+      contract_seen_phases := !contract_seen_phases @ ["FINALIZE"];
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"media_contract_1"}}|};
+      }
     end else
       on_success {
         Social_core.status = 200;
@@ -5192,53 +5185,26 @@ module Mock_http_chunked_contract : Social_core.HTTP_CLIENT = struct
     let get_part name =
       List.find_opt (fun p -> p.Social_core.name = name) parts
     in
-    let command =
-      get_part "command"
-      |> Option.map (fun p -> p.Social_core.content)
-      |> Option.value ~default:""
+    contract_seen_phases := !contract_seen_phases @ ["APPEND"];
+    let seg =
+      get_part "segment_index"
+      |> Option.map (fun p -> int_of_string p.Social_core.content)
+      |> Option.value ~default:(-1)
     in
-    contract_seen_commands := !contract_seen_commands @ [command];
-
-    (match command with
-     | "INIT" ->
-         let total_bytes = get_part "total_bytes" |> Option.map (fun p -> int_of_string p.Social_core.content) in
-         let media_type = get_part "media_type" |> Option.map (fun p -> p.Social_core.content) in
-         let media_category = get_part "media_category" |> Option.map (fun p -> p.Social_core.content) in
-         assert (get_part "media" = None);
-         contract_init_total_bytes := total_bytes;
-         contract_init_media_type := media_type;
-         contract_init_media_category := media_category
-     | "APPEND" ->
-         let seg =
-           get_part "segment_index"
-           |> Option.map (fun p -> int_of_string p.Social_core.content)
-           |> Option.value ~default:(-1)
-         in
-         let media_part =
-           match get_part "media" with
-           | Some p -> p
-           | None -> failwith "APPEND missing media part"
-         in
-         assert (media_part.Social_core.content_type = Some "application/octet-stream");
-         assert (String.length media_part.Social_core.content <= (5 * 1024 * 1024));
-         contract_seen_segments := !contract_seen_segments @ [seg];
-         contract_seen_append_media_chunks :=
-           !contract_seen_append_media_chunks @ [String.length media_part.Social_core.content]
-     | "FINALIZE" ->
-         assert (get_part "media_id" <> None)
-     | _ -> failwith ("Unexpected multipart command: " ^ command));
-
-    let body =
-      match command with
-      | "INIT" -> {|{"data":{"id":"media_contract_1"}}|}
-      | "APPEND" -> {|{"data":{}}|}
-      | "FINALIZE" -> {|{"data":{"id":"media_contract_1"}}|}
-      | _ -> {|{"data":{}}|}
+    let media_part =
+      match get_part "media" with
+      | Some p -> p
+      | None -> failwith "APPEND missing media part"
     in
+    assert (media_part.Social_core.content_type = Some "application/octet-stream");
+    assert (String.length media_part.Social_core.content <= (5 * 1024 * 1024));
+    contract_seen_segments := !contract_seen_segments @ [seg];
+    contract_seen_append_media_chunks :=
+      !contract_seen_append_media_chunks @ [String.length media_part.Social_core.content];
     on_success {
       Social_core.status = 200;
       headers = [("content-type", "application/json")];
-      body;
+      body = {|{"data":{}}|};
     }
 
   let put ?headers:_ ?body:_ _url on_success _on_error =
@@ -5271,7 +5237,7 @@ end
 module Twitter_chunked_contract = Social_twitter_v2.Make(Mock_config_chunked_contract)
 
 let test_chunked_upload_contract_init_append_finalize () =
-  contract_seen_commands := [];
+  contract_seen_phases := [];
   contract_seen_segments := [];
   contract_init_total_bytes := None;
   contract_init_media_type := None;
@@ -5295,7 +5261,7 @@ let test_chunked_upload_contract_init_append_finalize () =
    | Some (Error err) -> failwith ("Chunked contract test failed: " ^ err)
    | None -> failwith "No result in chunked contract test");
 
-  assert (!contract_seen_commands = ["INIT"; "APPEND"; "APPEND"; "APPEND"; "FINALIZE"]);
+  assert (!contract_seen_phases = ["INIT"; "APPEND"; "APPEND"; "APPEND"; "FINALIZE"]);
   assert (!contract_seen_segments = [0; 1; 2]);
   assert (!contract_init_media_type = Some "video/mp4");
   assert (!contract_init_media_category = Some "tweet_video");
@@ -5339,7 +5305,24 @@ module Mock_http_upload_mode : Social_core.HTTP_CLIENT = struct
       }
 
   let post ?headers:_ ?body:_ url on_success _on_error =
-    if string_contains url "/media/upload" then begin
+    if string_contains url "/media/upload/initialize" then begin
+      (* Chunked INIT — count as chunked, not simple *)
+      incr upload_mode_multipart_calls;
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"media_chunked_1"}}|};
+      }
+    end else if string_contains url "/finalize" then begin
+      (* Chunked FINALIZE *)
+      incr upload_mode_multipart_calls;
+      on_success {
+        Social_core.status = 200;
+        headers = [("content-type", "application/json")];
+        body = {|{"data":{"id":"media_chunked_1"}}|};
+      }
+    end else if string_contains url "/media/upload" then begin
+      (* Simple (non-chunked) upload *)
       incr upload_mode_simple_calls;
       on_success {
         Social_core.status = 200;

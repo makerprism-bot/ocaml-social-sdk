@@ -1655,12 +1655,20 @@ module Make (Config : CONFIG) = struct
            ~scopes:OAuth.Scopes.write
            ())
 
+  let exchange_for_long_lived_token ~client_secret ~short_lived_token on_success on_error =
+    OAuth_http.exchange_for_long_lived_token ~client_secret ~short_lived_token
+      (function
+        | Ok credentials ->
+            let normalized = { credentials with token_type = "Bearer" } in
+            on_success normalized
+        | Error err -> on_error (Error_types.error_to_string err))
+
   (** Exchange OAuth code for a long-lived access token (~60 days).
 
       Internally performs two steps: exchanges the code for a short-lived token,
       then exchanges that for a long-lived token via [exchange_for_long_lived_token].
       Callers do not need to perform a separate long-lived token exchange. *)
-  let rec exchange_code ~code ~redirect_uri on_success on_error =
+  let exchange_code ~code ~redirect_uri on_success on_error =
     let client_id = Config.get_env "INSTAGRAM_APP_ID" |> Option.value ~default:"" in
     let client_secret = Config.get_env "INSTAGRAM_APP_SECRET" |> Option.value ~default:"" in
 
@@ -1675,14 +1683,6 @@ module Make (Config : CONFIG) = struct
                 on_success on_error
           | Error err ->
               on_error (Error_types.error_to_string err))
-
-  and exchange_for_long_lived_token ~client_secret ~short_lived_token on_success on_error =
-    OAuth_http.exchange_for_long_lived_token ~client_secret ~short_lived_token
-      (function
-        | Ok credentials ->
-            let normalized = { credentials with token_type = "Bearer" } in
-            on_success normalized
-        | Error err -> on_error (Error_types.error_to_string err))
 
   (** Validate content length and hashtags *)
   let validate_content ~text =

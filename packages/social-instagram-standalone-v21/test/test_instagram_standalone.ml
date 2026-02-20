@@ -46,9 +46,6 @@ module Mock_http = struct
   let set_responses responses =
     response_queue := responses
 
-  let _set_errors errors =
-    error_queue := errors
-
   let get_next_response () =
     match !response_queue with
     | [] -> None
@@ -176,9 +173,6 @@ module Mock_config = struct
 
   let on_rate_limit_update _info =
     () (* No-op for tests *)
-
-  let _get_health_status account_id =
-    List.find_opt (fun (id, _, _) -> id = account_id) !health_statuses
 end
 
 module Instagram = Make(Mock_config)

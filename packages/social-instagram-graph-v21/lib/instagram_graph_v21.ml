@@ -434,6 +434,274 @@ module OAuth = struct
   end
 end
 
+(** Profile type for standalone (Instagram Business Login) OAuth flow *)
+type standalone_profile = {
+  user_id: string;
+  username: string;
+  name: string;
+  profile_picture_url: string option;
+}
+
+(** OAuth 2.0 module for Instagram Standalone (Business Login) flow
+
+    This flow uses Instagram's own OAuth endpoints instead of Facebook Login.
+    It is for Instagram Business/Creator accounts that authenticate directly
+    through Instagram rather than through Facebook.
+
+    Token types:
+    - Short-lived tokens: ~1 hour (from Instagram code exchange)
+    - Long-lived tokens: ~60 days (via ig_exchange_token grant)
+
+    Token refresh:
+    - Same as Graph API flow: ig_refresh_token grant on graph.instagram.com
+    - Must refresh before expiration (within 60 days)
+
+    Required environment variables (or pass directly to functions):
+    - INSTAGRAM_APP_ID: App ID from Facebook Developer Portal (same as Facebook App ID)
+    - INSTAGRAM_APP_SECRET: App Secret
+    - INSTAGRAM_REDIRECT_URI: Registered callback URL
+*)
+module OAuth_standalone = struct
+  (** Platform metadata for Instagram Standalone OAuth *)
+  module Metadata_standalone = struct
+    (** Instagram Standalone does NOT support PKCE *)
+    let supports_pkce = false
+
+    (** Instagram Standalone supports token refresh via ig_refresh_token grant *)
+    let supports_refresh = true
+
+    (** Short-lived tokens last ~1 hour *)
+    let short_lived_token_seconds = Some 3600
+
+    (** Long-lived tokens last ~60 days *)
+    let long_lived_token_seconds = Some 5184000
+
+    (** Recommended buffer before expiry (7 days) *)
+    let refresh_buffer_seconds = 604800
+
+    (** Maximum retry attempts for token operations *)
+    let max_refresh_attempts = 5
+
+    (** Authorization endpoint (Instagram's own OAuth dialog) *)
+    let authorization_endpoint = "https://api.instagram.com/oauth/authorize"
+
+    (** Token endpoint for initial code exchange (Instagram API) *)
+    let token_endpoint = "https://api.instagram.com/oauth/access_token"
+
+    (** Long-lived token exchange endpoint *)
+    let long_lived_token_endpoint = "https://graph.instagram.com/access_token"
+
+    (** Token refresh endpoint (same as Graph API flow) *)
+    let refresh_endpoint = "https://graph.instagram.com/refresh_access_token"
+
+    (** Instagram Graph API base URL for standalone flow *)
+    let api_base = "https://graph.instagram.com/v21.0"
+  end
+
+  (** Scope definitions for Instagram Standalone (Business Login) *)
+  module Scopes_standalone = struct
+    (** Basic business profile scope *)
+    let basic = "instagram_business_basic"
+
+    (** Content publish scope *)
+    let content_publish = "instagram_business_content_publish"
+
+    (** Scopes for basic profile read access *)
+    let read = [basic]
+
+    (** Scopes for read + content publishing *)
+    let write = [basic; content_publish]
+  end
+
+  (** Generate authorization URL for Instagram Standalone OAuth 2.0 flow
+
+      Note: This uses Instagram's own OAuth dialog (not Facebook's).
+      The user will log in directly to Instagram and grant permissions.
+
+      @param client_id Instagram App ID (same as Facebook App ID)
+      @param redirect_uri Registered callback URL
+      @param state CSRF protection state parameter
+      @param scopes OAuth scopes to request (defaults to Scopes_standalone.write)
+      @return Full authorization URL to redirect user to
+  *)
+  let get_authorization_url ~client_id ~redirect_uri ~state ?(scopes=Scopes_standalone.write) () =
+    let scope_str = String.concat "," scopes in
+    let params = [
+      ("enable_fb_login", "0");
+      ("client_id", client_id);
+      ("redirect_uri", redirect_uri);
+      ("scope", scope_str);
+      ("response_type", "code");
+      ("state", state);
+    ] in
+    let query = Uri.encoded_of_query (List.map (fun (k, v) -> (k, [v])) params) in
+    Printf.sprintf "%s?%s" Metadata_standalone.authorization_endpoint query
+
+  (** Make functor for Standalone OAuth operations that need HTTP client *)
+  module Make (Http : HTTP_CLIENT) = struct
+    (** Exchange authorization code for short-lived access token
+
+        IMPORTANT: This is a POST with form-encoded body, NOT a GET with query params.
+        The Instagram standalone token endpoint requires form body.
+
+        Returns short-lived token (~1 hour) and user_id.
+        Call exchange_for_long_lived_token to get a 60-day token.
+
+        @param client_id Instagram App ID
+        @param client_secret Instagram App Secret
+        @param redirect_uri Registered callback URL
+        @param code Authorization code from callback
+        @param on_result Continuation receiving api_result with credentials
+    *)
+    let exchange_code ~client_id ~client_secret ~redirect_uri ~code on_result =
+      let params = [
+        ("client_id", [client_id]);
+        ("client_secret", [client_secret]);
+        ("grant_type", ["authorization_code"]);
+        ("redirect_uri", [redirect_uri]);
+        ("code", [code]);
+      ] in
+      (* Note: Uri.encoded_of_query uses percent-encoding (%20 for spaces),
+         which is correct for application/x-www-form-urlencoded bodies.
+         This is consistent with all other OAuth token exchanges in the SDK. *)
+      let body = Uri.encoded_of_query params in
+      let headers = [
+        ("Content-Type", "application/x-www-form-urlencoded");
+      ] in
+      let url = Metadata_standalone.token_endpoint in
+
+      Http.post ~headers ~body url
+        (fun response ->
+          if response.status >= 200 && response.status < 300 then
+            try
+              let json = Yojson.Basic.from_string response.body in
+              let open Yojson.Basic.Util in
+              let user_id =
+                try json |> member "user_id" |> to_string
+                with _ ->
+                  try json |> member "user_id" |> to_int |> string_of_int
+                  with _ -> ""
+              in
+              let creds =
+                let c = OAuth.parse_credentials_from_json ~default_expires_in:3600 json in
+                { c with token_type = "Bearer" }
+              in
+              if user_id = "" then
+                on_result (Error (Error_types.Internal_error "Token exchange response missing user_id"))
+              else
+              on_result (Ok (creds, user_id))
+            with e ->
+              on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse standalone token response: %s" (Printexc.to_string e))))
+          else
+            on_result (Error (OAuth.parse_api_error ~status_code:response.status ~response_body:response.body)))
+        (fun err -> on_result (Error (OAuth.network_error_of_string err)))
+
+    (** Exchange short-lived token for long-lived token (60 days)
+
+        Uses the ig_exchange_token grant type on the Instagram Graph API endpoint.
+        This is specific to the Instagram Standalone (Business Login) flow.
+
+        @param client_secret Instagram App Secret
+        @param short_lived_token The short-lived token from exchange_code
+        @param app_secret Optional app secret for appsecret_proof
+        @param on_result Continuation receiving api_result with long-lived credentials
+    *)
+    let exchange_for_long_lived_token ~client_secret ~short_lived_token ?app_secret on_result =
+      let params = [
+        ("grant_type", ["ig_exchange_token"]);
+        ("client_secret", [client_secret]);
+        ("access_token", [short_lived_token]);
+      ] @
+      (match app_secret with
+       | Some secret -> [("appsecret_proof", [OAuth.compute_app_secret_proof ~app_secret:secret ~access_token:short_lived_token])]
+       | None -> [])
+      in
+      let query = Uri.encoded_of_query params in
+      let url = Printf.sprintf "%s?%s" Metadata_standalone.long_lived_token_endpoint query in
+
+      Http.get url
+        (fun response ->
+          if response.status >= 200 && response.status < 300 then
+            try
+              let json = Yojson.Basic.from_string response.body in
+              let creds =
+                let c = OAuth.parse_credentials_from_json ~default_expires_in:5184000 json in
+                { c with token_type = "Bearer" }
+              in
+              on_result (Ok creds)
+            with e ->
+              on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse long-lived token response: %s" (Printexc.to_string e))))
+          else
+            on_result (Error (OAuth.parse_api_error ~status_code:response.status ~response_body:response.body)))
+        (fun err -> on_result (Error (OAuth.network_error_of_string err)))
+
+    (** Get Instagram profile for the authenticated standalone user
+
+        Fetches user_id, username, name, and profile_picture_url from the
+        Instagram Graph API /me endpoint.
+
+        @param access_token A valid access token (short-lived or long-lived)
+        @param on_result Continuation receiving api_result with standalone_profile
+    *)
+    let get_profile ~access_token on_result =
+      let params = [
+        ("fields", ["id,username,name,profile_picture_url"]);
+        ("access_token", [access_token]);
+      ] in
+      let query = Uri.encoded_of_query params in
+      let url = Printf.sprintf "%s/me?%s" Metadata_standalone.api_base query in
+
+      Http.get url
+        (fun response ->
+          if response.status >= 200 && response.status < 300 then
+            try
+              let json = Yojson.Basic.from_string response.body in
+              let open Yojson.Basic.Util in
+              let user_id =
+                try json |> member "id" |> to_string
+                with _ ->
+                  try json |> member "user_id" |> to_string
+                  with _ ->
+                    try json |> member "user_id" |> to_int |> string_of_int
+                    with _ -> ""
+              in
+              if user_id = "" then
+                on_result (Error (Error_types.Internal_error "Profile response missing user identifier"))
+              else
+              let username =
+                try json |> member "username" |> to_string
+                with _ -> ""
+              in
+              let name =
+                try json |> member "name" |> to_string
+                with _ -> ""
+              in
+              let profile_picture_url =
+                try Some (json |> member "profile_picture_url" |> to_string)
+                with _ -> None
+              in
+              on_result (Ok { user_id; username; name; profile_picture_url })
+            with e ->
+              on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse profile response: %s" (Printexc.to_string e))))
+          else
+            on_result (Error (OAuth.parse_api_error ~status_code:response.status ~response_body:response.body)))
+        (fun err -> on_result (Error (OAuth.network_error_of_string err)))
+
+    (** Refresh a long-lived token to extend its validity
+
+        Delegates to the same ig_refresh_token endpoint used by the Graph API flow,
+        since both flows use the same refresh mechanism.
+
+        @param app_secret Optional app secret for appsecret_proof
+        @param access_token The current long-lived token to refresh
+        @param on_result Continuation receiving api_result with refreshed credentials
+    *)
+    let refresh_token ?app_secret ~access_token on_result =
+      let module OAuth_http = OAuth.Make(Http) in
+      OAuth_http.refresh_token ?app_secret ~access_token on_result
+  end
+end
+
 (** {1 Rate Limiting Types} *)
 
 (** Rate limit usage information from X-App-Usage header *)
@@ -456,14 +724,30 @@ module type CONFIG = sig
   val update_health_status : account_id:string -> status:string -> error_message:string option -> (unit -> unit) -> (string -> unit) -> unit
   val get_ig_user_id : account_id:string -> (string -> unit) -> (string -> unit) -> unit
   val sleep : float -> (unit -> 'a) -> 'a
-  
+
   (** Optional: Called when rate limit info is updated *)
   val on_rate_limit_update : rate_limit_info -> unit
+
+  (** Optional: Override the Graph API base URL.
+      When [Some url], that URL is used instead of the default Facebook Graph API.
+      When [None], falls back to ["https://graph.facebook.com/v21.0"].
+      Standalone (Business Login) accounts should set this to
+      ["https://graph.instagram.com/v21.0"] for content publishing.
+
+      LIMITATION: A single [Make] instantiation can only target one base URL.
+      Serving both Facebook-linked Instagram accounts (graph.facebook.com) and
+      Standalone-linked accounts (graph.instagram.com) requires two separate
+      [Make] instantiations: one with [None] (defaults to graph.facebook.com)
+      and one with [Some "https://graph.instagram.com/v21.0"]. *)
+  val api_base_url : string option
 end
 
 (** Make functor to create Instagram provider with given configuration *)
 module Make (Config : CONFIG) = struct
-  let graph_api_base = "https://graph.facebook.com/v21.0"
+  let graph_api_base =
+    match Config.api_base_url with
+    | Some url -> url
+    | None -> "https://graph.facebook.com/v21.0"
   module OAuth_http = OAuth.Make(Config.Http)
   
   (** {1 Platform Constants} *)

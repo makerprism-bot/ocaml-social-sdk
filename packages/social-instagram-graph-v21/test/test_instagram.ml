@@ -176,7 +176,9 @@ module Mock_config = struct
   
   let on_rate_limit_update _info =
     () (* No-op for tests *)
-  
+
+  let api_base_url = None
+
   let _get_health_status account_id =
     List.find_opt (fun (id, _, _) -> id = account_id) !health_statuses
 end

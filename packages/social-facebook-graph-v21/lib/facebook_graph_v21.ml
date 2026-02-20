@@ -1619,6 +1619,7 @@ module Make (Config : CONFIG) = struct
         "pages_read_engagement";
         "pages_manage_posts";
         "pages_show_list";
+        "business_management";
       ] in
       
       let scope_str = String.concat "," scopes in

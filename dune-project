@@ -95,8 +95,20 @@
 
 (package
  (name social-instagram-graph-v21)
- (synopsis "Instagram Graph API v21 client")
- (description "Instagram Graph API v21 client. Supports posting to business/creator accounts, media upload, stories, reels, and carousels.")
+ (synopsis "Instagram Graph API v21 client (Facebook Login)")
+ (description "Instagram Graph API v21 client for accounts linked via Facebook Login. Supports posting to business/creator accounts, media upload, stories, reels, and carousels. Uses graph.facebook.com as the API base.")
+ (depends
+  (ocaml (>= 4.14))
+  (social-core (= :version))
+  yojson
+  uri
+  ptime
+  digestif))
+
+(package
+ (name social-instagram-standalone-v21)
+ (synopsis "Instagram Standalone (Business Login) API v21 client")
+ (description "Instagram API v21 client for accounts using Instagram's own Business Login flow. Fully independent from the Facebook-based Instagram SDK. Uses graph.instagram.com as the API base.")
  (depends
   (ocaml (>= 4.14))
   (social-core (= :version))

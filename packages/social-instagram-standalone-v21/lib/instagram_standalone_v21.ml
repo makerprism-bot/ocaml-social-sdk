@@ -1,13 +1,18 @@
-(** Instagram Graph API v21 Provider
-    
-    This implementation supports Instagram Business accounts via Graph API.
-    
+(** Instagram Standalone (Business Login) API v21 Provider
+
+    This is a fully independent SDK for Instagram accounts that authenticate
+    directly through Instagram's own Business Login flow, rather than through
+    Facebook Login. It targets graph.instagram.com instead of graph.facebook.com.
+
+    This package is intentionally separate from social-instagram-graph-v21 to
+    allow independent evolution as the two APIs may drift apart.
+
     CRITICAL REQUIREMENTS:
     - Instagram Business or Creator account ONLY
-    - Must be linked to a Facebook Page
+    - Authenticates via Instagram's own OAuth (not Facebook Login)
     - Two-step publishing process: create container, then publish
     - Images must be publicly accessible URLs
-    
+
     Rate Limits:
     - 200 API calls/hour per user
     - 25 container creations/hour
@@ -16,25 +21,31 @@
 
 open Social_core
 
-(** OAuth 2.0 module for Instagram Graph API
+(** Profile type for standalone (Instagram Business Login) OAuth flow *)
+type standalone_profile = {
+  user_id: string;
+  username: string;
+  name: string;
+  profile_picture_url: string option;
+}
 
-    Instagram uses Facebook's OAuth 2.0 infrastructure with some key differences:
+(** OAuth 2.0 module for Instagram Standalone (Business Login) flow
+
+    This flow uses Instagram's own OAuth endpoints instead of Facebook Login.
+    It is for Instagram Business/Creator accounts that authenticate directly
+    through Instagram rather than through Facebook.
 
     Token types:
-    - Short-lived user tokens: ~1-2 hours (from Facebook code exchange)
-    - Long-lived user tokens: ~60 days (via fb_exchange_token grant on Facebook Graph API)
+    - Short-lived tokens: ~1 hour (from Instagram code exchange)
+    - Long-lived tokens: ~60 days (via ig_exchange_token grant)
 
     Token refresh:
     - Long-lived tokens can be refreshed using ig_refresh_token grant
     - Must refresh before expiration (within 60 days)
-    - Cannot refresh short-lived tokens directly
-
-    IMPORTANT: Instagram Business/Creator accounts ONLY.
-    Personal Instagram accounts cannot use the Graph API.
 
     Required environment variables (or pass directly to functions):
-    - FACEBOOK_APP_ID: App ID from Facebook Developer Portal
-    - FACEBOOK_APP_SECRET: App Secret (same app as Facebook)
+    - INSTAGRAM_APP_ID: App ID from Facebook Developer Portal (same as Facebook App ID)
+    - INSTAGRAM_APP_SECRET: App Secret
     - INSTAGRAM_REDIRECT_URI: Registered callback URL
 *)
 module OAuth = struct
@@ -122,103 +133,63 @@ module OAuth = struct
     let safe_err = if looks_sensitive then "[REDACTED_SENSITIVE_TEXT]" else err in
     Error_types.Network_error (Error_types.Connection_failed safe_err)
 
-  (** Scope definitions for Instagram Graph API *)
-  module Scopes = struct
-    (** Scopes for basic Instagram profile information *)
-    let read = [
-      "instagram_basic";
-      "pages_show_list";
-      "pages_read_engagement";
-    ]
-    
-    (** Scopes required for Instagram posting *)
-    let write = [
-      "instagram_basic";
-      "instagram_content_publish";
-      "pages_show_list";
-      "pages_read_engagement";
-    ]
-    
-    (** All commonly used scopes for Instagram management *)
-    let all = [
-      "instagram_basic";
-      "instagram_content_publish";
-      "instagram_manage_comments";
-      "instagram_manage_insights";
-      "pages_show_list";
-      "pages_read_engagement";
-      "pages_manage_metadata";
-    ]
-    
-    (** Operations that can be performed with Instagram API *)
-    type operation = 
-      | Post_image
-      | Post_video
-      | Post_carousel
-      | Post_reel
-      | Post_story
-      | Read_profile
-      | Read_insights
-      | Manage_comments
-    
-    (** Get scopes required for specific operations *)
-    let for_operations ops =
-      let base = ["instagram_basic"; "pages_show_list"; "pages_read_engagement"] in
-      let needs_publish = List.exists (fun o -> 
-        o = Post_image || o = Post_video || o = Post_carousel || o = Post_reel || o = Post_story
-      ) ops in
-      let needs_comments = List.exists (fun o -> o = Manage_comments) ops in
-      let needs_insights = List.exists (fun o -> o = Read_insights) ops in
-      base @
-      (if needs_publish then ["instagram_content_publish"] else []) @
-      (if needs_comments then ["instagram_manage_comments"] else []) @
-      (if needs_insights then ["instagram_manage_insights"] else [])
-  end
-  
-  (** Platform metadata for Instagram OAuth *)
+  (** Platform metadata for Instagram Standalone OAuth *)
   module Metadata = struct
-    (** Instagram does NOT support PKCE (uses Facebook OAuth) *)
+    (** Instagram Standalone does NOT support PKCE *)
     let supports_pkce = false
-    
-    (** Instagram supports token refresh via ig_refresh_token grant *)
+
+    (** Instagram Standalone supports token refresh via ig_refresh_token grant *)
     let supports_refresh = true
-    
-    (** Short-lived tokens last ~1-2 hours *)
+
+    (** Short-lived tokens last ~1 hour *)
     let short_lived_token_seconds = Some 3600
-    
+
     (** Long-lived tokens last ~60 days *)
     let long_lived_token_seconds = Some 5184000
-    
+
     (** Recommended buffer before expiry (7 days) *)
     let refresh_buffer_seconds = 604800
-    
+
     (** Maximum retry attempts for token operations *)
     let max_refresh_attempts = 5
-    
-    (** Authorization endpoint (Facebook's OAuth dialog) *)
-    let authorization_endpoint = "https://www.facebook.com/v21.0/dialog/oauth"
-    
-    (** Token endpoint for initial exchange (Facebook Graph API) *)
-    let token_endpoint = "https://graph.facebook.com/v21.0/oauth/access_token"
-    
-    (** Instagram Graph API token endpoint for long-lived exchange *)
-    let instagram_token_endpoint = "https://graph.instagram.com/access_token"
-    
-    (** Instagram Graph API endpoint for token refresh *)
-    let instagram_refresh_endpoint = "https://graph.instagram.com/refresh_access_token"
-    
-    (** Graph API base URL *)
-    let api_base = "https://graph.facebook.com/v21.0"
+
+    (** Authorization endpoint (Instagram's own OAuth dialog) *)
+    let authorization_endpoint = "https://api.instagram.com/oauth/authorize"
+
+    (** Token endpoint for initial code exchange (Instagram API) *)
+    let token_endpoint = "https://api.instagram.com/oauth/access_token"
+
+    (** Long-lived token exchange endpoint *)
+    let long_lived_token_endpoint = "https://graph.instagram.com/access_token"
+
+    (** Token refresh endpoint *)
+    let refresh_endpoint = "https://graph.instagram.com/refresh_access_token"
+
+    (** Instagram Graph API base URL for standalone flow *)
+    let api_base = "https://graph.instagram.com/v21.0"
   end
-  
-  (** Generate authorization URL for Instagram OAuth 2.0 flow
-      
-      Note: Instagram uses Facebook's OAuth dialog. The user will:
-      1. Log in to Facebook
-      2. Select which Instagram Business/Creator account to connect
-      3. Grant requested permissions
-      
-      @param client_id Facebook App ID
+
+  (** Scope definitions for Instagram Standalone (Business Login) *)
+  module Scopes = struct
+    (** Basic business profile scope *)
+    let basic = "instagram_business_basic"
+
+    (** Content publish scope *)
+    let content_publish = "instagram_business_content_publish"
+
+    (** Scopes for basic profile read access *)
+    let read = [basic]
+
+    (** Scopes for read + content publishing *)
+    let write = [basic; content_publish]
+  end
+
+  (** Generate authorization URL for Instagram Standalone OAuth 2.0 flow
+
+      Note: This uses Instagram's own OAuth dialog (not Facebook's).
+      The user will log in directly to Instagram and grant permissions.
+
+      @param client_id Instagram App ID (same as Facebook App ID)
       @param redirect_uri Registered callback URL
       @param state CSRF protection state parameter
       @param scopes OAuth scopes to request (defaults to Scopes.write)
@@ -227,25 +198,28 @@ module OAuth = struct
   let get_authorization_url ~client_id ~redirect_uri ~state ?(scopes=Scopes.write) () =
     let scope_str = String.concat "," scopes in
     let params = [
+      ("enable_fb_login", "0");
       ("client_id", client_id);
       ("redirect_uri", redirect_uri);
-      ("state", state);
       ("scope", scope_str);
       ("response_type", "code");
-      ("auth_type", "rerequest");
+      ("state", state);
     ] in
     let query = Uri.encoded_of_query (List.map (fun (k, v) -> (k, [v])) params) in
     Printf.sprintf "%s?%s" Metadata.authorization_endpoint query
-  
-  (** Make functor for OAuth operations that need HTTP client *)
+
+  (** Make functor for Standalone OAuth operations that need HTTP client *)
   module Make (Http : HTTP_CLIENT) = struct
     (** Exchange authorization code for short-lived access token
-        
-        Note: This returns a SHORT-LIVED token (~1-2 hours).
+
+        IMPORTANT: This is a POST with form-encoded body, NOT a GET with query params.
+        The Instagram standalone token endpoint requires form body.
+
+        Returns short-lived token (~1 hour) and user_id.
         Call exchange_for_long_lived_token to get a 60-day token.
-        
-        @param client_id Facebook App ID
-        @param client_secret Facebook App Secret
+
+        @param client_id Instagram App ID
+        @param client_secret Instagram App Secret
         @param redirect_uri Registered callback URL
         @param code Authorization code from callback
         @param on_result Continuation receiving api_result with credentials
@@ -254,65 +228,138 @@ module OAuth = struct
       let params = [
         ("client_id", [client_id]);
         ("client_secret", [client_secret]);
+        ("grant_type", ["authorization_code"]);
         ("redirect_uri", [redirect_uri]);
         ("code", [code]);
       ] in
-      let query = Uri.encoded_of_query params in
-      let url = Printf.sprintf "%s?%s" Metadata.token_endpoint query in
-      
-      Http.get url
+      let body = Uri.encoded_of_query params in
+      let headers = [
+        ("Content-Type", "application/x-www-form-urlencoded");
+      ] in
+      let url = Metadata.token_endpoint in
+
+      Http.post ~headers ~body url
         (fun response ->
           if response.status >= 200 && response.status < 300 then
             try
               let json = Yojson.Basic.from_string response.body in
-              let creds = parse_credentials_from_json ~default_expires_in:3600 json in
-              on_result (Ok creds)
+              let open Yojson.Basic.Util in
+              let user_id =
+                try json |> member "user_id" |> to_string
+                with _ ->
+                  try json |> member "user_id" |> to_int |> string_of_int
+                  with _ -> ""
+              in
+              let creds =
+                let c = parse_credentials_from_json ~default_expires_in:3600 json in
+                { c with token_type = "Bearer" }
+              in
+              if user_id = "" then
+                on_result (Error (Error_types.Internal_error "Token exchange response missing user_id"))
+              else
+              on_result (Ok (creds, user_id))
             with e ->
-              on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse token response: %s" (Printexc.to_string e))))
+              on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse standalone token response: %s" (Printexc.to_string e))))
           else
             on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
         (fun err -> on_result (Error (network_error_of_string err)))
-    
+
     (** Exchange short-lived token for long-lived token (60 days)
 
-        IMPORTANT: Always call this after exchange_code to get a usable token.
-        Uses the fb_exchange_token grant type on the Facebook Graph API endpoint.
-        This is for Instagram Graph API tokens obtained via Facebook Login.
+        Uses the ig_exchange_token grant type on the Instagram Graph API endpoint.
+        This is specific to the Instagram Standalone (Business Login) flow.
 
-        @param client_id Facebook App ID
-        @param client_secret Facebook App Secret
+        @param client_secret Instagram App Secret
         @param short_lived_token The short-lived token from exchange_code
+        @param app_secret Optional app secret for appsecret_proof
         @param on_result Continuation receiving api_result with long-lived credentials
     *)
-    let exchange_for_long_lived_token ~client_id ~client_secret ~short_lived_token on_result =
+    let exchange_for_long_lived_token ~client_secret ~short_lived_token ?app_secret on_result =
       let params = [
-        ("grant_type", ["fb_exchange_token"]);
-        ("client_id", [client_id]);
+        ("grant_type", ["ig_exchange_token"]);
         ("client_secret", [client_secret]);
-        ("fb_exchange_token", [short_lived_token]);
-      ] in
+        ("access_token", [short_lived_token]);
+      ] @
+      (match app_secret with
+       | Some secret -> [("appsecret_proof", [compute_app_secret_proof ~app_secret:secret ~access_token:short_lived_token])]
+       | None -> [])
+      in
       let query = Uri.encoded_of_query params in
-      let url = Printf.sprintf "%s?%s" Metadata.token_endpoint query in
-      
+      let url = Printf.sprintf "%s?%s" Metadata.long_lived_token_endpoint query in
+
       Http.get url
         (fun response ->
           if response.status >= 200 && response.status < 300 then
             try
               let json = Yojson.Basic.from_string response.body in
-              let creds = parse_credentials_from_json ~default_expires_in:5184000 json in
+              let creds =
+                let c = parse_credentials_from_json ~default_expires_in:5184000 json in
+                { c with token_type = "Bearer" }
+              in
               on_result (Ok creds)
             with e ->
               on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse long-lived token response: %s" (Printexc.to_string e))))
           else
             on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
         (fun err -> on_result (Error (network_error_of_string err)))
-    
+
+    (** Get Instagram profile for the authenticated standalone user
+
+        Fetches user_id, username, name, and profile_picture_url from the
+        Instagram Graph API /me endpoint.
+
+        @param access_token A valid access token (short-lived or long-lived)
+        @param on_result Continuation receiving api_result with standalone_profile
+    *)
+    let get_profile ~access_token on_result =
+      let params = [
+        ("fields", ["id,username,name,profile_picture_url"]);
+        ("access_token", [access_token]);
+      ] in
+      let query = Uri.encoded_of_query params in
+      let url = Printf.sprintf "%s/me?%s" Metadata.api_base query in
+
+      Http.get url
+        (fun response ->
+          if response.status >= 200 && response.status < 300 then
+            try
+              let json = Yojson.Basic.from_string response.body in
+              let open Yojson.Basic.Util in
+              let user_id =
+                try json |> member "id" |> to_string
+                with _ ->
+                  try json |> member "user_id" |> to_string
+                  with _ ->
+                    try json |> member "user_id" |> to_int |> string_of_int
+                    with _ -> ""
+              in
+              if user_id = "" then
+                on_result (Error (Error_types.Internal_error "Profile response missing user identifier"))
+              else
+              let username =
+                try json |> member "username" |> to_string
+                with _ -> ""
+              in
+              let name =
+                try json |> member "name" |> to_string
+                with _ -> ""
+              in
+              let profile_picture_url =
+                try Some (json |> member "profile_picture_url" |> to_string)
+                with _ -> None
+              in
+              on_result (Ok { user_id; username; name; profile_picture_url })
+            with e ->
+              on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse profile response: %s" (Printexc.to_string e))))
+          else
+            on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
+        (fun err -> on_result (Error (network_error_of_string err)))
+
     (** Refresh a long-lived token to extend its validity
-        
-        Instagram long-lived tokens can be refreshed to get a new 60-day token.
-        You should refresh tokens before they expire (within the 60-day window).
-        Uses the ig_refresh_token grant type.
-        
+
+        Uses the ig_refresh_token grant on graph.instagram.com/refresh_access_token.
+
+        @param app_secret Optional app secret for appsecret_proof
         @param access_token The current long-lived token to refresh
         @param on_result Continuation receiving api_result with refreshed credentials
     *)
@@ -326,8 +373,8 @@ module OAuth = struct
        | None -> [])
       in
       let query = Uri.encoded_of_query params in
-      let url = Printf.sprintf "%s?%s" Metadata.instagram_refresh_endpoint query in
-      
+      let url = Printf.sprintf "%s?%s" Metadata.refresh_endpoint query in
+
       Http.get url
         (fun response ->
           if response.status >= 200 && response.status < 300 then
@@ -337,97 +384,6 @@ module OAuth = struct
               on_result (Ok creds)
             with e ->
               on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse refresh response: %s" (Printexc.to_string e))))
-          else
-            on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
-        (fun err -> on_result (Error (network_error_of_string err)))
-    
-    (** Instagram Business Account info from /me/accounts discovery *)
-    type instagram_account_info = {
-      ig_user_id: string;
-      ig_username: string;
-      page_id: string;
-      page_name: string;
-    }
-    
-    (** Discover Instagram Business accounts linked to user's Facebook Pages
-        
-        After OAuth, use this to find which Instagram accounts the user can manage.
-        Returns all Instagram Business/Creator accounts linked to Facebook Pages
-        the user has admin access to.
-        
-        @param user_access_token Long-lived user access token
-        @param on_result Continuation receiving api_result with list of Instagram accounts
-    *)
-    let get_instagram_accounts ?app_secret ~user_access_token on_result =
-      let params = [
-        ("fields", ["id,name,instagram_business_account{id,username}"]);
-        ("access_token", [user_access_token]);
-      ] @
-      (match app_secret with
-       | Some secret -> [("appsecret_proof", [compute_app_secret_proof ~app_secret:secret ~access_token:user_access_token])]
-       | None -> [])
-      in
-      let query = Uri.encoded_of_query params in
-      let url = Printf.sprintf "%s/me/accounts?%s" Metadata.api_base query in
-      
-      Http.get url
-        (fun response ->
-          if response.status >= 200 && response.status < 300 then
-            try
-              let json = Yojson.Basic.from_string response.body in
-              let open Yojson.Basic.Util in
-              let pages_data = json |> member "data" |> to_list in
-              let accounts = List.filter_map (fun page ->
-                try
-                  let page_id = page |> member "id" |> to_string in
-                  let page_name = page |> member "name" |> to_string in
-                  let ig_account = page |> member "instagram_business_account" in
-                  if ig_account = `Null then None
-                  else
-                    try
-                      let ig_user_id = ig_account |> member "id" |> to_string in
-                      let ig_username =
-                        try ig_account |> member "username" |> to_string
-                        with _ -> "unknown"
-                      in
-                      Some {
-                        ig_user_id;
-                        ig_username;
-                        page_id;
-                        page_name;
-                      }
-                    with _ -> None
-                with _ -> None
-              ) pages_data in
-              on_result (Ok accounts)
-            with e ->
-              on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse accounts response: %s" (Printexc.to_string e))))
-          else
-            on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
-        (fun err -> on_result (Error (network_error_of_string err)))
-    
-    (** Debug/inspect a token to check its validity and permissions
-        
-        @param access_token The token to inspect
-        @param app_token App access token (client_id|client_secret)
-        @param on_result Continuation receiving api_result with token info as JSON
-    *)
-    let debug_token ~access_token ~app_token on_result =
-      let params = [
-        ("input_token", [access_token]);
-        ("access_token", [app_token]);
-      ] in
-      let query = Uri.encoded_of_query params in
-      let url = Printf.sprintf "%s/debug_token?%s" Metadata.api_base query in
-      
-      Http.get url
-        (fun response ->
-          if response.status >= 200 && response.status < 300 then
-            try
-              let json = Yojson.Basic.from_string response.body in
-              on_result (Ok json)
-            with e ->
-              on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse debug response: %s" (Printexc.to_string e))))
           else
             on_result (Error (parse_api_error ~status_code:response.status ~response_body:response.body)))
         (fun err -> on_result (Error (network_error_of_string err)))
@@ -444,10 +400,10 @@ type rate_limit_info = {
   percentage_used : float;
 }
 
-(** Configuration module type for Instagram provider *)
+(** Configuration module type for Instagram Standalone provider *)
 module type CONFIG = sig
   module Http : HTTP_CLIENT
-  
+
   val get_env : string -> string option
   val get_credentials : account_id:string -> (credentials -> unit) -> (string -> unit) -> unit
   val update_credentials : account_id:string -> credentials:credentials -> (unit -> unit) -> (string -> unit) -> unit
@@ -461,31 +417,31 @@ module type CONFIG = sig
   val on_rate_limit_update : rate_limit_info -> unit
 end
 
-(** Make functor to create Instagram provider with given configuration *)
+(** Make functor to create Instagram Standalone provider with given configuration *)
 module Make (Config : CONFIG) = struct
-  let graph_api_base = "https://graph.facebook.com/v21.0"
+  let graph_api_base = "https://graph.instagram.com/v21.0"
   module OAuth_http = OAuth.Make(Config.Http)
-  
+
   (** {1 Platform Constants} *)
-  
+
   let max_caption_length = 2200
   let max_carousel_items = 10
   let max_hashtags = 30
   let min_carousel_items = 2
-  
+
   (** {1 Validation Functions} *)
-  
+
   (** Validate a single post's content *)
   let validate_post ~text ?(media_count=0) () =
     let errors = ref [] in
-    
+
     (* Check caption length *)
     let text_len = String.length text in
     if text_len > max_caption_length then
       errors := Error_types.Text_too_long { length = text_len; max = max_caption_length } :: !errors;
-    
+
     (* Count hashtags *)
-    let hashtag_count = 
+    let hashtag_count =
       let rec count_hashtags str pos acc =
         try
           let idx = String.index_from str pos '#' in
@@ -495,20 +451,19 @@ module Make (Config : CONFIG) = struct
       count_hashtags text 0 0
     in
     if hashtag_count > max_hashtags then
-      (* Reusing Too_many_media for hashtag limit - count/max fields work for this *)
       errors := Error_types.Too_many_media { count = hashtag_count; max = max_hashtags } :: !errors;
-    
+
     (* Check media requirement - Instagram requires at least one media item *)
     if media_count = 0 then
       errors := Error_types.Media_required :: !errors;
-    
+
     (* Check carousel limits *)
     if media_count > max_carousel_items then
       errors := Error_types.Too_many_media { count = media_count; max = max_carousel_items } :: !errors;
-    
+
     if !errors = [] then Ok ()
     else Error (List.rev !errors)
-  
+
   (** Validate thread content *)
   let validate_thread ~texts ?(media_counts=[]) () =
     if List.length texts = 0 then
@@ -516,9 +471,9 @@ module Make (Config : CONFIG) = struct
     else
       let errors = ref [] in
       List.iteri (fun i text ->
-        let media_count = 
-          try List.nth media_counts i 
-          with _ -> 0 
+        let media_count =
+          try List.nth media_counts i
+          with _ -> 0
         in
         match validate_post ~text ~media_count () with
         | Error post_errors ->
@@ -527,7 +482,7 @@ module Make (Config : CONFIG) = struct
       ) texts;
       if !errors = [] then Ok ()
       else Error (List.rev !errors)
-  
+
   (** Validate media URLs *)
   let validate_media ~media_urls =
     let errors = ref [] in
@@ -537,9 +492,9 @@ module Make (Config : CONFIG) = struct
     ) media_urls;
     if !errors = [] then Ok ()
     else Error (List.rev !errors)
-  
+
   (** {1 Rate Limiting} *)
-  
+
   (** Parse X-App-Usage header *)
   let parse_rate_limit_header headers =
     let parse_usage_number json field =
@@ -553,10 +508,10 @@ module Make (Config : CONFIG) = struct
         with _ -> 0
     in
     try
-      let usage_header = 
-        List.find_opt (fun (k, _) -> 
+      let usage_header =
+        List.find_opt (fun (k, _) ->
           String.lowercase_ascii k = "x-app-usage"
-        ) headers 
+        ) headers
       in
       match usage_header with
       | Some (_, value) ->
@@ -575,38 +530,38 @@ module Make (Config : CONFIG) = struct
           }
       | None -> None
     with _ -> None
-  
+
   (** Update rate limit tracking from response *)
   let update_rate_limits response =
     match parse_rate_limit_header response.headers with
     | Some info -> Config.on_rate_limit_update info
     | None -> ()
-  
+
   (** {1 Security - App Secret Proof} *)
-  
+
   (** Compute HMAC-SHA256 app secret proof *)
   let compute_app_secret_proof ~access_token =
-    match Config.get_env "FACEBOOK_APP_SECRET" with
+    match Config.get_env "INSTAGRAM_APP_SECRET" with
     | Some app_secret ->
         let digest = Digestif.SHA256.hmac_string ~key:app_secret access_token in
         Some (Digestif.SHA256.to_hex digest)
     | None -> None
-  
+
   (** Parse Instagram API error and return user-friendly message *)
   let parse_error_response response_body status_code =
     try
       let json = Yojson.Basic.from_string response_body in
       let open Yojson.Basic.Util in
       let error_obj = json |> member "error" in
-      let error_code = 
+      let error_code =
         try error_obj |> member "code" |> to_int
         with _ -> 0
       in
-      let error_message = 
+      let error_message =
         try error_obj |> member "message" |> to_string
         with _ -> response_body
       in
-      
+
       (* Helper to check if string contains substring (case-insensitive) *)
       let string_contains_s str sub =
         try
@@ -614,47 +569,47 @@ module Make (Config : CONFIG) = struct
           true
         with Not_found -> false
       in
-      
+
       (* Map common error codes to user-friendly messages *)
       let friendly_message = match error_code with
         (* OAuth/Authentication errors *)
         | 190 -> "Instagram access token expired or invalid. Please reconnect your Instagram account."
         | 102 -> "Instagram session expired. Please reconnect your account."
-        
+
         (* Rate limit errors *)
         | 4 -> "Instagram rate limit exceeded. You can post up to 25 times per day. Please try again later."
         | 32 -> "Instagram page rate limit exceeded. Please wait a few minutes before posting again."
         | 613 -> "Too many API calls. Please wait a few minutes and try again."
-        
+
         (* Content errors *)
         | 100 when string_contains_s (String.lowercase_ascii error_message) "business" ->
-            "This Instagram account is not a Business or Creator account. Please convert your account: Instagram Settings → Account → Switch to Professional Account"
+            "This Instagram account is not a Business or Creator account. Please convert your account: Instagram Settings > Account > Switch to Professional Account"
         | 100 when string_contains_s (String.lowercase_ascii error_message) "image_url" ->
             "Instagram couldn't access the image URL. Make sure the image is publicly accessible via HTTPS."
         | 100 when string_contains_s (String.lowercase_ascii error_message) "caption" ->
             "Caption is too long. Instagram captions must be 2,200 characters or less."
         | 100 when string_contains_s (String.lowercase_ascii error_message) "creation_id" ->
             "Container not ready for publishing. The image is still being processed. Please wait a moment and try again."
-        
+
         (* Media errors *)
         | 9004 -> "Instagram couldn't download the image. Ensure the URL is publicly accessible via HTTPS."
         | 9005 -> "Invalid image format. Please use JPEG or PNG images."
         | 352 when string_contains_s (String.lowercase_ascii error_message) "size" ->
             "Image file is too large. Instagram images must be 8 MB or less."
-        
+
         (* Permission errors *)
         | 10 -> "Missing Instagram permissions. Please reconnect your account and grant all requested permissions."
-        | 200 -> "Missing Instagram content publishing permission. Please reconnect and grant instagram_content_publish."
-        
+        | 200 -> "Missing Instagram content publishing permission. Please reconnect and grant instagram_business_content_publish."
+
         (* Generic fallback *)
         | _ -> Printf.sprintf "Instagram API error (%d): %s" error_code error_message
       in
-      
+
       friendly_message
     with _ ->
       (* Failed to parse JSON error - return raw response *)
       Printf.sprintf "Instagram API error (%d): %s" status_code response_body
-  
+
   (** Parse API error response and return structured Error_types.error *)
   let parse_api_error ~status_code ~response_body =
     OAuth.parse_api_error ~status_code ~response_body
@@ -664,7 +619,7 @@ module Make (Config : CONFIG) = struct
 
   let network_error_of_string err =
     OAuth.network_error_of_string err
-  
+
   (** Check if token is expired or expiring soon *)
   let is_token_expired_buffer ~buffer_seconds expires_at_opt =
     match expires_at_opt with
@@ -680,7 +635,7 @@ module Make (Config : CONFIG) = struct
                | None -> false)
           | Error _ -> true
         with _ -> true
-  
+
   (** Refresh long-lived token (extends validity by 60 days) *)
   let refresh_token ~access_token on_success on_error =
     let params = [
@@ -711,7 +666,7 @@ module Make (Config : CONFIG) = struct
         else
           on_error (Error_types.error_to_string (api_error_of_response response)))
       on_error
-  
+
   (** Ensure valid access token, refreshing if needed *)
   let ensure_valid_token ~account_id on_success on_error =
     Config.get_credentials ~account_id
@@ -732,7 +687,7 @@ module Make (Config : CONFIG) = struct
                   on_error (Error_types.Network_error (Error_types.Connection_failed (Printf.sprintf "Failed to save refreshed token: %s" err)))))
             (fun refresh_err ->
               (* Token refresh failed - mark as expired and ask user to reconnect *)
-              Config.update_health_status ~account_id ~status:"token_expired" 
+              Config.update_health_status ~account_id ~status:"token_expired"
                 ~error_message:(Some "Access token expired - please reconnect")
                 (fun () -> on_error (Error_types.Auth_error (Error_types.Refresh_failed refresh_err)))
                 (fun _ -> on_error (Error_types.Auth_error (Error_types.Refresh_failed refresh_err))))
@@ -1105,7 +1060,7 @@ module Make (Config : CONFIG) = struct
   let detect_media_type url =
     match classify_media_url url with
     | `Video -> "VIDEO"
-    | `Image | `Unsupported -> "IMAGE"  (* Keep legacy default; validated earlier in flows *)
+    | `Image | `Unsupported -> "IMAGE"
 
   let validate_supported_media_urls ~media_urls =
     let errors =
@@ -1116,23 +1071,23 @@ module Make (Config : CONFIG) = struct
       ) [] media_urls
     in
     if errors = [] then Ok () else Error (List.rev errors)
-  
+
   (** Step 1a: Create single image container *)
   let create_image_container ~ig_user_id ~access_token ~image_url ~caption ~alt_text ~is_carousel_item on_result =
     let url = Printf.sprintf "%s/%s/media" graph_api_base ig_user_id in
-    
+
     let base_params = [
       ("image_url", [image_url]);
     ] in
-    
+
     (* Add alt text if provided *)
     let base_with_alt = match alt_text with
       | Some alt when String.length alt > 0 ->
           ("custom_accessibility_caption", [alt]) :: base_params
       | _ -> base_params
     in
-    
-    let params = 
+
+    let params =
       (if is_carousel_item then
         (* Carousel items don't include caption, and mark as carousel item *)
         ("is_carousel_item", ["true"]) :: base_with_alt
@@ -1144,13 +1099,13 @@ module Make (Config : CONFIG) = struct
        | Some proof -> [("appsecret_proof", [proof])]
        | None -> [])
     in
-    
+
     let body = Uri.encoded_of_query params in
     let headers = [
       ("Content-Type", "application/x-www-form-urlencoded");
       ("Authorization", Printf.sprintf "Bearer %s" access_token);
     ] in
-    
+
     Config.Http.post ~headers ~body url
       (fun response ->
         update_rate_limits response;
@@ -1165,24 +1120,24 @@ module Make (Config : CONFIG) = struct
         else
           on_result (Error (api_error_of_response response)))
       (fun err -> on_result (Error (network_error_of_string err)))
-  
+
   (** Step 1b: Create video container *)
   let create_video_container ~ig_user_id ~access_token ~video_url ~caption ~alt_text ~media_type ~is_carousel_item on_result =
     let url = Printf.sprintf "%s/%s/media" graph_api_base ig_user_id in
-    
+
     let base_params = [
-      ("media_type", [media_type]); (* "VIDEO" or "REELS" *)
+      ("media_type", [media_type]);
       ("video_url", [video_url]);
     ] in
-    
+
     (* Add alt text if provided *)
     let base_with_alt = match alt_text with
       | Some alt when String.length alt > 0 ->
           ("custom_accessibility_caption", [alt]) :: base_params
       | _ -> base_params
     in
-    
-    let params = 
+
+    let params =
       (if is_carousel_item then
         (* Carousel items don't include caption, and mark as carousel item *)
         ("is_carousel_item", ["true"]) :: base_with_alt
@@ -1194,13 +1149,13 @@ module Make (Config : CONFIG) = struct
        | Some proof -> [("appsecret_proof", [proof])]
        | None -> [])
     in
-    
+
     let body = Uri.encoded_of_query params in
     let headers = [
       ("Content-Type", "application/x-www-form-urlencoded");
       ("Authorization", Printf.sprintf "Bearer %s" access_token);
     ] in
-    
+
     Config.Http.post ~headers ~body url
       (fun response ->
         update_rate_limits response;
@@ -1215,11 +1170,11 @@ module Make (Config : CONFIG) = struct
         else
           on_result (Error (api_error_of_response response)))
       (fun err -> on_result (Error (network_error_of_string err)))
-  
+
   (** Step 1c: Create carousel container from child containers *)
   let create_carousel_container ~ig_user_id ~access_token ~children_ids ~caption on_result =
     let url = Printf.sprintf "%s/%s/media" graph_api_base ig_user_id in
-    
+
     let params = [
       ("media_type", ["CAROUSEL"]);
       ("children", [String.concat "," children_ids]);
@@ -1230,13 +1185,13 @@ module Make (Config : CONFIG) = struct
      | Some proof -> [("appsecret_proof", [proof])]
      | None -> [])
     in
-    
+
     let body = Uri.encoded_of_query params in
     let headers = [
       ("Content-Type", "application/x-www-form-urlencoded");
       ("Authorization", Printf.sprintf "Bearer %s" access_token);
     ] in
-    
+
     Config.Http.post ~headers ~body url
       (fun response ->
         update_rate_limits response;
@@ -1251,11 +1206,11 @@ module Make (Config : CONFIG) = struct
         else
           on_result (Error (api_error_of_response response)))
       (fun err -> on_result (Error (network_error_of_string err)))
-  
+
   (** Step 2: Publish container *)
   let publish_container ~ig_user_id ~access_token ~container_id on_result =
     let url = Printf.sprintf "%s/%s/media_publish" graph_api_base ig_user_id in
-    
+
     let params = [
       ("creation_id", [container_id]);
     ] @
@@ -1264,13 +1219,13 @@ module Make (Config : CONFIG) = struct
      | Some proof -> [("appsecret_proof", [proof])]
      | None -> [])
     in
-    
+
     let body = Uri.encoded_of_query params in
     let headers = [
       ("Content-Type", "application/x-www-form-urlencoded");
       ("Authorization", Printf.sprintf "Bearer %s" access_token);
     ] in
-    
+
     Config.Http.post ~headers ~body url
       (fun response ->
         update_rate_limits response;
@@ -1285,7 +1240,7 @@ module Make (Config : CONFIG) = struct
         else
           on_result (Error (api_error_of_response response)))
       (fun err -> on_result (Error (network_error_of_string err)))
-  
+
   (** Check container status *)
   let check_container_status ~container_id ~access_token on_result =
     let proof_params = match compute_app_secret_proof ~access_token with
@@ -1295,11 +1250,11 @@ module Make (Config : CONFIG) = struct
     let query_params = [("fields", ["status_code,status"])] @ proof_params in
     let query = Uri.encoded_of_query query_params in
     let url = Printf.sprintf "%s/%s?%s" graph_api_base container_id query in
-    
+
     let headers = [
       ("Authorization", Printf.sprintf "Bearer %s" access_token);
     ] in
-    
+
     Config.Http.get ~headers url
       (fun response ->
         update_rate_limits response;
@@ -1315,7 +1270,7 @@ module Make (Config : CONFIG) = struct
         else
           on_result (Error (api_error_of_response response)))
       (fun err -> on_result (Error (network_error_of_string err)))
-  
+
   (** Poll container status with exponential backoff *)
   let rec poll_container_status ~container_id ~access_token ~ig_user_id ~attempt ~max_attempts on_success on_error =
     if attempt > max_attempts then
@@ -1329,7 +1284,7 @@ module Make (Config : CONFIG) = struct
         | 4 -> 8.0
         | _ -> 13.0
       in
-      
+
       Config.sleep delay (fun () ->
         check_container_status ~container_id ~access_token
           (function
@@ -1343,13 +1298,13 @@ module Make (Config : CONFIG) = struct
                         | Error e -> on_error (Error_types.error_to_string e))
                 | "ERROR" ->
                     (* Container processing failed *)
-                    let error_detail = if status <> "UNKNOWN" && status <> "" 
-                      then Printf.sprintf ": %s" status 
+                    let error_detail = if status <> "UNKNOWN" && status <> ""
+                      then Printf.sprintf ": %s" status
                       else "" in
                     on_error (Printf.sprintf "Instagram container processing failed%s" error_detail)
                 | "IN_PROGRESS" ->
                     (* Still processing - retry with next attempt *)
-                    poll_container_status ~container_id ~access_token ~ig_user_id 
+                    poll_container_status ~container_id ~access_token ~ig_user_id
                       ~attempt:(attempt + 1) ~max_attempts on_success on_error
                 | _ ->
                     (* Unknown status code - keep polling until max attempts *)
@@ -1359,45 +1314,40 @@ module Make (Config : CONFIG) = struct
                 (* Status check failed - retry until max attempts *)
                 poll_container_status ~container_id ~access_token ~ig_user_id
                   ~attempt:(attempt + 1) ~max_attempts on_success on_error))
-  
+
   (** Create child containers for carousel (recursive) *)
   let rec create_carousel_children ~ig_user_id ~access_token ~media_urls_with_alt ~index ~acc on_success on_error =
     match media_urls_with_alt with
     | [] -> on_success (List.rev acc)
     | (url, alt_text) :: rest ->
         let media_type = detect_media_type url in
-        
+
         (match media_type with
         | "VIDEO" ->
             (* Create video carousel item *)
-            create_video_container ~ig_user_id ~access_token ~video_url:url 
+            create_video_container ~ig_user_id ~access_token ~video_url:url
               ~caption:"" ~alt_text ~media_type:"VIDEO" ~is_carousel_item:true
               (function
                 | Ok child_id ->
-                    create_carousel_children ~ig_user_id ~access_token 
+                    create_carousel_children ~ig_user_id ~access_token
                       ~media_urls_with_alt:rest ~index:(index + 1) ~acc:(child_id :: acc)
                       on_success on_error
                 | Error e -> on_error (Error_types.error_to_string e))
         | _ ->
             (* Create image carousel item *)
-            create_image_container ~ig_user_id ~access_token ~image_url:url 
+            create_image_container ~ig_user_id ~access_token ~image_url:url
               ~caption:"" ~alt_text ~is_carousel_item:true
               (function
                 | Ok child_id ->
-                    create_carousel_children ~ig_user_id ~access_token 
+                    create_carousel_children ~ig_user_id ~access_token
                       ~media_urls_with_alt:rest ~index:(index + 1) ~acc:(child_id :: acc)
                       on_success on_error
                 | Error e -> on_error (Error_types.error_to_string e)))
-  
-  (** Post to Instagram with two-step process
-      
-      Note: Instagram uses URL-based container creation where the platform
-      fetches media directly. Client-side file size validation is not possible.
-      Instagram enforces its own limits: 8MB images, 1GB video.
-  *)
+
+  (** Post to Instagram with two-step process *)
   let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) on_result =
     let media_count = List.length media_urls in
-    
+
     (* Validate content first - includes media count check *)
     match validate_post ~text ~media_count () with
     | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
@@ -1480,7 +1430,7 @@ module Make (Config : CONFIG) = struct
                          (fun err -> on_result (Error_types.Failure
                            (Error_types.Internal_error err))))
                      (fun err -> on_result (Error_types.Failure err)))
-  
+
   (** Post Reel (short-form video) *)
   let post_reel ~account_id ~text ~video_url ?(alt_text=None) on_result =
     (* Validate caption *)
@@ -1513,39 +1463,28 @@ module Make (Config : CONFIG) = struct
                        (fun err -> on_result (Error_types.Failure
                          (Error_types.Internal_error err))))
                    (fun err -> on_result (Error_types.Failure err)))
-  
+
   (** {1 Instagram Stories} *)
-  
-  (** Create story container for image
-      
-      Instagram Stories use a separate media_type "STORIES".
-      Stories are full-screen vertical content (9:16 aspect ratio recommended).
-      Stories expire after 24 hours.
-      
-      @param ig_user_id Instagram Business Account ID
-      @param access_token Valid access token
-      @param image_url Publicly accessible URL of the image
-      @param on_result Continuation receiving api_result with container ID
-  *)
+
+  (** Create story container for image *)
   let create_story_image_container ~ig_user_id ~access_token ~image_url on_result =
     let url = Printf.sprintf "%s/%s/media" graph_api_base ig_user_id in
-    
+
     let params = [
       ("media_type", ["STORIES"]);
       ("image_url", [image_url]);
     ] @
-    (* Add app secret proof if available *)
     (match compute_app_secret_proof ~access_token with
      | Some proof -> [("appsecret_proof", [proof])]
      | None -> [])
     in
-    
+
     let body = Uri.encoded_of_query params in
     let headers = [
       ("Content-Type", "application/x-www-form-urlencoded");
       ("Authorization", Printf.sprintf "Bearer %s" access_token);
     ] in
-    
+
     Config.Http.post ~headers ~body url
       (fun response ->
         update_rate_limits response;
@@ -1560,38 +1499,26 @@ module Make (Config : CONFIG) = struct
         else
           on_result (Error (api_error_of_response response)))
       (fun err -> on_result (Error (network_error_of_string err)))
-  
-  (** Create story container for video
-      
-      Video stories must be:
-      - MP4 or MOV format
-      - 1-60 seconds duration
-      - Recommended: 9:16 aspect ratio (1080x1920)
-      
-      @param ig_user_id Instagram Business Account ID
-      @param access_token Valid access token
-      @param video_url Publicly accessible URL of the video
-      @param on_result Continuation receiving api_result with container ID
-  *)
+
+  (** Create story container for video *)
   let create_story_video_container ~ig_user_id ~access_token ~video_url on_result =
     let url = Printf.sprintf "%s/%s/media" graph_api_base ig_user_id in
-    
+
     let params = [
       ("media_type", ["STORIES"]);
       ("video_url", [video_url]);
     ] @
-    (* Add app secret proof if available *)
     (match compute_app_secret_proof ~access_token with
      | Some proof -> [("appsecret_proof", [proof])]
      | None -> [])
     in
-    
+
     let body = Uri.encoded_of_query params in
     let headers = [
       ("Content-Type", "application/x-www-form-urlencoded");
       ("Authorization", Printf.sprintf "Bearer %s" access_token);
     ] in
-    
+
     Config.Http.post ~headers ~body url
       (fun response ->
         update_rate_limits response;
@@ -1606,88 +1533,46 @@ module Make (Config : CONFIG) = struct
         else
           on_result (Error (api_error_of_response response)))
       (fun err -> on_result (Error (network_error_of_string err)))
-  
-  (** Post image story to Instagram
-      
-      Posts an image as an Instagram Story. Stories are full-screen vertical
-      content that expires after 24 hours.
-      
-      Requirements:
-      - Image must be publicly accessible via HTTPS
-      - Recommended: 9:16 aspect ratio (1080x1920 pixels)
-      - Supported formats: JPEG, PNG
-      - Maximum file size: 8 MB
-      
-      @param account_id Internal account identifier
-      @param image_url Publicly accessible URL of the image
-      @param on_result Continuation receiving outcome with media ID
-  *)
+
+  (** Post image story to Instagram *)
   let post_story_image ~account_id ~image_url on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         Config.get_ig_user_id ~account_id
           (fun ig_user_id ->
-            (* Create story container with image *)
             create_story_image_container ~ig_user_id ~access_token ~image_url
               (function
                 | Ok container_id ->
-                    (* Poll and publish *)
-                    poll_container_status ~container_id ~access_token ~ig_user_id 
-                      ~attempt:1 ~max_attempts:5 
+                    poll_container_status ~container_id ~access_token ~ig_user_id
+                      ~attempt:1 ~max_attempts:5
                       (fun media_id -> on_result (Error_types.Success media_id))
-                      (fun err -> on_result (Error_types.Failure 
+                      (fun err -> on_result (Error_types.Failure
                         (Error_types.Internal_error err)))
                 | Error e -> on_result (Error_types.Failure e)))
-          (fun err -> on_result (Error_types.Failure 
+          (fun err -> on_result (Error_types.Failure
             (Error_types.Internal_error err))))
       (fun err -> on_result (Error_types.Failure err))
-  
-  (** Post video story to Instagram
-      
-      Posts a video as an Instagram Story. Stories are full-screen vertical
-      content that expires after 24 hours.
-      
-      Requirements:
-      - Video must be publicly accessible via HTTPS
-      - Duration: 1-60 seconds
-      - Recommended: 9:16 aspect ratio (1080x1920 pixels)
-      - Supported formats: MP4, MOV
-      - Supported codecs: H.264 video, AAC audio
-      - Maximum file size: 100 MB (varies by duration)
-      
-      @param account_id Internal account identifier
-      @param video_url Publicly accessible URL of the video
-      @param on_result Continuation receiving outcome with media ID
-  *)
+
+  (** Post video story to Instagram *)
   let post_story_video ~account_id ~video_url on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         Config.get_ig_user_id ~account_id
           (fun ig_user_id ->
-            (* Create story container with video *)
             create_story_video_container ~ig_user_id ~access_token ~video_url
               (function
                 | Ok container_id ->
-                    (* Poll and publish - videos need more time to process *)
-                    poll_container_status ~container_id ~access_token ~ig_user_id 
-                      ~attempt:1 ~max_attempts:10 
+                    poll_container_status ~container_id ~access_token ~ig_user_id
+                      ~attempt:1 ~max_attempts:10
                       (fun media_id -> on_result (Error_types.Success media_id))
-                      (fun err -> on_result (Error_types.Failure 
+                      (fun err -> on_result (Error_types.Failure
                         (Error_types.Internal_error err)))
                 | Error e -> on_result (Error_types.Failure e)))
-          (fun err -> on_result (Error_types.Failure 
+          (fun err -> on_result (Error_types.Failure
             (Error_types.Internal_error err))))
       (fun err -> on_result (Error_types.Failure err))
-  
-  (** Post story to Instagram (auto-detect media type)
-      
-      Automatically detects whether the media is an image or video based on
-      the file extension and posts it as an Instagram Story.
-      
-      @param account_id Internal account identifier
-      @param media_url Publicly accessible URL of the image or video
-      @param on_result Continuation receiving outcome with media ID
-  *)
+
+  (** Post story to Instagram (auto-detect media type) *)
   let post_story ~account_id ~media_url on_result =
     let url_lower = String.lowercase_ascii media_url in
     if not (String.starts_with ~prefix:"http://" url_lower || String.starts_with ~prefix:"https://" url_lower) then
@@ -1698,28 +1583,20 @@ module Make (Config : CONFIG) = struct
       | `Image -> post_story_image ~account_id ~image_url:media_url on_result
       | `Unsupported ->
           on_result (Error_types.Failure (Error_types.Validation_error [Error_types.Media_unsupported_format "Story media must be an image (JPEG, PNG) or video (MP4, MOV)"]))
-  
-  (** Validate story media
-      
-      Validates that the media URL is appropriate for Instagram Stories.
-      
-      @param media_url The URL to validate
-      @return Ok () if valid, Error message otherwise
-  *)
+
+  (** Validate story media *)
   let validate_story ~media_url =
     let url_lower = String.lowercase_ascii media_url in
-    (* Check if URL is accessible (starts with http/https) *)
     if not (String.starts_with ~prefix:"http://" url_lower || String.starts_with ~prefix:"https://" url_lower) then
       Error "Story media URL must be a publicly accessible HTTP(S) URL"
     else
-      (* Check for valid image or video extension *)
       let is_image = Str.string_match (Str.regexp ".*\\.\\(jpg\\|jpeg\\|png\\)$") url_lower 0 in
       let is_video = Str.string_match (Str.regexp ".*\\.\\(mp4\\|mov\\)$") url_lower 0 in
       if not (is_image || is_video) then
         Error "Story media must be an image (JPEG, PNG) or video (MP4, MOV)"
       else
         Ok ()
-  
+
   (** Post thread (Instagram doesn't support threads, posts only first item with warning) *)
   let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_result =
     if List.length texts = 0 then
@@ -1729,7 +1606,7 @@ module Make (Config : CONFIG) = struct
       let first_media = if List.length media_urls_per_post > 0 then List.hd media_urls_per_post else [] in
       let first_alt_texts = if List.length alt_texts_per_post > 0 then List.hd alt_texts_per_post else [] in
       let total_posts = List.length texts in
-      
+
       post_single ~account_id ~text:first_text ~media_urls:first_media ~alt_texts:first_alt_texts
         (fun outcome ->
           match outcome with
@@ -1740,10 +1617,9 @@ module Make (Config : CONFIG) = struct
                 total_requested = total_posts;
               } in
               if total_posts > 1 then
-                (* Warn that only first post was published *)
                 on_result (Error_types.Partial_success {
                   result = thread_result;
-                  warnings = [Error_types.Enrichment_skipped 
+                  warnings = [Error_types.Enrichment_skipped
                     "Instagram does not support threads - only the first post was published"];
                 })
               else
@@ -1754,22 +1630,22 @@ module Make (Config : CONFIG) = struct
                 failed_at_index = None;
                 total_requested = total_posts;
               } in
-              let all_warnings = 
+              let all_warnings =
                 if total_posts > 1 then
-                  Error_types.Enrichment_skipped 
+                  Error_types.Enrichment_skipped
                     "Instagram does not support threads - only the first post was published" :: warnings
                 else warnings
               in
               on_result (Error_types.Partial_success { result = thread_result; warnings = all_warnings })
           | Error_types.Failure err ->
               on_result (Error_types.Failure err))
-  
+
   (** OAuth authorization URL *)
   let get_oauth_url ~redirect_uri ~state on_success on_error =
-    let client_id = Config.get_env "FACEBOOK_APP_ID" |> Option.value ~default:"" in
-    
+    let client_id = Config.get_env "INSTAGRAM_APP_ID" |> Option.value ~default:"" in
+
     if client_id = "" then
-      on_error "Facebook App ID not configured"
+      on_error "Instagram App ID not configured"
     else
       on_success
         (OAuth.get_authorization_url
@@ -1778,55 +1654,43 @@ module Make (Config : CONFIG) = struct
            ~state
            ~scopes:OAuth.Scopes.write
            ())
-  
+
   (** Exchange OAuth code for a long-lived access token (~60 days).
 
       Internally performs two steps: exchanges the code for a short-lived token,
       then exchanges that for a long-lived token via [exchange_for_long_lived_token].
       Callers do not need to perform a separate long-lived token exchange. *)
   let rec exchange_code ~code ~redirect_uri on_success on_error =
-    let client_id = Config.get_env "FACEBOOK_APP_ID" |> Option.value ~default:"" in
-    let client_secret = Config.get_env "FACEBOOK_APP_SECRET" |> Option.value ~default:"" in
-    
+    let client_id = Config.get_env "INSTAGRAM_APP_ID" |> Option.value ~default:"" in
+    let client_secret = Config.get_env "INSTAGRAM_APP_SECRET" |> Option.value ~default:"" in
+
     if client_id = "" || client_secret = "" then
-      on_error "Facebook OAuth credentials not configured"
+      on_error "Instagram OAuth credentials not configured"
     else
       OAuth_http.exchange_code ~client_id ~client_secret ~redirect_uri ~code
         (function
-          | Ok short_lived_creds ->
+          | Ok (short_lived_creds, _user_id) ->
               (* Immediately exchange for long-lived token (60 days) *)
-              exchange_for_long_lived_token ~short_lived_token:short_lived_creds.access_token
+              exchange_for_long_lived_token ~client_secret ~short_lived_token:short_lived_creds.access_token
                 on_success on_error
           | Error err ->
               on_error (Error_types.error_to_string err))
-  
-  (** Exchange short-lived token for long-lived token (60 days)
 
-      Uses the fb_exchange_token grant type on the Facebook Graph API endpoint.
-      This is for Instagram Graph API tokens obtained via Facebook Login.
-  *)
-  and exchange_for_long_lived_token ~short_lived_token on_success on_error =
-    let client_id = Config.get_env "FACEBOOK_APP_ID" |> Option.value ~default:"" in
-    let client_secret = Config.get_env "FACEBOOK_APP_SECRET" |> Option.value ~default:"" in
+  and exchange_for_long_lived_token ~client_secret ~short_lived_token on_success on_error =
+    OAuth_http.exchange_for_long_lived_token ~client_secret ~short_lived_token
+      (function
+        | Ok credentials ->
+            let normalized = { credentials with token_type = "Bearer" } in
+            on_success normalized
+        | Error err -> on_error (Error_types.error_to_string err))
 
-    if client_id = "" || client_secret = "" then
-      on_error "Facebook OAuth credentials not configured"
-    else
-      OAuth_http.exchange_for_long_lived_token ~client_id ~client_secret ~short_lived_token
-        (function
-          | Ok credentials ->
-              let normalized = { credentials with token_type = "Bearer" } in
-              on_success normalized
-          | Error err -> on_error (Error_types.error_to_string err))
-  
   (** Validate content length and hashtags *)
   let validate_content ~text =
     let len = String.length text in
     if len > 2200 then
       Error (Printf.sprintf "Instagram captions must be 2,200 characters or less (current: %d)" len)
     else
-      (* Count hashtags *)
-      let hashtag_count = 
+      let hashtag_count =
         let rec count_hashtags str pos acc =
           try
             let idx = String.index_from str pos '#' in
@@ -1839,7 +1703,7 @@ module Make (Config : CONFIG) = struct
         Error (Printf.sprintf "Instagram allows maximum 30 hashtags (current: %d)" hashtag_count)
       else
         Ok ()
-  
+
   (** Validate carousel post *)
   let validate_carousel ~media_urls =
     let count = List.length media_urls in
@@ -1849,27 +1713,25 @@ module Make (Config : CONFIG) = struct
       Error (Printf.sprintf "Instagram carousel posts allow maximum 10 items (current: %d)" count)
     else
       Ok ()
-  
+
   (** Validate video URL *)
   let validate_video ~video_url ~media_type =
     let url_lower = String.lowercase_ascii video_url in
-    (* Check if URL has video extension *)
     if not (Str.string_match (Str.regexp ".*\\.\\(mp4\\|mov\\)$") url_lower 0) then
       Error "Instagram videos must be MP4 or MOV format"
     else
       match media_type with
-      | "REELS" -> Ok () (* Reels: 3-90 seconds, validated by Instagram *)
-      | "VIDEO" -> Ok () (* Feed videos: 3-60 seconds, validated by Instagram *)
+      | "REELS" -> Ok ()
+      | "VIDEO" -> Ok ()
       | _ -> Error "Invalid video media type"
-  
+
   (** Validate media URLs for carousel *)
   let validate_carousel_items ~media_urls =
-    (* All items must be accessible URLs *)
     let all_valid = List.for_all (fun url ->
-      String.length url > 0 && 
+      String.length url > 0 &&
       (String.starts_with ~prefix:"http://" url || String.starts_with ~prefix:"https://" url)
     ) media_urls in
-    
+
     if not all_valid then
       Error "All carousel media items must be publicly accessible HTTP(S) URLs"
     else

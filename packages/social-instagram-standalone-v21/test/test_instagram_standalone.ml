@@ -1,0 +1,859 @@
+(** Tests for Instagram Standalone (Business Login) API v21 Provider *)
+
+open Social_core
+open Social_instagram_standalone_v21
+
+(** Helper to check if string contains substring *)
+let string_contains s substr =
+  try
+    ignore (Str.search_forward (Str.regexp_string substr) s 0);
+    true
+  with Not_found -> false
+
+let query_param url key =
+  let params = Uri.query (Uri.of_string url) in
+  match List.assoc_opt key params with
+  | Some (v :: _) -> Some v
+  | _ -> None
+
+(** Helper to handle outcome type in tests *)
+let handle_outcome on_success on_error outcome =
+  match outcome with
+  | Error_types.Success result -> on_success result
+  | Error_types.Partial_success { result; _ } -> on_success result
+  | Error_types.Failure err -> on_error (Error_types.error_to_string err)
+
+(** Helper to handle api_result type in tests *)
+let handle_result on_success on_error result =
+  match result with
+  | Ok value -> on_success value
+  | Error err -> on_error (Error_types.error_to_string err)
+
+(** Mock HTTP client for testing *)
+module Mock_http = struct
+  let requests = ref []
+  let response_queue = ref []
+  let error_queue = ref []
+
+  let reset () =
+    requests := [];
+    response_queue := [];
+    error_queue := []
+
+  let set_response response =
+    response_queue := [response]
+
+  let set_responses responses =
+    response_queue := responses
+
+  let _set_errors errors =
+    error_queue := errors
+
+  let get_next_response () =
+    match !response_queue with
+    | [] -> None
+    | r :: rest ->
+        response_queue := rest;
+        Some r
+
+  let get_next_error () =
+    match !error_queue with
+    | [] -> None
+    | e :: rest ->
+        error_queue := rest;
+        Some e
+
+  include (struct
+  let get ?(headers=[]) url on_success on_error =
+    requests := ("GET", url, headers, "") :: !requests;
+    match get_next_response () with
+    | Some response -> on_success response
+    | None ->
+        (match get_next_error () with
+         | Some err -> on_error err
+         | None -> on_error "No mock response set")
+
+  let post ?(headers=[]) ?(body="") url on_success on_error =
+    requests := ("POST", url, headers, body) :: !requests;
+    match get_next_response () with
+    | Some response -> on_success response
+    | None ->
+        (match get_next_error () with
+         | Some err -> on_error err
+         | None -> on_error "No mock response set")
+
+  let put ?(headers=[]) ?(body="") url on_success on_error =
+    requests := ("PUT", url, headers, body) :: !requests;
+    match get_next_response () with
+    | Some response -> on_success response
+    | None ->
+        (match get_next_error () with
+         | Some err -> on_error err
+         | None -> on_error "No mock response set")
+
+  let delete ?(headers=[]) url on_success on_error =
+    requests := ("DELETE", url, headers, "") :: !requests;
+    match get_next_response () with
+    | Some response -> on_success response
+    | None ->
+        (match get_next_error () with
+         | Some err -> on_error err
+         | None -> on_error "No mock response set")
+
+  let post_multipart ?(headers=[]) ~parts url on_success on_error =
+    let body_str = Printf.sprintf "multipart with %d parts" (List.length parts) in
+    requests := ("POST_MULTIPART", url, headers, body_str) :: !requests;
+    match get_next_response () with
+    | Some response -> on_success response
+    | None ->
+        (match get_next_error () with
+         | Some err -> on_error err
+         | None -> on_error "No mock response set")
+  end : HTTP_CLIENT)
+end
+
+(** Mock config for testing *)
+module Mock_config = struct
+  module Http = Mock_http
+
+  let env_vars = ref []
+  let credentials_store = ref []
+  let health_statuses = ref []
+  let ig_user_ids = ref []
+  let sleep_calls = ref []
+
+  let reset () =
+    env_vars := [];
+    credentials_store := [];
+    health_statuses := [];
+    ig_user_ids := [];
+    sleep_calls := [];
+    Mock_http.reset ()
+
+  let set_env key value =
+    env_vars := (key, value) :: !env_vars
+
+  let get_env key =
+    List.assoc_opt key !env_vars
+
+  let set_credentials ~account_id ~credentials =
+    credentials_store := (account_id, credentials) :: !credentials_store
+
+  let set_ig_user_id ~account_id ~ig_user_id =
+    ig_user_ids := (account_id, ig_user_id) :: !ig_user_ids
+
+  let get_credentials ~account_id on_success on_error =
+    match List.assoc_opt account_id !credentials_store with
+    | Some creds -> on_success creds
+    | None -> on_error "Credentials not found"
+
+  let update_credentials ~account_id ~credentials on_success _on_error =
+    credentials_store := (account_id, credentials) ::
+      (List.remove_assoc account_id !credentials_store);
+    on_success ()
+
+  let encrypt data on_success _on_error =
+    on_success ("encrypted:" ^ data)
+
+  let decrypt data on_success on_error =
+    if String.starts_with ~prefix:"encrypted:" data then
+      on_success (String.sub data 10 (String.length data - 10))
+    else
+      on_error "Invalid encrypted data"
+
+  let update_health_status ~account_id ~status ~error_message on_success _on_error =
+    health_statuses := (account_id, status, error_message) :: !health_statuses;
+    on_success ()
+
+  let get_ig_user_id ~account_id on_success on_error =
+    match List.assoc_opt account_id !ig_user_ids with
+    | Some ig_user_id -> on_success ig_user_id
+    | None -> on_error "IG User ID not found"
+
+  let sleep duration on_continue =
+    sleep_calls := duration :: !sleep_calls;
+    on_continue ()
+
+  let on_rate_limit_update _info =
+    () (* No-op for tests *)
+
+  let _get_health_status account_id =
+    List.find_opt (fun (id, _, _) -> id = account_id) !health_statuses
+end
+
+module Instagram = Make(Mock_config)
+module OAuth_standalone_client = OAuth.Make(Mock_http)
+
+(** {1 OAuth Standalone Tests} *)
+
+(** Test: Standalone OAuth authorization URL starts with correct endpoint *)
+let test_standalone_auth_url_endpoint () =
+  let url = OAuth.get_authorization_url
+    ~client_id:"test_app_id"
+    ~redirect_uri:"https://example.com/callback"
+    ~state:"state_abc"
+    ()
+  in
+  assert (String.length url > 0);
+  assert (string_contains url "https://api.instagram.com/oauth/authorize");
+  print_endline "PASS Standalone auth URL starts with correct endpoint"
+
+(** Test: Standalone OAuth authorization URL includes enable_fb_login=0 *)
+let test_standalone_auth_url_enable_fb_login () =
+  let url = OAuth.get_authorization_url
+    ~client_id:"test_app_id"
+    ~redirect_uri:"https://example.com/callback"
+    ~state:"state_abc"
+    ()
+  in
+  assert (string_contains url "enable_fb_login=0");
+  print_endline "PASS Standalone auth URL includes enable_fb_login=0"
+
+(** Test: Standalone OAuth authorization URL has comma-separated scopes *)
+let test_standalone_auth_url_scopes_comma_separated () =
+  let url = OAuth.get_authorization_url
+    ~client_id:"test_app_id"
+    ~redirect_uri:"https://example.com/callback"
+    ~state:"state_abc"
+    ()
+  in
+  let scope_val = query_param url "scope" in
+  (match scope_val with
+   | Some s ->
+       assert (string_contains s ",");
+       assert (string_contains s "instagram_business_basic");
+       assert (string_contains s "instagram_business_content_publish")
+   | None -> failwith "Missing scope parameter");
+  print_endline "PASS Standalone auth URL has comma-separated scopes"
+
+(** Test: Standalone OAuth authorization URL has response_type=code *)
+let test_standalone_auth_url_response_type () =
+  let url = OAuth.get_authorization_url
+    ~client_id:"test_app_id"
+    ~redirect_uri:"https://example.com/callback"
+    ~state:"state_abc"
+    ()
+  in
+  assert (query_param url "response_type" = Some "code");
+  print_endline "PASS Standalone auth URL has response_type=code"
+
+(** Test: Standalone OAuth authorization URL supports custom scopes *)
+let test_standalone_auth_url_custom_scopes () =
+  let url = OAuth.get_authorization_url
+    ~client_id:"test_app_id"
+    ~redirect_uri:"https://example.com/callback"
+    ~state:"state_abc"
+    ~scopes:["instagram_business_basic"; "instagram_business_manage_comments"]
+    ()
+  in
+  let scope_val = query_param url "scope" in
+  (match scope_val with
+   | Some s ->
+       assert (string_contains s "instagram_business_basic");
+       assert (string_contains s "instagram_business_manage_comments");
+       assert (not (string_contains s "instagram_business_content_publish"))
+   | None -> failwith "Missing scope parameter");
+  print_endline "PASS Standalone auth URL supports custom scopes"
+
+(** Test: Standalone exchange_code happy path with user_id as int *)
+let test_standalone_exchange_code_happy_path_int_user_id () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"access_token":"short_tok_123","user_id":9876543210,"permissions":"instagram_business_basic,instagram_business_content_publish"}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.exchange_code
+    ~client_id:"app_id"
+    ~client_secret:"app_secret"
+    ~redirect_uri:"https://example.com/cb"
+    ~code:"auth_code_xyz"
+    (handle_result
+      (fun (creds, user_id) ->
+        assert (creds.access_token = "short_tok_123");
+        assert (creds.token_type = "Bearer");
+        assert (user_id = "9876543210");
+        (* Verify it was a POST request *)
+        let requests = !Mock_http.requests in
+        let has_post = List.exists (fun (meth, _, _, _) -> meth = "POST") requests in
+        assert has_post;
+        (* Verify Content-Type header *)
+        let has_form_header = List.exists (fun (_, _, headers, _) ->
+          List.exists (fun (k, v) -> k = "Content-Type" && v = "application/x-www-form-urlencoded") headers
+        ) requests in
+        assert has_form_header;
+        print_endline "PASS Standalone exchange_code happy path (int user_id)")
+      (fun err -> failwith ("Standalone exchange_code failed: " ^ err)))
+
+(** Test: Standalone exchange_code happy path with user_id as string *)
+let test_standalone_exchange_code_happy_path_string_user_id () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"access_token":"short_tok_456","user_id":"1234567890","token_type":"bearer"}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.exchange_code
+    ~client_id:"app_id"
+    ~client_secret:"app_secret"
+    ~redirect_uri:"https://example.com/cb"
+    ~code:"auth_code_abc"
+    (handle_result
+      (fun (creds, user_id) ->
+        assert (creds.access_token = "short_tok_456");
+        assert (user_id = "1234567890");
+        print_endline "PASS Standalone exchange_code happy path (string user_id)")
+      (fun err -> failwith ("Standalone exchange_code string user_id failed: " ^ err)))
+
+(** Test: Standalone exchange_code normalizes token_type to Bearer *)
+let test_standalone_exchange_code_normalizes_token_type () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"access_token":"tok","user_id":"123","token_type":"bearer"}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.exchange_code
+    ~client_id:"app_id"
+    ~client_secret:"app_secret"
+    ~redirect_uri:"https://example.com/cb"
+    ~code:"code"
+    (handle_result
+      (fun (creds, _user_id) ->
+        assert (creds.token_type = "Bearer");
+        print_endline "PASS Standalone exchange_code normalizes token_type to Bearer")
+      (fun err -> failwith ("Standalone exchange_code token_type failed: " ^ err)))
+
+(** Test: Standalone exchange_code error when user_id is missing *)
+let test_standalone_exchange_code_missing_user_id () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"access_token":"tok_no_uid","token_type":"bearer"}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.exchange_code
+    ~client_id:"app_id"
+    ~client_secret:"app_secret"
+    ~redirect_uri:"https://example.com/cb"
+    ~code:"code"
+    (function
+      | Ok _ -> failwith "Expected error for missing user_id"
+      | Error (Error_types.Internal_error msg) when string_contains msg "user_id" ->
+          print_endline "PASS Standalone exchange_code error on missing user_id"
+      | Error err -> failwith ("Unexpected error type: " ^ Error_types.error_to_string err))
+
+(** Test: Standalone exchange_code handles HTTP error response *)
+let test_standalone_exchange_code_http_error () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 400;
+    body = {|{"error":{"code":190,"message":"Invalid OAuth 2.0 Access Token"}}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.exchange_code
+    ~client_id:"app_id"
+    ~client_secret:"app_secret"
+    ~redirect_uri:"https://example.com/cb"
+    ~code:"bad_code"
+    (function
+      | Ok _ -> failwith "Expected error for HTTP 400"
+      | Error (Error_types.Auth_error Error_types.Token_expired) ->
+          print_endline "PASS Standalone exchange_code handles HTTP error"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: Standalone exchange_for_long_lived_token happy path *)
+let test_standalone_exchange_long_lived_happy_path () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"access_token":"long_lived_tok_abc","token_type":"bearer","expires_in":5184000}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.exchange_for_long_lived_token
+    ~client_secret:"app_secret"
+    ~short_lived_token:"short_tok"
+    (handle_result
+      (fun creds ->
+        assert (creds.access_token = "long_lived_tok_abc");
+        assert (creds.token_type = "Bearer");
+        assert (creds.expires_at <> None);
+        (* Verify it was a GET request to the correct endpoint *)
+        let requests = !Mock_http.requests in
+        let has_correct_url = List.exists (fun (meth, url, _, _) ->
+          meth = "GET"
+          && string_contains url "graph.instagram.com/access_token"
+          && query_param url "grant_type" = Some "ig_exchange_token"
+        ) requests in
+        assert has_correct_url;
+        print_endline "PASS Standalone exchange_for_long_lived_token happy path")
+      (fun err -> failwith ("Standalone exchange_for_long_lived_token failed: " ^ err)))
+
+(** Test: Standalone exchange_for_long_lived_token normalizes token_type *)
+let test_standalone_exchange_long_lived_normalizes_token_type () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"access_token":"ll_tok","token_type":"bearer","expires_in":5184000}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.exchange_for_long_lived_token
+    ~client_secret:"secret"
+    ~short_lived_token:"sl_tok"
+    (handle_result
+      (fun creds ->
+        assert (creds.token_type = "Bearer");
+        print_endline "PASS Standalone exchange_for_long_lived_token normalizes token_type")
+      (fun err -> failwith ("Standalone long-lived token_type failed: " ^ err)))
+
+(** Test: Standalone exchange_for_long_lived_token with appsecret_proof *)
+let test_standalone_exchange_long_lived_appsecret_proof () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"access_token":"ll_tok","token_type":"bearer","expires_in":5184000}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.exchange_for_long_lived_token
+    ~client_secret:"secret"
+    ~short_lived_token:"sl_tok"
+    ~app_secret:"my_app_secret"
+    (handle_result
+      (fun _creds ->
+        let requests = !Mock_http.requests in
+        let has_proof = List.exists (fun (_, url, _, _) ->
+          match query_param url "appsecret_proof" with
+          | Some p -> String.length p = 64
+          | None -> false
+        ) requests in
+        assert has_proof;
+        print_endline "PASS Standalone exchange_for_long_lived_token with appsecret_proof")
+      (fun err -> failwith ("Standalone long-lived appsecret_proof failed: " ^ err)))
+
+(** Test: Standalone get_profile happy path *)
+let test_standalone_get_profile_happy_path () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"id":"12345","username":"testuser","name":"Test User","profile_picture_url":"https://example.com/pic.jpg"}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.get_profile
+    ~access_token:"valid_tok"
+    (handle_result
+      (fun (profile : standalone_profile) ->
+        assert (profile.user_id = "12345");
+        assert (profile.username = "testuser");
+        assert (profile.name = "Test User");
+        assert (profile.profile_picture_url = Some "https://example.com/pic.jpg");
+        print_endline "PASS Standalone get_profile happy path")
+      (fun err -> failwith ("Standalone get_profile failed: " ^ err)))
+
+(** Test: Standalone get_profile with missing profile_picture_url *)
+let test_standalone_get_profile_no_picture () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"id":"67890","username":"nopic_user","name":"No Pic"}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.get_profile
+    ~access_token:"valid_tok"
+    (handle_result
+      (fun (profile : standalone_profile) ->
+        assert (profile.user_id = "67890");
+        assert (profile.username = "nopic_user");
+        assert (profile.profile_picture_url = None);
+        print_endline "PASS Standalone get_profile with missing profile_picture_url")
+      (fun err -> failwith ("Standalone get_profile no picture failed: " ^ err)))
+
+(** Test: Standalone get_profile requests 'id' field (not 'user_id') *)
+let test_standalone_get_profile_fields_parameter () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"id":"99999","username":"u","name":"N"}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.get_profile
+    ~access_token:"valid_tok"
+    (handle_result
+      (fun _profile ->
+        let requests = !Mock_http.requests in
+        let has_id_field = List.exists (fun (_, url, _, _) ->
+          match query_param url "fields" with
+          | Some f -> string_contains f "id" && not (string_contains f "user_id")
+          | None -> false
+        ) requests in
+        assert has_id_field;
+        print_endline "PASS Standalone get_profile requests 'id' field (not 'user_id')")
+      (fun err -> failwith ("Standalone get_profile fields failed: " ^ err)))
+
+(** Test: Standalone get_profile error on missing identifier *)
+let test_standalone_get_profile_missing_identifier () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"username":"orphan_user","name":"No ID"}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.get_profile
+    ~access_token:"valid_tok"
+    (function
+      | Ok _ -> failwith "Expected error for missing identifier"
+      | Error (Error_types.Internal_error msg) when string_contains msg "identifier" ->
+          print_endline "PASS Standalone get_profile error on missing identifier"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** {1 Content Publishing Tests} *)
+
+(** Test: OAuth URL uses Instagram standalone endpoint *)
+let test_oauth_url () =
+  Mock_config.reset ();
+  Mock_config.set_env "INSTAGRAM_APP_ID" "test_app_id";
+
+  Instagram.get_oauth_url ~redirect_uri:"https://example.com/callback" ~state:"test_state_123"
+    (fun url ->
+      assert (string_contains url "client_id=test_app_id");
+      assert (string_contains url "state=test_state_123");
+      assert (string_contains url "instagram_business");
+      print_endline "PASS OAuth URL generation (standalone)")
+    (fun err -> failwith ("OAuth URL failed: " ^ err))
+
+(** Test: API base URL uses graph.instagram.com *)
+let test_api_base_url_uses_instagram () =
+  Mock_config.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"data": []}|};
+    headers = [];
+  };
+
+  Instagram.get_account_audience_insights
+    ~id:"ig_user_123"
+    ~access_token:"tok"
+    ~since:"2025-01-01"
+    ~until:"2025-01-07"
+    (handle_result
+      (fun _insights ->
+        let requests = !Mock_http.requests in
+        let uses_instagram_graph = List.exists (fun (_, url, _, _) ->
+          string_contains url "graph.instagram.com/v21.0"
+        ) requests in
+        assert uses_instagram_graph;
+        let uses_facebook_graph = List.exists (fun (_, url, _, _) ->
+          string_contains url "graph.facebook.com"
+        ) requests in
+        assert (not uses_facebook_graph);
+        print_endline "PASS API base URL uses graph.instagram.com (not graph.facebook.com)")
+      (fun err -> failwith ("API base URL check failed: " ^ err)))
+
+(** Test: Rate-limit parser tolerates numeric formats and uses max component *)
+let test_rate_limit_parsing () =
+  let headers = [
+    ("X-App-Usage", "{\"call_count\":5,\"total_cputime\":24.9,\"total_time\":12}");
+  ] in
+  match Instagram.parse_rate_limit_header headers with
+  | Some info ->
+      assert (info.call_count = 5);
+      assert (info.total_cputime = 24);
+      assert (info.total_time = 12);
+      assert (info.percentage_used = 24.0);
+      print_endline "PASS Rate limit parsing"
+  | None -> failwith "Rate limit parsing should succeed"
+
+(** Test: Create container *)
+let test_create_container () =
+  Mock_config.reset ();
+
+  let response_body = {|{"id": "container_12345"}|} in
+  Mock_http.set_response { status = 200; body = response_body; headers = [] };
+
+  Instagram.create_image_container
+    ~ig_user_id:"ig_123"
+    ~access_token:"test_token"
+    ~image_url:"https://example.com/image.jpg"
+    ~caption:"Test caption"
+    ~alt_text:None
+    ~is_carousel_item:false
+    (handle_result
+      (fun container_id ->
+        assert (container_id = "container_12345");
+        print_endline "PASS Create image container")
+      (fun err -> failwith ("Create image container failed: " ^ err)))
+
+(** Test: Publish container *)
+let test_publish_container () =
+  Mock_config.reset ();
+
+  let response_body = {|{"id": "media_67890"}|} in
+  Mock_http.set_response { status = 200; body = response_body; headers = [] };
+
+  Instagram.publish_container
+    ~ig_user_id:"ig_123"
+    ~access_token:"test_token"
+    ~container_id:"container_12345"
+    (handle_result
+      (fun media_id ->
+        assert (media_id = "media_67890");
+        print_endline "PASS Publish container")
+      (fun err -> failwith ("Publish container failed: " ^ err)))
+
+(** Test: Check container status *)
+let test_check_status () =
+  Mock_config.reset ();
+
+  let response_body = {|{
+    "status_code": "FINISHED",
+    "status": "Processing complete"
+  }|} in
+  Mock_http.set_response { status = 200; body = response_body; headers = [] };
+
+  Instagram.check_container_status
+    ~container_id:"container_12345"
+    ~access_token:"test_token"
+    (handle_result
+      (fun (status_code, status) ->
+        assert (status_code = "FINISHED");
+        assert (status = "Processing complete");
+        print_endline "PASS Check container status")
+      (fun err -> failwith ("Check status failed: " ^ err)))
+
+(** Test: Content validation *)
+let test_content_validation () =
+  (* Valid content *)
+  (match Instagram.validate_content ~text:"Hello Instagram! #test" with
+   | Ok () -> print_endline "PASS Valid content passes"
+   | Error e -> failwith ("Valid content failed: " ^ e));
+
+  (* Too long *)
+  let long_text = String.make 2201 'x' in
+  (match Instagram.validate_content ~text:long_text with
+   | Error msg when string_contains msg "2,200" ->
+       print_endline "PASS Long content rejected"
+   | _ -> failwith "Long content should fail");
+
+  (* Too many hashtags *)
+  let many_hashtags = String.concat " " (List.init 31 (fun i -> Printf.sprintf "#tag%d" i)) in
+  (match Instagram.validate_content ~text:many_hashtags with
+   | Error msg when string_contains msg "30 hashtags" ->
+       print_endline "PASS Too many hashtags rejected"
+   | _ -> failwith "Too many hashtags should fail")
+
+(** Test: Post single (full flow) *)
+let test_post_single () =
+  Mock_config.reset ();
+
+  let future_time =
+    let now = Ptime_clock.now () in
+    match Ptime.add_span now (Ptime.Span.of_int_s (30 * 86400)) with
+    | Some t -> Ptime.to_rfc3339 t
+    | None -> failwith "Failed to calculate future time"
+  in
+
+  let creds = {
+    access_token = "valid_token";
+    refresh_token = None;
+    expires_at = Some future_time;
+    token_type = "Bearer";
+  } in
+
+  Mock_config.set_credentials ~account_id:"test_account" ~credentials:creds;
+  Mock_config.set_ig_user_id ~account_id:"test_account" ~ig_user_id:"ig_123";
+
+  Mock_http.set_responses [
+    { status = 200; body = {|{"id": "container_12345"}|}; headers = [] };
+    { status = 200; body = {|{"status_code": "FINISHED", "status": "OK"}|}; headers = [] };
+    { status = 200; body = {|{"id": "media_67890"}|}; headers = [] };
+  ];
+
+  Instagram.post_single
+    ~account_id:"test_account"
+    ~text:"Test post"
+    ~media_urls:["https://example.com/image.jpg"]
+    (handle_outcome
+      (fun media_id ->
+        assert (media_id = "media_67890");
+        assert (List.length !Mock_config.sleep_calls > 0);
+        print_endline "PASS Post single (full flow)")
+      (fun err -> failwith ("Post single failed: " ^ err)))
+
+(** Test: Post requires media *)
+let test_post_requires_media () =
+  Mock_config.reset ();
+
+  Instagram.post_single
+    ~account_id:"test_account"
+    ~text:"Test"
+    ~media_urls:[]
+    (fun outcome ->
+      match outcome with
+      | Error_types.Failure _ -> print_endline "PASS Post requires media"
+      | _ -> failwith "Should fail without media")
+
+(** Test: post_single rejects unsupported media extension *)
+let test_post_single_rejects_unsupported_media () =
+  Mock_config.reset ();
+  Instagram.post_single
+    ~account_id:"test_account"
+    ~text:"Unsupported media"
+    ~media_urls:["https://example.com/file.avi"]
+    (function
+      | Error_types.Failure (Error_types.Validation_error errs) ->
+          let has_format_error = List.exists (function
+            | Error_types.Media_unsupported_format _ -> true
+            | _ -> false
+          ) errs in
+          assert has_format_error;
+          let requests = !Mock_http.requests in
+          assert (requests = []);
+          print_endline "PASS post_single rejects unsupported media"
+      | _ -> failwith "Expected media format validation error")
+
+(** Test: Polling does not publish when status checks keep failing *)
+let test_polling_no_publish_on_status_error () =
+  Mock_config.reset ();
+
+  Mock_http.set_response { status = 500; body = {|{"error":{"message":"boom"}}|}; headers = [] };
+
+  Instagram.poll_container_status
+    ~container_id:"container_123"
+    ~access_token:"token_123"
+    ~ig_user_id:"ig_123"
+    ~attempt:1
+    ~max_attempts:1
+    (fun _ -> failwith "Polling should not publish on status-check failure")
+    (fun _err ->
+      let requests = !Mock_http.requests in
+      let attempted_publish = List.exists (fun (_, url, _, _) -> string_contains url "media_publish") requests in
+      assert (not attempted_publish);
+      print_endline "PASS Polling does not publish on status-check errors")
+
+(** Test: OAuth API error mapping for token expiration *)
+let test_parse_api_error_token_expired () =
+  let err =
+    Instagram.parse_api_error
+      ~status_code:400
+      ~response_body:{|{"error":{"code":190,"message":"Invalid OAuth 2.0 Access Token"}}|}
+  in
+  match err with
+  | Error_types.Auth_error Error_types.Token_expired ->
+      print_endline "PASS OAuth API error mapping (token expired)"
+  | _ -> failwith "Expected Auth_error Token_expired"
+
+(** Test: User-friendly error response mapping for token expiration *)
+let test_parse_error_response_token_expired () =
+  let msg =
+    Instagram.parse_error_response
+      {|{"error":{"code":190,"message":"Invalid OAuth 2.0 Access Token"}}|}
+      400
+  in
+  if string_contains msg "reconnect" then
+    print_endline "PASS User-friendly OAuth error mapping"
+  else
+    failwith "Expected reconnect guidance for token expiration"
+
+(** Test: container creation returns structured auth error on API auth failure *)
+let test_create_container_structured_auth_error () =
+  Mock_config.reset ();
+  Mock_http.set_response {
+    status = 400;
+    body = {|{"error":{"code":190,"message":"Invalid OAuth 2.0 Access Token"}}|};
+    headers = [];
+  };
+
+  Instagram.create_image_container
+    ~ig_user_id:"ig_user_123"
+    ~access_token:"bad_token"
+    ~image_url:"https://example.com/image.jpg"
+    ~caption:"caption"
+    ~alt_text:None
+    ~is_carousel_item:false
+    (function
+      | Ok _ -> failwith "Expected auth error"
+      | Error (Error_types.Auth_error Error_types.Token_expired) ->
+          print_endline "PASS Structured auth error from container creation"
+      | Error _ -> failwith "Expected Token_expired auth error")
+
+(** Test: Standalone refresh_token in OAuth.Make *)
+let test_standalone_oauth_refresh_token () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"access_token":"refreshed_tok","expires_in":5184000}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.refresh_token
+    ~app_secret:"secret_abc"
+    ~access_token:"old_tok"
+    (handle_result
+      (fun creds ->
+        assert (creds.access_token = "refreshed_tok");
+        let requests = !Mock_http.requests in
+        let has_refresh_endpoint = List.exists (fun (_, url, _, _) ->
+          string_contains url "graph.instagram.com/refresh_access_token"
+        ) requests in
+        assert has_refresh_endpoint;
+        let has_proof = List.exists (fun (_, url, _, _) ->
+          match query_param url "appsecret_proof" with
+          | Some p -> String.length p = 64
+          | None -> false
+        ) requests in
+        assert has_proof;
+        print_endline "PASS Standalone OAuth refresh_token")
+      (fun err -> failwith ("Standalone OAuth refresh_token failed: " ^ err)))
+
+(** Run all tests *)
+let () =
+  print_endline "\n=== Instagram Standalone Provider Tests ===\n";
+
+  print_endline "--- OAuth Standalone Tests ---";
+  test_standalone_auth_url_endpoint ();
+  test_standalone_auth_url_enable_fb_login ();
+  test_standalone_auth_url_scopes_comma_separated ();
+  test_standalone_auth_url_response_type ();
+  test_standalone_auth_url_custom_scopes ();
+  test_standalone_exchange_code_happy_path_int_user_id ();
+  test_standalone_exchange_code_happy_path_string_user_id ();
+  test_standalone_exchange_code_normalizes_token_type ();
+  test_standalone_exchange_code_missing_user_id ();
+  test_standalone_exchange_code_http_error ();
+  test_standalone_exchange_long_lived_happy_path ();
+  test_standalone_exchange_long_lived_normalizes_token_type ();
+  test_standalone_exchange_long_lived_appsecret_proof ();
+  test_standalone_get_profile_happy_path ();
+  test_standalone_get_profile_no_picture ();
+  test_standalone_get_profile_fields_parameter ();
+  test_standalone_get_profile_missing_identifier ();
+  test_standalone_oauth_refresh_token ();
+
+  print_endline "\n--- Content Publishing Tests ---";
+  test_oauth_url ();
+  test_api_base_url_uses_instagram ();
+  test_rate_limit_parsing ();
+  test_create_container ();
+  test_publish_container ();
+  test_check_status ();
+  test_content_validation ();
+  test_post_single ();
+  test_post_requires_media ();
+  test_post_single_rejects_unsupported_media ();
+  test_polling_no_publish_on_status_error ();
+  test_parse_api_error_token_expired ();
+  test_parse_error_response_token_expired ();
+  test_create_container_structured_auth_error ();
+
+  print_endline "\n=== All standalone tests passed! ===\n"

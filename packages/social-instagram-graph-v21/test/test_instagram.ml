@@ -1673,6 +1673,403 @@ let test_insights_network_error_redacts_query_token () =
       | Ok _ -> failwith "Expected network error"
       | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
 
+(** {1 OAuth Standalone Tests} *)
+
+module OAuth_standalone_client = OAuth_standalone.Make(Mock_http)
+
+(** Test: Standalone OAuth authorization URL starts with correct endpoint *)
+let test_standalone_auth_url_endpoint () =
+  let url = OAuth_standalone.get_authorization_url
+    ~client_id:"test_app_id"
+    ~redirect_uri:"https://example.com/callback"
+    ~state:"state_abc"
+    ()
+  in
+  assert (String.length url > 0);
+  assert (string_contains url "https://api.instagram.com/oauth/authorize");
+  print_endline "✓ Standalone auth URL starts with correct endpoint"
+
+(** Test: Standalone OAuth authorization URL includes enable_fb_login=0 *)
+let test_standalone_auth_url_enable_fb_login () =
+  let url = OAuth_standalone.get_authorization_url
+    ~client_id:"test_app_id"
+    ~redirect_uri:"https://example.com/callback"
+    ~state:"state_abc"
+    ()
+  in
+  assert (string_contains url "enable_fb_login=0");
+  print_endline "✓ Standalone auth URL includes enable_fb_login=0"
+
+(** Test: Standalone OAuth authorization URL has comma-separated scopes *)
+let test_standalone_auth_url_scopes_comma_separated () =
+  let url = OAuth_standalone.get_authorization_url
+    ~client_id:"test_app_id"
+    ~redirect_uri:"https://example.com/callback"
+    ~state:"state_abc"
+    ()
+  in
+  (* Default scopes are write = [basic; content_publish], comma-separated *)
+  let scope_val = query_param url "scope" in
+  (match scope_val with
+   | Some s ->
+       assert (string_contains s ",");
+       assert (string_contains s "instagram_business_basic");
+       assert (string_contains s "instagram_business_content_publish")
+   | None -> failwith "Missing scope parameter");
+  print_endline "✓ Standalone auth URL has comma-separated scopes"
+
+(** Test: Standalone OAuth authorization URL has response_type=code *)
+let test_standalone_auth_url_response_type () =
+  let url = OAuth_standalone.get_authorization_url
+    ~client_id:"test_app_id"
+    ~redirect_uri:"https://example.com/callback"
+    ~state:"state_abc"
+    ()
+  in
+  assert (query_param url "response_type" = Some "code");
+  print_endline "✓ Standalone auth URL has response_type=code"
+
+(** Test: Standalone OAuth authorization URL supports custom scopes *)
+let test_standalone_auth_url_custom_scopes () =
+  let url = OAuth_standalone.get_authorization_url
+    ~client_id:"test_app_id"
+    ~redirect_uri:"https://example.com/callback"
+    ~state:"state_abc"
+    ~scopes:["instagram_business_basic"; "instagram_business_manage_comments"]
+    ()
+  in
+  let scope_val = query_param url "scope" in
+  (match scope_val with
+   | Some s ->
+       assert (string_contains s "instagram_business_basic");
+       assert (string_contains s "instagram_business_manage_comments");
+       assert (not (string_contains s "instagram_business_content_publish"))
+   | None -> failwith "Missing scope parameter");
+  print_endline "✓ Standalone auth URL supports custom scopes"
+
+(** Test: Standalone exchange_code happy path with user_id as int *)
+let test_standalone_exchange_code_happy_path_int_user_id () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"access_token":"short_tok_123","user_id":9876543210,"permissions":"instagram_business_basic,instagram_business_content_publish"}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.exchange_code
+    ~client_id:"app_id"
+    ~client_secret:"app_secret"
+    ~redirect_uri:"https://example.com/cb"
+    ~code:"auth_code_xyz"
+    (handle_result
+      (fun (creds, user_id) ->
+        assert (creds.access_token = "short_tok_123");
+        assert (creds.token_type = "Bearer");
+        assert (user_id = "9876543210");
+        (* Verify it was a POST request *)
+        let requests = !Mock_http.requests in
+        let has_post = List.exists (fun (meth, _, _, _) -> meth = "POST") requests in
+        assert has_post;
+        (* Verify Content-Type header *)
+        let has_form_header = List.exists (fun (_, _, headers, _) ->
+          List.exists (fun (k, v) -> k = "Content-Type" && v = "application/x-www-form-urlencoded") headers
+        ) requests in
+        assert has_form_header;
+        print_endline "✓ Standalone exchange_code happy path (int user_id)")
+      (fun err -> failwith ("Standalone exchange_code failed: " ^ err)))
+
+(** Test: Standalone exchange_code happy path with user_id as string *)
+let test_standalone_exchange_code_happy_path_string_user_id () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"access_token":"short_tok_456","user_id":"1234567890","token_type":"bearer"}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.exchange_code
+    ~client_id:"app_id"
+    ~client_secret:"app_secret"
+    ~redirect_uri:"https://example.com/cb"
+    ~code:"auth_code_abc"
+    (handle_result
+      (fun (creds, user_id) ->
+        assert (creds.access_token = "short_tok_456");
+        assert (user_id = "1234567890");
+        print_endline "✓ Standalone exchange_code happy path (string user_id)")
+      (fun err -> failwith ("Standalone exchange_code string user_id failed: " ^ err)))
+
+(** Test: Standalone exchange_code normalizes token_type to Bearer *)
+let test_standalone_exchange_code_normalizes_token_type () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"access_token":"tok","user_id":"123","token_type":"bearer"}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.exchange_code
+    ~client_id:"app_id"
+    ~client_secret:"app_secret"
+    ~redirect_uri:"https://example.com/cb"
+    ~code:"code"
+    (handle_result
+      (fun (creds, _user_id) ->
+        assert (creds.token_type = "Bearer");
+        print_endline "✓ Standalone exchange_code normalizes token_type to Bearer")
+      (fun err -> failwith ("Standalone exchange_code token_type failed: " ^ err)))
+
+(** Test: Standalone exchange_code error when user_id is missing *)
+let test_standalone_exchange_code_missing_user_id () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"access_token":"tok_no_uid","token_type":"bearer"}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.exchange_code
+    ~client_id:"app_id"
+    ~client_secret:"app_secret"
+    ~redirect_uri:"https://example.com/cb"
+    ~code:"code"
+    (function
+      | Ok _ -> failwith "Expected error for missing user_id"
+      | Error (Error_types.Internal_error msg) when string_contains msg "user_id" ->
+          print_endline "✓ Standalone exchange_code error on missing user_id"
+      | Error err -> failwith ("Unexpected error type: " ^ Error_types.error_to_string err))
+
+(** Test: Standalone exchange_code handles HTTP error response *)
+let test_standalone_exchange_code_http_error () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 400;
+    body = {|{"error":{"code":190,"message":"Invalid OAuth 2.0 Access Token"}}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.exchange_code
+    ~client_id:"app_id"
+    ~client_secret:"app_secret"
+    ~redirect_uri:"https://example.com/cb"
+    ~code:"bad_code"
+    (function
+      | Ok _ -> failwith "Expected error for HTTP 400"
+      | Error (Error_types.Auth_error Error_types.Token_expired) ->
+          print_endline "✓ Standalone exchange_code handles HTTP error"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: Standalone exchange_for_long_lived_token happy path *)
+let test_standalone_exchange_long_lived_happy_path () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"access_token":"long_lived_tok_abc","token_type":"bearer","expires_in":5184000}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.exchange_for_long_lived_token
+    ~client_secret:"app_secret"
+    ~short_lived_token:"short_tok"
+    (handle_result
+      (fun creds ->
+        assert (creds.access_token = "long_lived_tok_abc");
+        assert (creds.token_type = "Bearer");
+        assert (creds.expires_at <> None);
+        (* Verify it was a GET request to the correct endpoint *)
+        let requests = !Mock_http.requests in
+        let has_correct_url = List.exists (fun (meth, url, _, _) ->
+          meth = "GET"
+          && string_contains url "graph.instagram.com/access_token"
+          && query_param url "grant_type" = Some "ig_exchange_token"
+        ) requests in
+        assert has_correct_url;
+        print_endline "✓ Standalone exchange_for_long_lived_token happy path")
+      (fun err -> failwith ("Standalone exchange_for_long_lived_token failed: " ^ err)))
+
+(** Test: Standalone exchange_for_long_lived_token normalizes token_type *)
+let test_standalone_exchange_long_lived_normalizes_token_type () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"access_token":"ll_tok","token_type":"bearer","expires_in":5184000}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.exchange_for_long_lived_token
+    ~client_secret:"secret"
+    ~short_lived_token:"sl_tok"
+    (handle_result
+      (fun creds ->
+        assert (creds.token_type = "Bearer");
+        print_endline "✓ Standalone exchange_for_long_lived_token normalizes token_type")
+      (fun err -> failwith ("Standalone long-lived token_type failed: " ^ err)))
+
+(** Test: Standalone exchange_for_long_lived_token with appsecret_proof *)
+let test_standalone_exchange_long_lived_appsecret_proof () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"access_token":"ll_tok","token_type":"bearer","expires_in":5184000}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.exchange_for_long_lived_token
+    ~client_secret:"secret"
+    ~short_lived_token:"sl_tok"
+    ~app_secret:"my_app_secret"
+    (handle_result
+      (fun _creds ->
+        let requests = !Mock_http.requests in
+        let has_proof = List.exists (fun (_, url, _, _) ->
+          match query_param url "appsecret_proof" with
+          | Some p -> String.length p = 64
+          | None -> false
+        ) requests in
+        assert has_proof;
+        print_endline "✓ Standalone exchange_for_long_lived_token with appsecret_proof")
+      (fun err -> failwith ("Standalone long-lived appsecret_proof failed: " ^ err)))
+
+(** Test: Standalone get_profile happy path *)
+let test_standalone_get_profile_happy_path () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"id":"12345","username":"testuser","name":"Test User","profile_picture_url":"https://example.com/pic.jpg"}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.get_profile
+    ~access_token:"valid_tok"
+    (handle_result
+      (fun (profile : standalone_profile) ->
+        assert (profile.user_id = "12345");
+        assert (profile.username = "testuser");
+        assert (profile.name = "Test User");
+        assert (profile.profile_picture_url = Some "https://example.com/pic.jpg");
+        print_endline "✓ Standalone get_profile happy path")
+      (fun err -> failwith ("Standalone get_profile failed: " ^ err)))
+
+(** Test: Standalone get_profile with missing profile_picture_url *)
+let test_standalone_get_profile_no_picture () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"id":"67890","username":"nopic_user","name":"No Pic"}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.get_profile
+    ~access_token:"valid_tok"
+    (handle_result
+      (fun (profile : standalone_profile) ->
+        assert (profile.user_id = "67890");
+        assert (profile.username = "nopic_user");
+        assert (profile.profile_picture_url = None);
+        print_endline "✓ Standalone get_profile with missing profile_picture_url")
+      (fun err -> failwith ("Standalone get_profile no picture failed: " ^ err)))
+
+(** Test: Standalone get_profile requests 'id' field (not 'user_id') *)
+let test_standalone_get_profile_fields_parameter () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"id":"99999","username":"u","name":"N"}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.get_profile
+    ~access_token:"valid_tok"
+    (handle_result
+      (fun _profile ->
+        let requests = !Mock_http.requests in
+        let has_id_field = List.exists (fun (_, url, _, _) ->
+          match query_param url "fields" with
+          | Some f -> string_contains f "id" && not (string_contains f "user_id")
+          | None -> false
+        ) requests in
+        assert has_id_field;
+        print_endline "✓ Standalone get_profile requests 'id' field (not 'user_id')")
+      (fun err -> failwith ("Standalone get_profile fields failed: " ^ err)))
+
+(** Test: Standalone get_profile error on missing identifier *)
+let test_standalone_get_profile_missing_identifier () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"username":"orphan_user","name":"No ID"}|};
+    headers = [];
+  };
+
+  OAuth_standalone_client.get_profile
+    ~access_token:"valid_tok"
+    (function
+      | Ok _ -> failwith "Expected error for missing identifier"
+      | Error (Error_types.Internal_error msg) when string_contains msg "identifier" ->
+          print_endline "✓ Standalone get_profile error on missing identifier"
+      | Error err -> failwith ("Unexpected error: " ^ Error_types.error_to_string err))
+
+(** Test: api_base_url=None uses graph.facebook.com *)
+let test_api_base_url_default () =
+  Mock_config.reset ();
+  (* Mock_config has api_base_url = None *)
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"data": []}|};
+    headers = [];
+  };
+
+  Instagram.get_account_audience_insights
+    ~id:"ig_user_123"
+    ~access_token:"tok"
+    ~since:"2025-01-01"
+    ~until:"2025-01-07"
+    (handle_result
+      (fun _insights ->
+        let requests = !Mock_http.requests in
+        let uses_facebook_graph = List.exists (fun (_, url, _, _) ->
+          string_contains url "graph.facebook.com"
+        ) requests in
+        assert uses_facebook_graph;
+        print_endline "✓ api_base_url=None uses graph.facebook.com")
+      (fun err -> failwith ("api_base_url default failed: " ^ err)))
+
+(** Test: api_base_url=Some override uses custom base URL *)
+let test_api_base_url_override () =
+  (* Create a separate config with overridden api_base_url *)
+  let module Override_config = struct
+    include Mock_config
+
+    let api_base_url = Some "https://graph.instagram.com/v21.0"
+  end in
+  let module Instagram_override = Make(Override_config) in
+
+  Override_config.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"data": []}|};
+    headers = [];
+  };
+
+  Instagram_override.get_account_audience_insights
+    ~id:"ig_user_123"
+    ~access_token:"tok"
+    ~since:"2025-01-01"
+    ~until:"2025-01-07"
+    (handle_result
+      (fun _insights ->
+        let requests = !Mock_http.requests in
+        let uses_instagram_graph = List.exists (fun (_, url, _, _) ->
+          string_contains url "graph.instagram.com/v21.0"
+        ) requests in
+        assert uses_instagram_graph;
+        let uses_facebook_graph = List.exists (fun (_, url, _, _) ->
+          string_contains url "graph.facebook.com"
+        ) requests in
+        assert (not uses_facebook_graph);
+        print_endline "✓ api_base_url=Some override uses custom base URL")
+      (fun err -> failwith ("api_base_url override failed: " ^ err)))
+
 (** Run all tests *)
 let () =
   print_endline "\n=== Instagram Provider Tests ===\n";
@@ -1745,5 +2142,26 @@ let () =
   test_media_insights_parser ();
   test_canonical_insights_adapters ();
   test_insights_network_error_redacts_query_token ();
+
+  print_endline "\n--- OAuth Standalone Tests ---";
+  test_standalone_auth_url_endpoint ();
+  test_standalone_auth_url_enable_fb_login ();
+  test_standalone_auth_url_scopes_comma_separated ();
+  test_standalone_auth_url_response_type ();
+  test_standalone_auth_url_custom_scopes ();
+  test_standalone_exchange_code_happy_path_int_user_id ();
+  test_standalone_exchange_code_happy_path_string_user_id ();
+  test_standalone_exchange_code_normalizes_token_type ();
+  test_standalone_exchange_code_missing_user_id ();
+  test_standalone_exchange_code_http_error ();
+  test_standalone_exchange_long_lived_happy_path ();
+  test_standalone_exchange_long_lived_normalizes_token_type ();
+  test_standalone_exchange_long_lived_appsecret_proof ();
+  test_standalone_get_profile_happy_path ();
+  test_standalone_get_profile_no_picture ();
+  test_standalone_get_profile_fields_parameter ();
+  test_standalone_get_profile_missing_identifier ();
+  test_api_base_url_default ();
+  test_api_base_url_override ();
 
   print_endline "\n=== All tests passed! ===\n"

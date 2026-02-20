@@ -95,9 +95,8 @@ let post_to_page account_id =
 Required Facebook permissions:
 
 - `pages_read_engagement` - Read page insights
-- `pages_manage_posts` - Create and manage posts
+- `pages_manage_posts` - Create and manage posts (including videos and Reels)
 - `pages_show_list` - List user's pages
-- `publish_video` - Required for posting Reels
 
 ## Configuration
 

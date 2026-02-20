@@ -511,19 +511,22 @@ module Make (Config : CONFIG) = struct
       true
     with Not_found -> false
 
+  (* Note: publish_video is NOT a real Facebook permission. Video and Reel
+     publishing on Pages requires only pages_manage_posts with a Page access
+     token. See: https://developers.facebook.com/docs/video-api/guides/publishing *)
   let provider_required_permissions = [
     "pages_read_engagement";
     "pages_manage_posts";
     "pages_show_list";
-    "publish_video";
   ]
 
   let permissions_for_path path =
     let p = String.lowercase_ascii path in
     if contains_substring p "me/accounts" then
       ["pages_show_list"]
-    else if contains_substring p "video_reels" || contains_substring p "video_stories" then
-      ["pages_manage_posts"; "publish_video"]
+    else if contains_substring p "video_reels" || contains_substring p "video_stories"
+         || contains_substring p "/videos" then
+      ["pages_manage_posts"]
     else if contains_substring p "photo_stories" || contains_substring p "photos" || contains_substring p "feed" then
       ["pages_manage_posts"]
     else
@@ -1073,13 +1076,13 @@ module Make (Config : CONFIG) = struct
                                 on_success video_id
                             else
                               on_error (parse_api_error_with_permissions
-                                ~required_permissions:["pages_manage_posts"; "publish_video"]
+                                ~required_permissions:["pages_manage_posts"]
                                 ~status_code:finish_response.status
                                 ~response_body:finish_response.body))
                           (fun err -> on_error (Error_types.Internal_error err))
                       else
                         on_error (parse_api_error_with_permissions
-                          ~required_permissions:["pages_manage_posts"; "publish_video"]
+                          ~required_permissions:["pages_manage_posts"]
                           ~status_code:upload_response.status
                           ~response_body:upload_response.body))
                     (fun err -> on_error (Error_types.Internal_error err))
@@ -1087,7 +1090,7 @@ module Make (Config : CONFIG) = struct
                   on_error (Error_types.Internal_error (Printf.sprintf "Failed to parse init response: %s" (Printexc.to_string e)))
               else
                 on_error (parse_api_error_with_permissions
-                  ~required_permissions:["pages_manage_posts"; "publish_video"]
+                  ~required_permissions:["pages_manage_posts"]
                   ~status_code:init_response.status
                   ~response_body:init_response.body))
             (fun err -> on_error (Error_types.Internal_error err))
@@ -1304,13 +1307,13 @@ module Make (Config : CONFIG) = struct
                                 on_result (Ok video_id)
                             else
                               on_result (Error (parse_api_error_with_permissions
-                                ~required_permissions:["pages_manage_posts"; "publish_video"]
+                                ~required_permissions:["pages_manage_posts"]
                                 ~status_code:finish_response.status
                                 ~response_body:finish_response.body)))
                           (fun err -> on_result (Error (Error_types.Internal_error err)))
                       else
                         on_result (Error (parse_api_error_with_permissions
-                          ~required_permissions:["pages_manage_posts"; "publish_video"]
+                          ~required_permissions:["pages_manage_posts"]
                           ~status_code:upload_response.status
                           ~response_body:upload_response.body)))
                     (fun err -> on_result (Error (Error_types.Internal_error err)))
@@ -1318,7 +1321,7 @@ module Make (Config : CONFIG) = struct
                   on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse video story init response: %s" (Printexc.to_string e))))
               else
                 on_result (Error (parse_api_error_with_permissions
-                  ~required_permissions:["pages_manage_posts"; "publish_video"]
+                  ~required_permissions:["pages_manage_posts"]
                   ~status_code:init_response.status
                   ~response_body:init_response.body)))
             (fun err -> on_result (Error (Error_types.Internal_error err)))

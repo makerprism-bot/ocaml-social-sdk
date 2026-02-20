@@ -786,7 +786,7 @@ let test_standalone_oauth_refresh_token () =
   Mock_http.reset ();
   Mock_http.set_response {
     status = 200;
-    body = {|{"access_token":"refreshed_tok","expires_in":5184000}|};
+    body = {|{"access_token":"refreshed_tok","token_type":"bearer","expires_in":5184000}|};
     headers = [];
   };
 
@@ -796,6 +796,7 @@ let test_standalone_oauth_refresh_token () =
     (handle_result
       (fun creds ->
         assert (creds.access_token = "refreshed_tok");
+        assert (creds.token_type = "Bearer");
         let requests = !Mock_http.requests in
         let has_refresh_endpoint = List.exists (fun (_, url, _, _) ->
           string_contains url "graph.instagram.com/refresh_access_token"
@@ -807,8 +808,53 @@ let test_standalone_oauth_refresh_token () =
           | None -> false
         ) requests in
         assert has_proof;
-        print_endline "PASS Standalone OAuth refresh_token")
+        print_endline "PASS Standalone OAuth refresh_token (with token_type normalization)")
       (fun err -> failwith ("Standalone OAuth refresh_token failed: " ^ err)))
+
+(** Test: OAuth.Make.exchange_code calls on_response callback *)
+let test_standalone_exchange_code_on_response () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"access_token":"tok","user_id":"123","token_type":"bearer"}|};
+    headers = [("X-App-Usage", {|{"call_count":5,"total_cputime":10,"total_time":3}|})];
+  };
+
+  let callback_called = ref false in
+  let on_response _response = callback_called := true in
+
+  OAuth_standalone_client.exchange_code
+    ~client_id:"app_id"
+    ~client_secret:"app_secret"
+    ~redirect_uri:"https://example.com/cb"
+    ~code:"code"
+    ~on_response
+    (handle_result
+      (fun (_creds, _user_id) ->
+        assert !callback_called;
+        print_endline "PASS Standalone exchange_code calls on_response callback")
+      (fun err -> failwith ("Standalone exchange_code on_response failed: " ^ err)))
+
+(** Test: OAuth.Make.refresh_token calls on_response callback *)
+let test_standalone_refresh_token_on_response () =
+  Mock_http.reset ();
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"access_token":"refreshed_tok","token_type":"bearer","expires_in":5184000}|};
+    headers = [("X-App-Usage", {|{"call_count":12,"total_cputime":8,"total_time":4}|})];
+  };
+
+  let callback_called = ref false in
+  let on_response _response = callback_called := true in
+
+  OAuth_standalone_client.refresh_token
+    ~access_token:"old_tok"
+    ~on_response
+    (handle_result
+      (fun _creds ->
+        assert !callback_called;
+        print_endline "PASS Standalone refresh_token calls on_response callback")
+      (fun err -> failwith ("Standalone refresh_token on_response failed: " ^ err)))
 
 (** Run all tests *)
 let () =
@@ -833,6 +879,8 @@ let () =
   test_standalone_get_profile_fields_parameter ();
   test_standalone_get_profile_missing_identifier ();
   test_standalone_oauth_refresh_token ();
+  test_standalone_exchange_code_on_response ();
+  test_standalone_refresh_token_on_response ();
 
   print_endline "\n--- Content Publishing Tests ---";
   test_oauth_url ();

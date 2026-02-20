@@ -43,10 +43,10 @@ type standalone_profile = {
     - Long-lived tokens can be refreshed using ig_refresh_token grant
     - Must refresh before expiration (within 60 days)
 
-    Required environment variables (or pass directly to functions):
-    - INSTAGRAM_APP_ID: App ID from Facebook Developer Portal (same as Facebook App ID)
-    - INSTAGRAM_APP_SECRET: App Secret
-    - INSTAGRAM_REDIRECT_URI: Registered callback URL
+    Required configuration values (passed as function parameters):
+    - App ID from Facebook Developer Portal (same as Facebook App ID)
+    - App Secret
+    - Redirect URI (registered callback URL)
 *)
 module OAuth = struct
   let compute_app_secret_proof ~app_secret ~access_token =
@@ -67,7 +67,9 @@ module OAuth = struct
       | None -> None
     in
     let token_type =
-      try json |> member "token_type" |> to_string
+      try
+        let t = json |> member "token_type" |> to_string in
+        if String.lowercase_ascii t = "bearer" then "Bearer" else t
       with _ -> "Bearer"
     in
     ({
@@ -224,7 +226,7 @@ module OAuth = struct
         @param code Authorization code from callback
         @param on_result Continuation receiving api_result with credentials
     *)
-    let exchange_code ~client_id ~client_secret ~redirect_uri ~code on_result =
+    let exchange_code ~client_id ~client_secret ~redirect_uri ~code ?on_response on_result =
       let params = [
         ("client_id", [client_id]);
         ("client_secret", [client_secret]);
@@ -240,6 +242,7 @@ module OAuth = struct
 
       Http.post ~headers ~body url
         (fun response ->
+          (match on_response with Some f -> f response | None -> ());
           if response.status >= 200 && response.status < 300 then
             try
               let json = Yojson.Basic.from_string response.body in
@@ -250,10 +253,7 @@ module OAuth = struct
                   try json |> member "user_id" |> to_int |> string_of_int
                   with _ -> ""
               in
-              let creds =
-                let c = parse_credentials_from_json ~default_expires_in:3600 json in
-                { c with token_type = "Bearer" }
-              in
+              let creds = parse_credentials_from_json ~default_expires_in:3600 json in
               if user_id = "" then
                 on_result (Error (Error_types.Internal_error "Token exchange response missing user_id"))
               else
@@ -274,7 +274,7 @@ module OAuth = struct
         @param app_secret Optional app secret for appsecret_proof
         @param on_result Continuation receiving api_result with long-lived credentials
     *)
-    let exchange_for_long_lived_token ~client_secret ~short_lived_token ?app_secret on_result =
+    let exchange_for_long_lived_token ~client_secret ~short_lived_token ?app_secret ?on_response on_result =
       let params = [
         ("grant_type", ["ig_exchange_token"]);
         ("client_secret", [client_secret]);
@@ -289,13 +289,11 @@ module OAuth = struct
 
       Http.get url
         (fun response ->
+          (match on_response with Some f -> f response | None -> ());
           if response.status >= 200 && response.status < 300 then
             try
               let json = Yojson.Basic.from_string response.body in
-              let creds =
-                let c = parse_credentials_from_json ~default_expires_in:5184000 json in
-                { c with token_type = "Bearer" }
-              in
+              let creds = parse_credentials_from_json ~default_expires_in:5184000 json in
               on_result (Ok creds)
             with e ->
               on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse long-lived token response: %s" (Printexc.to_string e))))
@@ -311,7 +309,7 @@ module OAuth = struct
         @param access_token A valid access token (short-lived or long-lived)
         @param on_result Continuation receiving api_result with standalone_profile
     *)
-    let get_profile ~access_token on_result =
+    let get_profile ~access_token ?on_response on_result =
       let params = [
         ("fields", ["id,username,name,profile_picture_url"]);
         ("access_token", [access_token]);
@@ -321,6 +319,7 @@ module OAuth = struct
 
       Http.get url
         (fun response ->
+          (match on_response with Some f -> f response | None -> ());
           if response.status >= 200 && response.status < 300 then
             try
               let json = Yojson.Basic.from_string response.body in
@@ -363,7 +362,7 @@ module OAuth = struct
         @param access_token The current long-lived token to refresh
         @param on_result Continuation receiving api_result with refreshed credentials
     *)
-    let refresh_token ?app_secret ~access_token on_result =
+    let refresh_token ?app_secret ~access_token ?on_response on_result =
       let params = [
         ("grant_type", ["ig_refresh_token"]);
         ("access_token", [access_token]);
@@ -377,6 +376,7 @@ module OAuth = struct
 
       Http.get url
         (fun response ->
+          (match on_response with Some f -> f response | None -> ());
           if response.status >= 200 && response.status < 300 then
             try
               let json = Yojson.Basic.from_string response.body in
@@ -659,7 +659,6 @@ module Make (Config : CONFIG) = struct
             let credentials =
               OAuth.parse_credentials_from_json ~default_expires_in:5184000 json
             in
-            let credentials = { credentials with token_type = "Bearer" } in
             on_success credentials
           with e ->
             on_error (Printf.sprintf "Failed to parse refresh response: %s" (Printexc.to_string e))
@@ -1657,10 +1656,10 @@ module Make (Config : CONFIG) = struct
 
   let exchange_for_long_lived_token ~client_secret ~short_lived_token on_success on_error =
     OAuth_http.exchange_for_long_lived_token ~client_secret ~short_lived_token
+      ~on_response:update_rate_limits
       (function
         | Ok credentials ->
-            let normalized = { credentials with token_type = "Bearer" } in
-            on_success normalized
+            on_success credentials
         | Error err -> on_error (Error_types.error_to_string err))
 
   (** Exchange OAuth code for a long-lived access token (~60 days).
@@ -1676,6 +1675,7 @@ module Make (Config : CONFIG) = struct
       on_error "Instagram OAuth credentials not configured"
     else
       OAuth_http.exchange_code ~client_id ~client_secret ~redirect_uri ~code
+        ~on_response:update_rate_limits
         (function
           | Ok (short_lived_creds, _user_id) ->
               (* Immediately exchange for long-lived token (60 days) *)

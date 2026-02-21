@@ -321,6 +321,7 @@ type post_info = {
   disable_comment : bool;
   disable_stitch : bool;
   video_cover_timestamp_ms : int option;
+  is_aigc : bool;  (** Whether the video is AI-generated content *)
 }
 
 (** Creator information returned by TikTok *)
@@ -489,9 +490,9 @@ let validate_caption text =
 (** {1 Helper Functions} *)
 
 (** Create post_info with defaults *)
-let make_post_info ~title ?(privacy_level=SelfOnly) ?(disable_duet=false) 
-    ?(disable_comment=false) ?(disable_stitch=false) ?video_cover_timestamp_ms () =
-  { title; privacy_level; disable_duet; disable_comment; disable_stitch; video_cover_timestamp_ms }
+let make_post_info ~title ?(privacy_level=SelfOnly) ?(disable_duet=false)
+    ?(disable_comment=false) ?(disable_stitch=false) ?video_cover_timestamp_ms ?(is_aigc=false) () =
+  { title; privacy_level; disable_duet; disable_comment; disable_stitch; video_cover_timestamp_ms; is_aigc }
 
 (** {1 JSON Serialization} *)
 
@@ -502,6 +503,7 @@ let post_info_to_json info =
     ("disable_duet", `Bool info.disable_duet);
     ("disable_comment", `Bool info.disable_comment);
     ("disable_stitch", `Bool info.disable_stitch);
+    ("is_aigc", `Bool info.is_aigc);
   ] in
   let with_cover = match info.video_cover_timestamp_ms with
     | Some ms -> ("video_cover_timestamp_ms", `Int ms) :: base
@@ -1378,23 +1380,25 @@ module Make (Config : CONFIG) = struct
   let post_video ~account_id ~caption ~video_content
       ?(content_type="video/mp4")
       ?(upload_chunk_size_bytes=default_upload_chunk_size_bytes)
-      ?(privacy_level=SelfOnly) 
-      ?(disable_duet=false) 
-      ?(disable_comment=false) 
+      ?(privacy_level=SelfOnly)
+      ?(disable_duet=false)
+      ?(disable_comment=false)
       ?(disable_stitch=false)
       ?video_cover_timestamp_ms
+      ?(is_aigc=false)
       on_result =
     let caption_len = String.length caption in
     if caption_len > max_caption_length then
       on_result (Error (Error_types.Validation_error [Error_types.Text_too_long { length = caption_len; max = max_caption_length }]))
     else
-        let post_info = make_post_info 
-          ~title:caption 
-          ~privacy_level 
-          ~disable_duet 
-          ~disable_comment 
+        let post_info = make_post_info
+          ~title:caption
+          ~privacy_level
+          ~disable_duet
+          ~disable_comment
           ~disable_stitch
           ?video_cover_timestamp_ms
+          ~is_aigc
           ()
         in
         let video_size = String.length video_content in
@@ -1443,9 +1447,10 @@ module Make (Config : CONFIG) = struct
   let post_video_from_url ~account_id ~caption ~video_url
       ?(privacy_level=SelfOnly)
       ?(disable_duet=false)
-      ?(disable_comment=false) 
+      ?(disable_comment=false)
       ?(disable_stitch=false)
       ?video_cover_timestamp_ms
+      ?(is_aigc=false)
       ?(upload_chunk_size_bytes=default_upload_chunk_size_bytes)
       ?(validate_before_upload=false)
       on_result =
@@ -1502,7 +1507,7 @@ module Make (Config : CONFIG) = struct
                 ~content_type:effective_content_type
                 ~upload_chunk_size_bytes
                 ~privacy_level ~disable_duet ~disable_comment ~disable_stitch
-                ?video_cover_timestamp_ms
+                ?video_cover_timestamp_ms ~is_aigc
                 on_result)
         else
           if response.status = 404 then
@@ -1516,7 +1521,10 @@ module Make (Config : CONFIG) = struct
       @param validate_media_before_upload When true, validates video size after download.
              Default: false
   *)
-  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) ?(validate_media_before_upload=false) on_result =
+  let post_single ~account_id ~text ~media_urls ?(alt_texts=[])
+      ?(privacy_level=SelfOnly) ?(disable_duet=false) ?(disable_comment=false)
+      ?(disable_stitch=false) ?video_cover_timestamp_ms ?(is_aigc=false)
+      ?(validate_media_before_upload=false) on_result =
     let _ = alt_texts in (* TikTok doesn't support alt text *)
     let media_count = List.length media_urls in
     match validate_post ~text ~media_count () with
@@ -1528,13 +1536,15 @@ module Make (Config : CONFIG) = struct
           on_result (Error_types.Failure (Error_types.Validation_error [Error_types.Invalid_url video_url]))
         else
           post_video_from_url ~account_id ~caption:text ~video_url
+            ~privacy_level ~disable_duet ~disable_comment ~disable_stitch
+            ?video_cover_timestamp_ms ~is_aigc
             ~validate_before_upload:validate_media_before_upload
             (function
               | Ok publish_id -> on_result (Error_types.Success publish_id)
               | Error err -> on_result (Error_types.Failure err))
   
   (** Post thread (TikTok doesn't support threads, posts videos separately) *)
-  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) on_result =
+  let post_thread ~account_id ~texts ~media_urls_per_post ?(alt_texts_per_post=[]) ?(is_aigc=false) on_result =
     let _ = alt_texts_per_post in
     let media_counts = List.map List.length media_urls_per_post in
     match validate_thread ~texts ~media_counts () with
@@ -1567,7 +1577,7 @@ module Make (Config : CONFIG) = struct
           | text :: rest_texts, urls :: rest_media ->
               (* Validation ensures urls is non-empty *)
               let video_url = List.hd urls in
-              post_video_from_url ~account_id ~caption:text ~video_url
+              post_video_from_url ~account_id ~caption:text ~video_url ~is_aigc
                 (function
                   | Ok post_id -> post_all (post_id :: acc) (post_index + 1) rest_texts rest_media
                   | Error err ->

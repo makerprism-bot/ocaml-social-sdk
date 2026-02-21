@@ -1007,7 +1007,7 @@ module Make (Config : CONFIG) = struct
     else
       msg
 
-  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) ?(validate_media_before_upload=false) on_result =
+  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) ?(board_id="") ?(title="") ?(link="") ?(validate_media_before_upload=false) on_result =
     let media_count = List.length media_urls in
     match validate_post ~text ~media_count () with
     | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
@@ -1017,16 +1017,23 @@ module Make (Config : CONFIG) = struct
         let alt_text = try List.nth alt_texts 0 with _ -> None in
         ensure_valid_token ~account_id
           (fun access_token ->
-            get_default_board ~access_token
-              (fun board_id ->
+            let continue_with_board resolved_board_id =
+                let pin_title =
+                  if title <> "" then title
+                  else String.sub text 0 (min (String.length text) max_title_length)
+                in
                 let create_pin_with_media ~media_source ~alt_text_opt =
                   let url = pinterest_api_base ^ "/pins" in
                   let base_fields = [
-                    ("board_id", `String board_id);
-                    ("title", `String (String.sub text 0 (min (String.length text) max_title_length)));
+                    ("board_id", `String resolved_board_id);
+                    ("title", `String pin_title);
                     ("description", `String text);
                     ("media_source", media_source);
                   ] in
+                  let base_fields =
+                    if link <> "" then ("link", `String link) :: base_fields
+                    else base_fields
+                  in
                   let pin_fields = match alt_text_opt with
                     | Some alt when String.length alt > 0 -> ("alt_text", `String alt) :: base_fields
                     | _ -> base_fields
@@ -1117,8 +1124,14 @@ module Make (Config : CONFIG) = struct
                         post_as_image ~image_url:first_media_url
                       else
                         on_result (Error_types.Failure (Error_types.Internal_error (format_video_upload_error err)))))
-                    ())
-              (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
+                    ()
+            in
+            if board_id <> "" then
+              continue_with_board board_id
+            else
+              get_default_board ~access_token
+                (fun resolved_board_id -> continue_with_board resolved_board_id)
+                (fun err -> on_result (Error_types.Failure (Error_types.Internal_error err))))
           (fun err -> on_result (Error_types.Failure err))
   
   (** Post thread (Pinterest doesn't support threads, posts only first item)

@@ -1265,7 +1265,7 @@ module Make (Config : CONFIG) = struct
              download but before upload. Practical limit: 2GB.
              Default: false
   *)
-  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) ?(validate_media_before_upload=false) on_result =
+  let post_single ~account_id ~text ~media_urls ?(alt_texts=[]) ?(title="") ?(description="") ?(privacy_status="public") ?(tags=[]) ?(made_for_kids=false) ?(category_id="22") ?(validate_media_before_upload=false) on_result =
     let _ = alt_texts in (* YouTube doesn't support alt text for videos *)
     let media_count = List.length media_urls in
     match validate_post ~text ~media_count () with
@@ -1281,13 +1281,13 @@ module Make (Config : CONFIG) = struct
                 if video_response.status >= 200 && video_response.status < 300 then
                   let video_data = video_response.body in
                   let file_size = String.length video_data in
-                  
+
                   (* Validate if requested *)
                   let validation_result =
                     if validate_media_before_upload then
                       let media : Platform_types.post_media = {
                         media_type = Platform_types.Video;
-                        mime_type = List.assoc_opt "content-type" video_response.headers 
+                        mime_type = List.assoc_opt "content-type" video_response.headers
                                     |> Option.value ~default:"video/mp4";
                         file_size_bytes = file_size;
                         width = None;
@@ -1299,27 +1299,41 @@ module Make (Config : CONFIG) = struct
                     else
                       Ok ()
                   in
-                  
+
                   (match validation_result with
                   | Error errs -> on_result (Error_types.Failure (Error_types.Validation_error errs))
                   | Ok () ->
-                  let content_type = 
+                  let content_type =
                     match List.assoc_opt "content-type" video_response.headers with
                     | Some ct -> ct
                     | None -> "video/mp4"
                   in
-                  
+
+                  (* Resolve metadata: use explicit params or derive from text *)
+                  let resolved_title =
+                    if title <> "" then title
+                    else String.sub text 0 (min (String.length text) max_title_length)
+                  in
+                  let resolved_description =
+                    if description <> "" then description
+                    else text ^ " #Shorts"
+                  in
+                  let resolved_tags =
+                    if tags <> [] then List.map (fun t -> `String t) tags
+                    else [`String "shorts"; `String "short"]
+                  in
+
                   (* Step 1: Initialize resumable upload with metadata *)
                   let video_metadata = `Assoc [
                     ("snippet", `Assoc [
-                      ("title", `String (String.sub text 0 (min (String.length text) max_title_length)));
-                      ("description", `String (text ^ " #Shorts"));
-                      ("tags", `List [`String "shorts"; `String "short"]);
-                      ("categoryId", `String "22"); (* People & Blogs *)
+                      ("title", `String resolved_title);
+                      ("description", `String resolved_description);
+                      ("tags", `List resolved_tags);
+                      ("categoryId", `String category_id);
                     ]);
                     ("status", `Assoc [
-                      ("privacyStatus", `String "public");
-                      ("selfDeclaredMadeForKids", `Bool false);
+                      ("privacyStatus", `String privacy_status);
+                      ("selfDeclaredMadeForKids", `Bool made_for_kids);
                     ]);
                   ] in
                   

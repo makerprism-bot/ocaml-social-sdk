@@ -107,12 +107,14 @@ module Mock_config = struct
   let credentials_store = ref []
   let credentials_error_override = ref None
   let update_credentials_error_override = ref None
+  let health_status_updates = ref []
 
   let reset () =
     env_vars := [];
     credentials_store := [];
     credentials_error_override := None;
     update_credentials_error_override := None;
+    health_status_updates := [];
     Mock_http.reset ()
 
   let get_env key =
@@ -136,7 +138,8 @@ module Mock_config = struct
   let encrypt value on_success _on_error = on_success value
   let decrypt value on_success _on_error = on_success value
 
-  let update_health_status ~account_id:_ ~status:_ ~error_message:_ on_success _on_error =
+  let update_health_status ~account_id:_ ~status ~error_message on_success _on_error =
+    health_status_updates := (status, error_message) :: !health_status_updates;
     on_success ()
 
   let sleep _delay f = f ()
@@ -2797,11 +2800,83 @@ let test_get_me_auto_refresh_enabled_refresh_failure_returns_expired () =
     ];
   Threads.get_me ~account_id:"acct-1"
     (function
-      | Error (Error_types.Auth_error Error_types.Token_expired) ->
+       | Error (Error_types.Auth_error Error_types.Token_expired) ->
+           let requests = List.rev !Mock_http.requests in
+           assert (List.length requests = 1);
+           print_endline "ok: auto refresh fail"
+       | _ -> failwith "expected token_expired when auto refresh fails")
+
+let test_get_me_auto_refresh_persist_failure_returns_error () =
+  Mock_config.reset ();
+  Mock_config.env_vars := [ ("THREADS_AUTO_REFRESH_TOKEN", "true") ];
+  Mock_config.update_credentials_error_override := Some "db write failed";
+  Mock_config.credentials_store :=
+    [
+      ( "acct-1",
+        {
+          access_token = "expired-token";
+          refresh_token = None;
+          expires_at = Some (rfc3339_after_seconds 10);
+          token_type = "Bearer";
+        } );
+    ];
+  Mock_http.set_responses
+    [
+      {
+        status = 200;
+        headers = [];
+        body =
+          "{\"access_token\":\"refreshed-token\",\"token_type\":\"Bearer\",\"expires_in\":3600}";
+      };
+    ];
+  Threads.get_me ~account_id:"acct-1"
+    (function
+      | Error (Error_types.Network_error (Error_types.Connection_failed msg)) ->
+          assert (string_contains msg "db write failed");
           let requests = List.rev !Mock_http.requests in
           assert (List.length requests = 1);
-          print_endline "ok: auto refresh fail"
-      | _ -> failwith "expected token_expired when auto refresh fails")
+          print_endline "ok: auto refresh persist failure surfaces"
+      | _ -> failwith "expected persistence failure to surface as network error")
+
+let test_get_me_auto_refresh_updates_health_status () =
+  Mock_config.reset ();
+  Mock_config.env_vars := [ ("THREADS_AUTO_REFRESH_TOKEN", "true") ];
+  Mock_config.credentials_store :=
+    [
+      ( "acct-1",
+        {
+          access_token = "expired-token";
+          refresh_token = None;
+          expires_at = Some (rfc3339_after_seconds 10);
+          token_type = "Bearer";
+        } );
+    ];
+  Mock_http.set_responses
+    [
+      {
+        status = 200;
+        headers = [];
+        body =
+          "{\"access_token\":\"refreshed-token\",\"token_type\":\"Bearer\",\"expires_in\":3600}";
+      };
+      {
+        status = 200;
+        headers = [];
+        body = "{\"id\":\"user-1\",\"username\":\"alice\"}";
+      };
+    ];
+  Threads.get_me ~account_id:"acct-1"
+    (function
+      | Ok me ->
+          assert (me.id = "user-1");
+          let has_healthy =
+            List.exists
+              (fun (status, error_message) -> status = "healthy" && error_message = None)
+              !Mock_config.health_status_updates
+          in
+          assert has_healthy;
+          print_endline "ok: auto refresh updates health status"
+      | _ -> failwith "expected successful get_me after auto refresh")
 
 let test_post_thread_multi_item_success () =
   Mock_config.reset ();
@@ -4129,6 +4204,8 @@ let () =
   test_get_me_auto_refresh_enabled_refreshes_and_proceeds ();
   test_get_me_auto_refresh_empty_token_from_refresh_fails ();
   test_get_me_auto_refresh_enabled_refresh_failure_returns_expired ();
+  test_get_me_auto_refresh_persist_failure_returns_error ();
+  test_get_me_auto_refresh_updates_health_status ();
   test_post_thread_multi_item_success ();
   test_post_thread_multi_item_with_media_success ();
   test_post_thread_idempotency_key_suffixes ();

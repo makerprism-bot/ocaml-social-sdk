@@ -1029,41 +1029,29 @@ module Make (Config : CONFIG) = struct
   
   (** Ensure valid access token, refreshing if needed *)
   let ensure_valid_token ~account_id on_success on_error =
-    Config.get_credentials ~account_id
-      (fun creds ->
-        (* TikTok tokens expire after 24 hours, refresh 1 hour before *)
-        if is_token_expired_buffer ~buffer_seconds:3600 creds.expires_at then
-          match creds.refresh_token with
-          | None ->
-              Config.update_health_status ~account_id ~status:"token_expired"
-                ~error_message:(Some "No refresh token available")
-                (fun () -> on_error (Error_types.Auth_error Error_types.Missing_credentials))
-                (fun _ -> on_error (Error_types.Auth_error Error_types.Missing_credentials))
-          | Some rt ->
-              refresh_access_token ~refresh_token:rt
-                (fun (new_access, new_refresh, expires_at) ->
-                  let updated_creds = {
-                    access_token = new_access;
-                    refresh_token = Some new_refresh;
-                    expires_at = Some expires_at;
-                    token_type = "Bearer";
-                  } in
-                  Config.update_credentials ~account_id ~credentials:updated_creds
-                    (fun () ->
-                      Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
-                        (fun () -> on_success new_access)
-                        (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
-                    (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
-                (fun err ->
-                  Config.update_health_status ~account_id ~status:"refresh_failed"
-                    ~error_message:(Some err)
-                    (fun () -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err)))
-                    (fun _ -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err))))
-        else
-          Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
-            (fun () -> on_success creds.access_token)
-            (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
-      (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
+    let perform_refresh ~credentials on_refresh_success on_refresh_error =
+      match credentials.Social_core.refresh_token with
+      | None -> on_refresh_error (Error_types.Auth_error Error_types.Missing_credentials)
+      | Some refresh_token ->
+          refresh_access_token ~refresh_token
+            (fun (new_access, new_refresh, expires_at) ->
+              on_refresh_success {
+                Social_core.access_token = new_access;
+                refresh_token = Some new_refresh;
+                expires_at = Some expires_at;
+                token_type = "Bearer";
+              })
+            (fun err -> on_refresh_error (Error_types.Auth_error (Error_types.Refresh_failed err)))
+    in
+    Social_refresh.Orchestrator.ensure_valid_access_token
+      ~policy:{ Social_refresh.refresh_window_seconds = 3600 }
+      ~account_id
+      ~load_credentials:Config.get_credentials
+      ~perform_refresh
+      ~persist_credentials:Config.update_credentials
+      ~update_health:Config.update_health_status
+      (fun credentials -> on_success credentials.Social_core.access_token)
+      on_error
   
   (** Query creator info to get available privacy options *)
   let get_creator_info ~account_id on_result =

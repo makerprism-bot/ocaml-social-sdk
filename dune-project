@@ -111,6 +111,7 @@
  (depends
   (ocaml (>= 4.14))
   (social-core (= :version))
+  (social-refresh (= :version))
   yojson
   uri
   ptime
@@ -123,6 +124,7 @@
  (depends
   (ocaml (>= 4.14))
   (social-core (= :version))
+  (social-refresh (= :version))
   yojson
   uri
   ptime
@@ -135,6 +137,7 @@
  (depends
   (ocaml (>= 4.14))
   (social-core (= :version))
+  (social-refresh (= :version))
   yojson
   uri
   ptime
@@ -148,6 +151,7 @@
  (depends
   (ocaml (>= 4.14))
   (social-core (= :version))
+  (social-refresh (= :version))
   yojson
   uri
   base64
@@ -160,6 +164,7 @@
  (depends
   (ocaml (>= 4.14))
   (social-core (= :version))
+  (social-refresh (= :version))
   yojson
   uri
   ptime))
@@ -171,6 +176,7 @@
  (depends
   (ocaml (>= 4.14))
   (social-core (= :version))
+  (social-refresh (= :version))
   yojson
   uri
   base64
@@ -183,6 +189,7 @@
  (depends
   (ocaml (>= 4.14))
   (social-core (= :version))
+  (social-refresh (= :version))
   yojson
   uri
   ptime

@@ -661,39 +661,49 @@ module Make (Config : CONFIG) = struct
   
   (** Ensure we have a valid access token, refreshing if necessary *)
   let ensure_valid_token ~account_id on_success on_error =
-    Config.get_credentials ~account_id
-      (fun creds ->
-        if token_needs_refresh creds then
-          match creds.refresh_token with
-          | Some refresh_tok ->
-              let client_id = Config.get_env "REDDIT_CLIENT_ID" |> Option.value ~default:"" in
-              let client_secret = Config.get_env "REDDIT_CLIENT_SECRET" |> Option.value ~default:"" in
-              if client_id = "" || client_secret = "" then
-                on_error (Error_types.Auth_error Error_types.Missing_credentials)
-              else
-                let module OAuthHttp = OAuth.Make(Config.Http) in
-                OAuthHttp.refresh_token ~client_id ~client_secret ~refresh_token:refresh_tok
-                  (fun new_creds ->
-                    Config.update_credentials ~account_id ~credentials:new_creds
-                      (fun () ->
-                        Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
-                          (fun () -> on_success new_creds.access_token)
-                          (fun _ -> on_success new_creds.access_token))
-                      (fun err ->
-                        Config.update_health_status ~account_id ~status:"refresh_failed" ~error_message:(Some err)
-                          (fun () -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err)))
-                          (fun _ -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err)))))
-                  (fun err ->
-                    Config.update_health_status ~account_id ~status:"refresh_failed" ~error_message:(Some err)
-                      (fun () -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err)))
-                      (fun _ -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err))))
-          | None ->
-              on_error (Error_types.Auth_error Error_types.Token_expired)
-        else
-          Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
-            (fun () -> on_success creds.access_token)
-            (fun _ -> on_success creds.access_token))
-      (fun err -> on_error (Error_types.Auth_error (Error_types.Refresh_failed err)))
+    let load_credentials ~account_id on_loaded on_load_error =
+      Config.get_credentials ~account_id
+        (fun creds ->
+          let expires_at =
+            match creds.Social_core.expires_at with
+            | Some expires_at ->
+                (match Ptime.of_rfc3339 expires_at with
+                 | Ok _ -> Some expires_at
+                 | Error _ -> None)
+            | None -> None
+          in
+          on_loaded { creds with Social_core.expires_at = expires_at })
+        on_load_error
+    in
+    let perform_refresh ~credentials on_refresh_success on_refresh_error =
+      match credentials.Social_core.refresh_token with
+      | None -> on_refresh_error (Error_types.Auth_error Error_types.Token_expired)
+      | Some refresh_token ->
+          let client_id = Config.get_env "REDDIT_CLIENT_ID" |> Option.value ~default:"" in
+          let client_secret = Config.get_env "REDDIT_CLIENT_SECRET" |> Option.value ~default:"" in
+          if client_id = "" || client_secret = "" then
+            on_refresh_error (Error_types.Auth_error Error_types.Missing_credentials)
+          else
+            let module OAuthHttp = OAuth.Make(Config.Http) in
+            OAuthHttp.refresh_token ~client_id ~client_secret ~refresh_token
+              on_refresh_success
+              (fun err -> on_refresh_error (Error_types.Auth_error (Error_types.Refresh_failed err)))
+    in
+    let update_health ~account_id ~status ~error_message on_health_ok _on_health_error =
+      Config.update_health_status ~account_id ~status ~error_message on_health_ok
+        (fun _ -> on_health_ok ())
+    in
+    Social_refresh.Orchestrator.ensure_valid_access_token
+      ~policy:{ Social_refresh.refresh_window_seconds = OAuth.Metadata.refresh_buffer_seconds }
+      ~map_load_error:(fun err -> Error_types.Auth_error (Error_types.Refresh_failed err))
+      ~map_persist_error:(fun err -> Error_types.Auth_error (Error_types.Refresh_failed err))
+      ~account_id
+      ~load_credentials
+      ~perform_refresh
+      ~persist_credentials:Config.update_credentials
+      ~update_health
+      (fun credentials -> on_success credentials.Social_core.access_token)
+      on_error
   
   (** {1 API Functions} *)
   

@@ -715,34 +715,24 @@ module Make (Config : CONFIG) = struct
   
   (** Ensure valid access token, refreshing if needed *)
   let ensure_valid_token ~account_id on_success on_error =
-    Config.get_credentials ~account_id
-      (fun creds ->
-        (* Check if token needs refresh (7 day buffer before expiry) *)
-        if is_token_expired_buffer ~buffer_seconds:(7 * 86400) creds.expires_at then
-          (* Token is expired or expiring soon - try to refresh it *)
-          refresh_token ~access_token:creds.access_token
-            (fun refreshed_creds ->
-              (* Update stored credentials with refreshed token *)
-              Config.update_credentials ~account_id ~credentials:refreshed_creds
-                (fun () ->
-                  Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
-                    (fun () -> on_success refreshed_creds.access_token)
-                    (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
-                (fun err ->
-                  (* Failed to update credentials in DB *)
-                  on_error (Error_types.Network_error (Error_types.Connection_failed (Printf.sprintf "Failed to save refreshed token: %s" err)))))
-            (fun refresh_err ->
-              (* Token refresh failed - mark as expired and ask user to reconnect *)
-              Config.update_health_status ~account_id ~status:"token_expired" 
-                ~error_message:(Some "Access token expired - please reconnect")
-                (fun () -> on_error (Error_types.Auth_error (Error_types.Refresh_failed refresh_err)))
-                (fun _ -> on_error (Error_types.Auth_error (Error_types.Refresh_failed refresh_err))))
-        else
-          (* Token is still valid *)
-          Config.update_health_status ~account_id ~status:"healthy" ~error_message:None
-            (fun () -> on_success creds.access_token)
-            (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err))))
-      (fun err -> on_error (Error_types.Network_error (Error_types.Connection_failed err)))
+    let perform_refresh ~credentials on_refresh_success on_refresh_error =
+      refresh_token ~access_token:credentials.Social_core.access_token
+        on_refresh_success
+        (fun err -> on_refresh_error (Error_types.Auth_error (Error_types.Refresh_failed err)))
+    in
+    Social_refresh.Orchestrator.ensure_valid_access_token
+      ~policy:{ Social_refresh.refresh_window_seconds = (7 * 86400) }
+      ~map_persist_error:(fun err ->
+        Error_types.Network_error
+          (Error_types.Connection_failed
+             (Printf.sprintf "Failed to save refreshed token: %s" err)))
+      ~account_id
+      ~load_credentials:Config.get_credentials
+      ~perform_refresh
+      ~persist_credentials:Config.update_credentials
+      ~update_health:Config.update_health_status
+      (fun credentials -> on_success credentials.Social_core.access_token)
+      on_error
 
   (** {1 Insights (P0 Analytics)} *)
 

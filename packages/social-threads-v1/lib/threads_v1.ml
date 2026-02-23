@@ -646,13 +646,13 @@ module Make (Config : CONFIG) = struct
       else
         on_refresh_error (Error_types.Auth_error Error_types.Token_expired)
     in
-    let persist_credentials ~account_id ~credentials on_persisted _on_persist_error =
+    let persist_credentials ~account_id ~credentials on_persisted on_persist_error =
       Config.update_credentials ~account_id ~credentials
         (fun () -> on_persisted ())
-        (fun _ -> on_persisted ())
+        on_persist_error
     in
-    let update_health ~account_id:_ ~status:_ ~error_message:_ on_health_ok _on_health_error =
-      on_health_ok ()
+    let update_health ~account_id ~status ~error_message on_health_ok on_health_error =
+      Config.update_health_status ~account_id ~status ~error_message on_health_ok on_health_error
     in
     Social_refresh.Orchestrator.ensure_valid_access_token
       ~policy:{ Social_refresh.refresh_window_seconds = token_expiry_skew_seconds () }

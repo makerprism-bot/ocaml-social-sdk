@@ -5,7 +5,6 @@ type refresh_policy = {
 type refresh_decision =
   | Skip
   | Refresh_required
-  | Refresh_not_possible of Error_types.error
 
 type refresh_error =
   | Credential_load_failed of string

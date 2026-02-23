@@ -7,12 +7,12 @@ let rfc3339_in_seconds seconds =
   in
   Ptime.to_rfc3339 target
 
-let make_credentials ?refresh_token ?expires_at access_token =
+let make_credentials ?refresh_token ?expires_at ?(token_type = "Bearer") access_token =
   {
     Social_core.access_token;
     refresh_token;
     expires_at;
-    token_type = "Bearer";
+    token_type;
   }
 
 let test_refresh_time_boundaries () =
@@ -127,6 +127,79 @@ let test_orchestrator_preserves_refresh_token_when_missing_in_response () =
    | None -> failwith "Expected persisted credentials");
   print_endline "✓ orchestrator refresh token preservation"
 
+let test_orchestrator_preserves_expires_at_and_token_type_when_blank () =
+  let persisted = ref None in
+  let result = ref None in
+  let current_expiry = rfc3339_in_seconds 1200 in
+  let load_credentials ~account_id:_ on_success _on_error =
+    on_success
+      (make_credentials
+         ~expires_at:current_expiry
+         ~token_type:"Bearer"
+         ~refresh_token:"old_refresh"
+         "old_access")
+  in
+  let perform_refresh ~credentials:_ on_success _on_error =
+    on_success
+      (make_credentials
+         ~refresh_token:"   "
+         ~expires_at:"   "
+         ~token_type:"   "
+         "new_access")
+  in
+  let persist_credentials ~account_id:_ ~credentials on_success _on_error =
+    persisted := Some credentials;
+    on_success ()
+  in
+  let update_health ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success () in
+  Social_refresh.Orchestrator.ensure_valid_access_token
+    ~account_id:"acct"
+    ~load_credentials
+    ~perform_refresh
+    ~persist_credentials
+    ~update_health
+    (fun credentials -> result := Some (Ok credentials))
+    (fun err -> result := Some (Error err));
+  (match !result with
+   | Some (Ok credentials) ->
+       assert (credentials.Social_core.access_token = "new_access");
+       assert (credentials.Social_core.refresh_token = Some "old_refresh");
+       assert (credentials.Social_core.expires_at = Some current_expiry);
+       assert (credentials.Social_core.token_type = "Bearer")
+   | _ -> failwith "Expected refreshed credentials");
+  (match !persisted with
+   | Some credentials ->
+       assert (credentials.Social_core.refresh_token = Some "old_refresh");
+       assert (credentials.Social_core.expires_at = Some current_expiry);
+       assert (credentials.Social_core.token_type = "Bearer")
+   | None -> failwith "Expected persisted credentials");
+  print_endline "✓ orchestrator expiry/token-type preservation"
+
+let test_orchestrator_failure_keeps_root_error_when_health_update_fails () =
+  let result = ref None in
+  let load_credentials ~account_id:_ on_success _on_error =
+    on_success (make_credentials ~expires_at:(rfc3339_in_seconds 5) ~refresh_token:"bad" "expired")
+  in
+  let perform_refresh ~credentials:_ _on_success on_error =
+    on_error (Error_types.Auth_error (Error_types.Refresh_failed "invalid refresh token"))
+  in
+  let persist_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success () in
+  let update_health ~account_id:_ ~status:_ ~error_message:_ _on_success on_error =
+    on_error "health update failed"
+  in
+  Social_refresh.Orchestrator.ensure_valid_access_token
+    ~account_id:"acct"
+    ~load_credentials
+    ~perform_refresh
+    ~persist_credentials
+    ~update_health
+    (fun _ -> result := Some (Ok ()))
+    (fun err -> result := Some (Error err));
+  (match !result with
+   | Some (Error (Error_types.Auth_error (Error_types.Refresh_failed "invalid refresh token"))) -> ()
+   | _ -> failwith "Expected root refresh error when health update fails");
+  print_endline "✓ orchestrator failure keeps root cause"
+
 let test_orchestrator_health_transitions () =
   let statuses = ref [] in
   let result = ref None in
@@ -162,5 +235,7 @@ let () =
   test_orchestrator_missing_refresh_token ();
   test_orchestrator_refresh_failure_mapping ();
   test_orchestrator_preserves_refresh_token_when_missing_in_response ();
+  test_orchestrator_preserves_expires_at_and_token_type_when_blank ();
+  test_orchestrator_failure_keeps_root_error_when_health_update_fails ();
   test_orchestrator_health_transitions ();
   print_endline "social-refresh tests passed"

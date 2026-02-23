@@ -1,0 +1,19 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.0.1] - Unreleased
+
+### Added
+
+- Initial `social-refresh` package scaffold
+- Provider-neutral refresh type definitions
+- `refresh_time` RFC3339 and refresh-window helpers
+- `refresh_decision` engine (`Skip` / `Refresh_required`)
+- `refresh_orchestrator` for load -> decide -> refresh -> persist -> health updates
+- Package unit tests for malformed timestamps, boundary windows, refresh failure mapping,
+  missing refresh token handling, refresh token preservation, and health transitions
+- Pilot provider integrations in `social-twitter-v2` and `social-threads-v1`

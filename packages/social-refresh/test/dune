@@ -1,0 +1,6 @@
+(test
+ (name test_social_refresh)
+ (modules test_social_refresh)
+ (libraries
+  social-core
+  social-refresh))

@@ -609,15 +609,11 @@ module Make (Config : CONFIG) = struct
   let is_token_expired = function
     | None -> false
     | Some expires_at ->
-        (match Ptime.of_rfc3339 expires_at with
-         | Ok (exp, _, _) ->
-             let now = Ptime_clock.now () in
-             let threshold =
-               match Ptime.add_span now (Ptime.Span.of_int_s (token_expiry_skew_seconds ())) with
-               | Some t -> t
-               | None -> now
-             in
-             Ptime.is_earlier exp ~than:threshold
+        (match Social_refresh.Time.needs_refresh
+                 ~refresh_window_seconds:(token_expiry_skew_seconds ())
+                 expires_at
+         with
+         | Ok refresh_needed -> refresh_needed
          | Error _ -> true)
 
   let with_valid_credentials ~account_id on_success on_error =
@@ -627,31 +623,47 @@ module Make (Config : CONFIG) = struct
       else
         Error_types.Internal_error ("Failed to load credentials: " ^ err)
     in
-    Config.get_credentials ~account_id
-      (fun creds ->
-        let token = String.trim creds.access_token in
-        if token = "" then
-          on_error (Error_types.Auth_error Error_types.Missing_credentials)
-        else if is_token_expired creds.expires_at then
-          if auto_refresh_token_enabled () then
-            OAuth_http.refresh_token ~long_lived_token:token
-              (fun refreshed_creds ->
-                let refreshed_token = String.trim refreshed_creds.access_token in
-                if refreshed_token = "" then
-                  on_error (Error_types.Auth_error Error_types.Token_expired)
-                else
-                  let normalized_refreshed =
-                    { refreshed_creds with access_token = refreshed_token }
-                  in
-                  Config.update_credentials ~account_id ~credentials:normalized_refreshed
-                    (fun () -> on_success normalized_refreshed)
-                    (fun _ -> on_success normalized_refreshed))
-              (fun _ -> on_error (Error_types.Auth_error Error_types.Token_expired))
-          else
-            on_error (Error_types.Auth_error Error_types.Token_expired)
-        else
-          on_success { creds with access_token = token })
-      (fun err -> on_error (map_credentials_error err))
+    let load_credentials ~account_id on_loaded on_load_error =
+      Config.get_credentials ~account_id
+        (fun creds ->
+           let token = String.trim creds.access_token in
+           if token = "" then
+             on_load_error "missing credentials"
+           else
+             on_loaded { creds with access_token = token })
+        on_load_error
+    in
+    let perform_refresh ~credentials on_refresh_success on_refresh_error =
+      if auto_refresh_token_enabled () then
+        OAuth_http.refresh_token ~long_lived_token:credentials.Social_core.access_token
+          (fun refreshed_creds ->
+             let refreshed_token = String.trim refreshed_creds.access_token in
+             if refreshed_token = "" then
+               on_refresh_error (Error_types.Auth_error Error_types.Token_expired)
+             else
+               on_refresh_success { refreshed_creds with access_token = refreshed_token })
+          (fun _ -> on_refresh_error (Error_types.Auth_error Error_types.Token_expired))
+      else
+        on_refresh_error (Error_types.Auth_error Error_types.Token_expired)
+    in
+    let persist_credentials ~account_id ~credentials on_persisted _on_persist_error =
+      Config.update_credentials ~account_id ~credentials
+        (fun () -> on_persisted ())
+        (fun _ -> on_persisted ())
+    in
+    let update_health ~account_id:_ ~status:_ ~error_message:_ on_health_ok _on_health_error =
+      on_health_ok ()
+    in
+    Social_refresh.Orchestrator.ensure_valid_access_token
+      ~policy:{ Social_refresh.refresh_window_seconds = token_expiry_skew_seconds () }
+      ~map_load_error:map_credentials_error
+      ~account_id
+      ~load_credentials
+      ~perform_refresh
+      ~persist_credentials
+      ~update_health
+      on_success
+      on_error
 
   let validate_text_length text =
     let length = String.length (String.trim text) in

@@ -1,7 +1,6 @@
 _build/
 *.install
 .merlin
-*.opam
 !*.opam.template
 dev-tools.locks/
 dune.lock/

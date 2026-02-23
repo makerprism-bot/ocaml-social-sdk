@@ -50,6 +50,7 @@ jobs:
           for pkg in \
             social-core \
             social-lwt \
+            social-refresh \
             social-twitter-v2 \
             social-bluesky-v1 \
             social-linkedin-v2 \

@@ -27,8 +27,17 @@
   (ocaml (>= 4.14))
   (social-core (= :version))
   lwt
-  (lwt_ppx (>= 2.0.0))
-  cohttp-lwt-unix))
+   (lwt_ppx (>= 2.0.0))
+   cohttp-lwt-unix))
+
+(package
+ (name social-refresh)
+ (synopsis "Shared token refresh orchestration utilities")
+ (description "Optional shared package that centralizes token-refresh decision and orchestration helpers while preserving provider-specific OAuth and network implementations.")
+ (depends
+  (ocaml (>= 4.14))
+  (social-core (= :version))
+  ptime))
 
 (package
  (name social-twitter-v2)
@@ -37,6 +46,7 @@
  (depends
   (ocaml (>= 4.14))
   (social-core (= :version))
+  (social-refresh (= :version))
   yojson
   base64
   digestif
@@ -63,6 +73,7 @@
  (depends
   (ocaml (>= 4.14))
   (social-core (= :version))
+  (social-refresh (= :version))
   yojson
   uri
   ptime

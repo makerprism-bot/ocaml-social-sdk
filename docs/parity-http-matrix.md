@@ -2,6 +2,11 @@
 
 Scope: current implementation in `packages/social-*/lib/*.ml` and contract-style assertions in `packages/social-*/test/test_*.ml`.
 
+Interpretation:
+- This document tracks endpoint/request-shape parity and contract-test coverage.
+- It does not imply production hardening; align with the root `README.md` status legend (`⚠️` = implemented + automated tests, limited production validation).
+- Current matrix coverage is partial and focuses on: Facebook, Instagram, Threads, Pinterest, LinkedIn, TikTok, Twitter v2, and YouTube.
+
 ## Facebook
 
 | Capability | Method | Path/query contract | Required headers | Payload shape | SDK function(s) | Contract test name(s) |
@@ -99,7 +104,7 @@ Known subtle bug traps:
 - Publish flow is async: init/upload success still requires explicit status polling.
 - Account analytics is a stitched 3-call flow; partial implementation of only one call yields misleading totals.
 
-## X
+## Twitter v2 (X)
 
 | Capability | Method | Path/query contract | Required headers | Payload shape | SDK function(s) | Contract test name(s) |
 | --- | --- | --- | --- | --- | --- | --- |

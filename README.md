@@ -14,7 +14,7 @@ OCaml SDK for social media APIs. Post content, manage media, handle threads acro
 > - OAuth 2.0 flows for Twitter, LinkedIn, Bluesky, and Mastodon
 > - Posting (write) functionality for Twitter, LinkedIn, Bluesky, and Mastodon
 >
-> All other functionality (Facebook, Instagram, YouTube, Pinterest, TikTok, and read operations) should be considered untested. Use at your own risk and expect breaking changes.
+> Other functionality (Facebook, Instagram, YouTube, Pinterest, TikTok, Threads, Reddit, and broader read/analytics flows) now has automated unit/contract coverage in this repository, but still has limited production validation. Use at your own risk and expect breaking changes.
 
 ## Packages
 
@@ -162,13 +162,15 @@ The SDK follows a runtime-agnostic design:
 | Mastodon | ✅ | ✅ | ✅ | ✅ | - | - | ⚠️ | ⚠️ |
 | Facebook | ⚠️ | ⚠️ | ⚠️ | - | ⚠️ | ⚠️ | ⚠️ | ⚠️ |
 | Instagram | ⚠️ | ⚠️ | ⚠️ | - | ⚠️ | ⚠️ | ⚠️ | ⚠️ |
-| Threads | ⚠️ | ⚠️ | ⚠️ | ⚠️ | - | - | ⚠️ | - |
-| YouTube | ⚠️ | - | - | - | - | ⚠️ | ⚠️ | ⚠️ |
+| Threads | ⚠️ | ⚠️ | ⚠️ | ⚠️ | - | - | ⚠️ | ⚠️ |
+| YouTube | ⚠️ | ⚠️ | ⚠️ | - | - | ⚠️ | ⚠️ | ⚠️ |
 | Pinterest | ⚠️ | ⚠️ | ⚠️ | - | - | - | ⚠️ | ⚠️ |
 | Reddit | ⚠️ | ⚠️ | ⚠️ | - | - | - | ⚠️ | - |
-| TikTok | ⚠️ | - | - | - | - | ⚠️ | ⚠️ | ⚠️ |
+| TikTok | ⚠️ | ⚠️ | ⚠️ | - | - | ⚠️ | ⚠️ | ⚠️ |
 
-✅ = Used successfully, ⚠️ = Implemented but untested, ❌ = Not implemented (API available), - = Not applicable
+✅ = Used successfully in production workflows, ⚠️ = Implemented with automated tests but limited production validation, ❌ = Not implemented (API available), - = Not applicable
+
+For endpoint-level request/response contract coverage, see `docs/parity-http-matrix.md`.
 
 ## Development
 

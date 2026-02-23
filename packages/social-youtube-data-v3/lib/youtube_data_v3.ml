@@ -810,75 +810,99 @@ module Make (Config : CONFIG) = struct
 
   let parse_report_rows ~column_headers json =
     let open Yojson.Basic.Util in
-    try
+    let rows_result =
       let rows_value = json |> member "rows" in
-      let rows =
-        match rows_value with
-        | `Null -> []
-        | `List row_items -> row_items
-        | _ -> failwith "Report rows must be a list"
-      in
-      match report_day_column_index column_headers with
-      | None -> Error (`Malformed "Report column headers are missing day dimension")
-      | Some day_column_index ->
-          let metric_columns = report_metric_columns column_headers in
-          if metric_columns = [] then
-            Error (`Malformed "Report column headers are missing metric columns")
-          else
-          let parse_single_row row_index row_json =
-            let values = row_json |> to_list in
-            let day =
-              match nth_opt values day_column_index with
-              | Some value ->
-                  let day_value = to_string value in
-                  if String.trim day_value = "" then
-                    failwith
-                      (Printf.sprintf "Row %d has empty day value" row_index)
-                  else
-                    day_value
-              | None ->
-                  failwith
-                    (Printf.sprintf
-                       "Row %d is missing day value at index %d"
-                       row_index
-                       day_column_index)
-            in
-            let rec collect_metrics acc = function
-              | [] -> List.rev acc
-              | (metric_index, metric_header) :: rest ->
-                  let metric_value =
-                    match nth_opt values metric_index with
-                    | Some value ->
-                        (match report_metric_value_to_int value with
-                         | Some parsed -> parsed
-                         | None ->
-                             failwith
-                               (Printf.sprintf
-                                  "Row %d metric %s is not an integer"
-                                  row_index
-                                  metric_header.name))
-                    | None ->
-                        failwith
-                          (Printf.sprintf
-                             "Row %d is missing metric %s"
-                             row_index
-                             metric_header.name)
-                  in
-                  collect_metrics ((metric_header.name, metric_value) :: acc) rest
-            in
-            { day; metrics = collect_metrics [] metric_columns }
-          in
-          let rec parse_all_rows row_index acc = function
-            | [] -> Ok (List.rev acc)
-            | row_json :: rest ->
-                let parsed_row = parse_single_row row_index row_json in
-                parse_all_rows (row_index + 1) (parsed_row :: acc) rest
-          in
-          parse_all_rows 0 [] rows
-    with e ->
-      Error
-        (`Malformed
-          (Printf.sprintf "Failed to parse report rows: %s" (Printexc.to_string e)))
+      match rows_value with
+      | `Null -> Ok []
+      | `List row_items -> Ok row_items
+      | _ -> Error "Report rows must be a list"
+    in
+    match rows_result with
+    | Error msg -> Error (`Malformed msg)
+    | Ok rows ->
+        (match report_day_column_index column_headers with
+         | None -> Error (`Malformed "Report column headers are missing day dimension")
+         | Some day_column_index ->
+             let metric_columns = report_metric_columns column_headers in
+             if metric_columns = [] then
+               Error (`Malformed "Report column headers are missing metric columns")
+             else
+               let parse_single_row row_index row_json =
+                 try
+                   let values = row_json |> to_list in
+                   let day_result =
+                     match nth_opt values day_column_index with
+                     | Some value ->
+                         (try
+                            let day_value = to_string value in
+                            if String.trim day_value = "" then
+                              Error (Printf.sprintf "Row %d has empty day value" row_index)
+                            else
+                              Ok day_value
+                          with exn ->
+                            Error
+                              (Printf.sprintf
+                                 "Row %d has invalid day value: %s"
+                                 row_index
+                                 (Printexc.to_string exn)))
+                     | None ->
+                         Error
+                           (Printf.sprintf
+                              "Row %d is missing day value at index %d"
+                              row_index
+                              day_column_index)
+                   in
+                   match day_result with
+                   | Error msg -> Error msg
+                   | Ok day ->
+                       let rec collect_metrics acc = function
+                         | [] -> Ok (List.rev acc)
+                         | (metric_index, metric_header) :: rest ->
+                             let metric_result =
+                               match nth_opt values metric_index with
+                               | Some value ->
+                                   (match report_metric_value_to_int value with
+                                    | Some parsed -> Ok parsed
+                                    | None ->
+                                        Error
+                                          (Printf.sprintf
+                                             "Row %d metric %s is not an integer"
+                                             row_index
+                                             metric_header.name))
+                               | None ->
+                                   Error
+                                     (Printf.sprintf
+                                        "Row %d is missing metric %s"
+                                        row_index
+                                        metric_header.name)
+                             in
+                             (match metric_result with
+                              | Error msg -> Error msg
+                              | Ok metric_value ->
+                                  collect_metrics
+                                    ((metric_header.name, metric_value) :: acc)
+                                    rest)
+                       in
+                       (match collect_metrics [] metric_columns with
+                        | Error msg -> Error msg
+                        | Ok metrics -> Ok { day; metrics })
+                 with exn ->
+                   Error
+                     (Printf.sprintf
+                        "Failed to parse report row %d: %s"
+                        row_index
+                        (Printexc.to_string exn))
+               in
+               let rec parse_all_rows row_index acc = function
+                 | [] -> Ok (List.rev acc)
+                 | row_json :: rest ->
+                     (match parse_single_row row_index row_json with
+                      | Error msg ->
+                          Error (`Malformed (Printf.sprintf "Failed to parse report rows: %s" msg))
+                      | Ok parsed_row ->
+                          parse_all_rows (row_index + 1) (parsed_row :: acc) rest)
+               in
+               parse_all_rows 0 [] rows)
 
   let parse_account_analytics_report_response ~start_date ~end_date ~metrics response_body =
     try

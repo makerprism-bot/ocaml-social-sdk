@@ -10,6 +10,7 @@ Pinterest API v5 client for OCaml.
 - Native video pin flow (register upload -> upload binary -> processing poll -> `/pins` create)
 - Strict media validation (size and content type)
 - Unknown extension routing by downloaded `content-type` (video vs image)
+- Default board auto-resolution (`get_default_board` helper); no full board CRUD/list APIs yet
 
 ## Platform Limits
 

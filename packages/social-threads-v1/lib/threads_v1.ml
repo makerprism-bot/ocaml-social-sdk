@@ -38,27 +38,31 @@ let expires_at_of_expires_in expires_in =
 
 let parse_credentials_from_json json =
   let open Yojson.Basic.Util in
-  let access_token =
-    json
-    |> member "access_token"
-    |> to_string
-    |> String.trim
-  in
-  if access_token = "" then
-    failwith "empty access token in OAuth response";
-  let token_type =
-    let parsed =
-      try Some (json |> member "token_type" |> to_string)
-      with _ -> None
+  try
+    let access_token =
+      json
+      |> member "access_token"
+      |> to_string
+      |> String.trim
     in
-    match parsed with
-    | Some v when String.trim v <> "" ->
-        let normalized = String.trim v in
-        if String.lowercase_ascii normalized = "bearer" then "Bearer" else normalized
-    | _ -> "Bearer"
-  in
-  let expires_at = parse_expires_in json |> expires_at_of_expires_in in
-  ({ access_token; refresh_token = None; expires_at; token_type } : credentials)
+    if access_token = "" then
+      Error "empty access token in OAuth response"
+    else
+      let token_type =
+        let parsed =
+          try Some (json |> member "token_type" |> to_string)
+          with _ -> None
+        in
+        match parsed with
+        | Some v when String.trim v <> "" ->
+            let normalized = String.trim v in
+            if String.lowercase_ascii normalized = "bearer" then "Bearer" else normalized
+        | _ -> "Bearer"
+      in
+      let expires_at = parse_expires_in json |> expires_at_of_expires_in in
+      Ok ({ access_token; refresh_token = None; expires_at; token_type } : credentials)
+  with exn ->
+    Error (Printf.sprintf "invalid OAuth response payload: %s" (Printexc.to_string exn))
 
 let find_header headers key =
   let key_lower = String.lowercase_ascii key in
@@ -286,8 +290,9 @@ module OAuth = struct
           if response.status >= 200 && response.status < 300 then
             try
               let json = Yojson.Basic.from_string response.body in
-              let creds = parse_credentials_from_json json in
-              on_success creds
+              (match parse_credentials_from_json json with
+               | Ok creds -> on_success creds
+               | Error msg -> on_error (Printf.sprintf "Failed to parse token response: %s" msg))
             with exn ->
               on_error (Printf.sprintf "Failed to parse token response: %s" (Printexc.to_string exn))
           else
@@ -312,8 +317,10 @@ module OAuth = struct
           if response.status >= 200 && response.status < 300 then
             try
               let json = Yojson.Basic.from_string response.body in
-              let creds = parse_credentials_from_json json in
-              on_success creds
+              (match parse_credentials_from_json json with
+               | Ok creds -> on_success creds
+               | Error msg ->
+                   on_error (Printf.sprintf "Failed to parse long-lived token response: %s" msg))
             with exn ->
               on_error
                 (Printf.sprintf "Failed to parse long-lived token response: %s" (Printexc.to_string exn))
@@ -338,8 +345,9 @@ module OAuth = struct
           if response.status >= 200 && response.status < 300 then
             try
               let json = Yojson.Basic.from_string response.body in
-              let creds = parse_credentials_from_json json in
-              on_success creds
+              (match parse_credentials_from_json json with
+               | Ok creds -> on_success creds
+               | Error msg -> on_error (Printf.sprintf "Failed to parse refresh response: %s" msg))
             with exn ->
               on_error (Printf.sprintf "Failed to parse refresh response: %s" (Printexc.to_string exn))
           else
@@ -714,60 +722,85 @@ module Make (Config : CONFIG) = struct
 
   let parse_account_insights_response response_body =
     let open Yojson.Basic.Util in
-    let json = Yojson.Basic.from_string response_body in
-    json |> member "data" |> to_list
-    |> List.map (fun item ->
-           let metric_name = item |> member "name" |> to_string in
-           let metric =
-             match insight_metric_of_string metric_name with
-             | Some metric -> metric
-             | None -> failwith ("Unsupported insight metric: " ^ metric_name)
-           in
-           let period =
-             try Some (item |> member "period" |> to_string)
-             with _ -> None
-           in
-           let values =
-             item |> member "values" |> to_list
-             |> List.map (fun value_item ->
-                    let value =
-                      try parse_int_value (value_item |> member "value")
-                      with _ -> parse_int_value value_item
-                    in
-                    let end_time =
-                      try Some (value_item |> member "end_time" |> to_string)
-                      with _ -> None
-                    in
-                    { value; end_time })
-           in
-           { metric; period; values })
+    try
+      let json = Yojson.Basic.from_string response_body in
+      let data_items = json |> member "data" |> to_list in
+      let rec parse_values acc = function
+        | [] -> Ok (List.rev acc)
+        | value_item :: rest ->
+            let value =
+              try Ok (parse_int_value (value_item |> member "value"))
+              with _ ->
+                try Ok (parse_int_value value_item)
+                with exn ->
+                  Error (Printf.sprintf "invalid insight value: %s" (Printexc.to_string exn))
+            in
+            (match value with
+             | Error msg -> Error msg
+             | Ok value ->
+                 let end_time =
+                   try Some (value_item |> member "end_time" |> to_string)
+                   with _ -> None
+                 in
+                 parse_values ({ value; end_time } :: acc) rest)
+      in
+      let rec parse_items acc = function
+        | [] -> Ok (List.rev acc)
+        | item :: rest ->
+            let metric_name = item |> member "name" |> to_string in
+            (match insight_metric_of_string metric_name with
+             | None -> Error ("unsupported insight metric: " ^ metric_name)
+             | Some metric ->
+                 let period =
+                   try Some (item |> member "period" |> to_string)
+                   with _ -> None
+                 in
+                 let value_items = item |> member "values" |> to_list in
+                 (match parse_values [] value_items with
+                  | Error msg -> Error msg
+                  | Ok values ->
+                      parse_items ({ metric; period; values } :: acc) rest))
+      in
+      parse_items [] data_items
+    with exn ->
+      Error (Printexc.to_string exn)
 
   let parse_post_insights_response response_body =
     let open Yojson.Basic.Util in
-    let json = Yojson.Basic.from_string response_body in
-    json |> member "data" |> to_list
-    |> List.map (fun item ->
-           let metric_name = item |> member "name" |> to_string in
-           let metric =
-             match insight_metric_of_string metric_name with
-             | Some metric -> metric
-             | None -> failwith ("Unsupported insight metric: " ^ metric_name)
-           in
-           let period =
-             try Some (item |> member "period" |> to_string)
-             with _ -> None
-           in
-           let value =
-             try parse_int_value (item |> member "value")
-             with _ ->
-               let values = item |> member "values" |> to_list in
-               match values with
-               | first :: _ ->
-                   (try parse_int_value (first |> member "value")
-                    with _ -> parse_int_value first)
-               | [] -> failwith "Missing post insight value"
-           in
-           { metric; period; value })
+    try
+      let json = Yojson.Basic.from_string response_body in
+      let data_items = json |> member "data" |> to_list in
+      let rec parse_items acc = function
+        | [] -> Ok (List.rev acc)
+        | item :: rest ->
+            let metric_name = item |> member "name" |> to_string in
+            (match insight_metric_of_string metric_name with
+             | None -> Error ("unsupported insight metric: " ^ metric_name)
+             | Some metric ->
+                 let period =
+                   try Some (item |> member "period" |> to_string)
+                   with _ -> None
+                 in
+                 let value_result =
+                   try Ok (parse_int_value (item |> member "value"))
+                   with _ ->
+                     try
+                       let values = item |> member "values" |> to_list in
+                       match values with
+                       | first :: _ ->
+                           (try Ok (parse_int_value (first |> member "value"))
+                            with _ -> Ok (parse_int_value first))
+                       | [] -> Error "missing post insight value"
+                     with exn ->
+                       Error (Printf.sprintf "invalid post insight value: %s" (Printexc.to_string exn))
+                 in
+                 (match value_result with
+                  | Error msg -> Error msg
+                  | Ok value -> parse_items ({ metric; period; value } :: acc) rest))
+      in
+      parse_items [] data_items
+    with exn ->
+      Error (Printexc.to_string exn)
 
   let fetch_me_with_access_token ~access_token on_result =
     let query =
@@ -1232,16 +1265,15 @@ module Make (Config : CONFIG) = struct
                 http_get_with_retry url
                   (fun response ->
                     if response.status >= 200 && response.status < 300 then
-                      try
-                        let insights = parse_account_insights_response response.body in
-                        on_result (Ok insights)
-                      with exn ->
-                        on_result
-                          (Error
-                             (Error_types.Internal_error
-                                (Printf.sprintf
-                                   "Failed to parse account insights response: %s"
-                                   (Printexc.to_string exn))))
+                      (match parse_account_insights_response response.body with
+                       | Ok insights -> on_result (Ok insights)
+                       | Error msg ->
+                           on_result
+                             (Error
+                                (Error_types.Internal_error
+                                   (Printf.sprintf
+                                      "Failed to parse account insights response: %s"
+                                      msg))))
                     else
                       on_result
                         (Error
@@ -1277,16 +1309,15 @@ module Make (Config : CONFIG) = struct
         http_get_with_retry url
           (fun response ->
             if response.status >= 200 && response.status < 300 then
-              try
-                let insights = parse_post_insights_response response.body in
-                on_result (Ok insights)
-              with exn ->
-                on_result
-                  (Error
-                     (Error_types.Internal_error
-                        (Printf.sprintf
-                           "Failed to parse post insights response: %s"
-                           (Printexc.to_string exn))))
+              (match parse_post_insights_response response.body with
+               | Ok insights -> on_result (Ok insights)
+               | Error msg ->
+                   on_result
+                     (Error
+                        (Error_types.Internal_error
+                           (Printf.sprintf
+                              "Failed to parse post insights response: %s"
+                              msg))))
             else
               on_result
                 (Error

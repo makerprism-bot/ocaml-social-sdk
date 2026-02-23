@@ -306,28 +306,8 @@ let test_post_single_expired_token_without_refresh_fails () =
       | Error_types.Partial_success _ ->
           failwith "Expected failure, not partial success")
 
-(** Test: Get all boards *)
-(* TODO: Function get_all_boards not implemented yet
-let test_get_all_boards () =
-  Mock_config.reset ();
-  
-  let response_body = {|{
-    "items": [
-      {"id": "board_123", "name": "My Board", "privacy": "PUBLIC"},
-      {"id": "board_456", "name": "Another Board", "privacy": "PRIVATE"}
-    ]
-  }|} in
-  
-  Mock_http.set_responses [{ status = 200; body = response_body; headers = [] }];
-  
-  Pinterest.get_all_boards ~access_token:"test_token"
-    (fun boards ->
-      assert (List.length boards = 2);
-      assert ((List.nth boards 0).id = "board_123");
-      assert ((List.nth boards 0).name = "My Board");
-      print_endline "✓ Get all boards")
-    (fun err -> failwith ("Get boards failed: " ^ err))
-*)
+(* Note: full board-list management APIs are not exposed in this package today.
+   post_single and get_default_board cover the current board-resolution workflow. *)
 
 (** Test: Content validation *)
 let test_content_validation () =
@@ -1179,7 +1159,6 @@ let () =
   test_token_exchange_rejects_missing_scopes ();
   test_post_single_refreshes_expired_token ();
   test_post_single_expired_token_without_refresh_fails ();
-  (* test_get_all_boards (); *) (* TODO: Function not implemented *)
   test_content_validation ();
   test_post_requires_image ();
   test_get_account_analytics_request_contract ();

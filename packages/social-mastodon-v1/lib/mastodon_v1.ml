@@ -613,6 +613,45 @@ module Make (Config : CONFIG) = struct
       (fun _ -> fallback_to_v1 ())
 
   (** Parse API error response and return structured Error_types.error *)
+  let parse_ipv4_host host =
+    let octets = String.split_on_char '.' host in
+    match octets with
+    | [a; b; c; d] ->
+        (try
+           let ai = int_of_string a in
+           let bi = int_of_string b in
+           let ci = int_of_string c in
+           let di = int_of_string d in
+           let in_range x = x >= 0 && x <= 255 in
+           if in_range ai && in_range bi && in_range ci && in_range di then
+             Some (ai, bi, ci, di)
+           else
+             None
+         with _ -> None)
+    | _ -> None
+
+  let is_safe_remote_media_url url =
+    try
+      let uri = Uri.of_string (String.trim url) in
+      match Uri.scheme uri, Uri.host uri with
+      | (Some ("http" | "https"), Some host) ->
+          let lower_host = String.lowercase_ascii host in
+          if lower_host = "localhost" || lower_host = "::1" || String.ends_with ~suffix:".local" lower_host then
+            false
+          else
+            (match parse_ipv4_host lower_host with
+             | Some (a, b, _, _) ->
+                 not (
+                   a = 10
+                   || a = 127
+                   || (a = 169 && b = 254)
+                   || (a = 172 && b >= 16 && b <= 31)
+                   || (a = 192 && b = 168)
+                 )
+             | None -> true)
+      | _ -> false
+    with _ -> false
+
   let parse_api_error ~headers ~status_code ~response_body =
     let redacted_body = redact_sensitive_text response_body in
     try
@@ -2678,7 +2717,10 @@ module Make (Config : CONFIG) = struct
           | [] -> on_complete (List.rev acc)
           | (url, alt_text) :: rest ->
               (* Fetch media from URL *)
-              Config.Http.get url
+              if not (is_safe_remote_media_url url) then
+                on_result (Error_types.Failure (Error_types.Validation_error [Error_types.Invalid_url "Unsafe media URL"]))
+              else
+                Config.Http.get url
                 (fun media_resp ->
                   if media_resp.status >= 200 && media_resp.status < 300 then
                     let mime_type = 
@@ -2876,7 +2918,10 @@ module Make (Config : CONFIG) = struct
               match urls_with_alt with
               | [] -> on_complete (List.rev acc)
               | (url, alt_text) :: rest ->
-                  Config.Http.get url
+                  if not (is_safe_remote_media_url url) then
+                    on_err "Unsafe media URL"
+                  else
+                    Config.Http.get url
                     (fun media_resp ->
                       if media_resp.status >= 200 && media_resp.status < 300 then
                         let mime_type = 

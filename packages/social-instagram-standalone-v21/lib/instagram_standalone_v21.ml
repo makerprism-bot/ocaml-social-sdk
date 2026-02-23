@@ -620,6 +620,11 @@ module Make (Config : CONFIG) = struct
   let network_error_of_string err =
     OAuth.network_error_of_string err
 
+  let redact_transport_error err =
+    err
+    |> Str.global_replace (Str.regexp "access_token=[^&[:space:]]+") "access_token=[REDACTED]"
+    |> Str.global_replace (Str.regexp "appsecret_proof=[^&[:space:]]+") "appsecret_proof=[REDACTED]"
+
   (** Check if token is expired or expiring soon *)
   let is_token_expired_buffer ~buffer_seconds expires_at_opt =
     match expires_at_opt with
@@ -664,7 +669,7 @@ module Make (Config : CONFIG) = struct
             on_error (Printf.sprintf "Failed to parse refresh response: %s" (Printexc.to_string e))
         else
           on_error (Error_types.error_to_string (api_error_of_response response)))
-      on_error
+      (fun err -> on_error (redact_transport_error err))
 
   (** Ensure valid access token, refreshing if needed *)
   let ensure_valid_token ~account_id on_success on_error =

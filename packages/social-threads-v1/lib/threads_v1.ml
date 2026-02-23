@@ -588,15 +588,20 @@ module Make (Config : CONFIG) = struct
     let retry_status status =
       (status = 429 && should_retry_429) || (status >= 500 && should_retry_5xx)
     in
+    let backoff_seconds attempt =
+      min 2.0 (0.1 *. (2.0 ** float_of_int (max 0 (attempt - 1))))
+    in
     let rec loop attempt =
       Config.Http.get url
         (fun response ->
           if retry_status response.status && attempt < max_attempts then
+            let _ = Unix.select [] [] [] (backoff_seconds attempt) in
             loop (attempt + 1)
           else
             on_success response)
         (fun err ->
           if retry_network && attempt < max_attempts then
+            let _ = Unix.select [] [] [] (backoff_seconds attempt) in
             loop (attempt + 1)
           else
             on_error err)

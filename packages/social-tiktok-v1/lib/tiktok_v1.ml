@@ -256,10 +256,13 @@ module OAuth = struct
         @param on_error Continuation receiving error message
     *)
     let revoke_token ~access_token on_success on_error =
-      let url = Printf.sprintf "%s/oauth/revoke/?access_token=%s" 
-        Metadata.api_base access_token in
-      
-      Http.post ~headers:[] ~body:"" url
+      let url = Printf.sprintf "%s/oauth/revoke/" Metadata.api_base in
+      let headers = [
+        ("Content-Type", "application/x-www-form-urlencoded");
+      ] in
+      let body = Uri.encoded_of_query [ ("access_token", [access_token]) ] in
+
+      Http.post ~headers ~body url
         (fun response ->
           if response.status >= 200 && response.status < 300 then
             on_success ()

@@ -1545,7 +1545,7 @@ module Make (Config : CONFIG) = struct
         Printf.sprintf "%s=%s" k (Uri.pct_encode v)
       ) params |> String.concat "&" in
       
-      let url = google_oauth_base ^ "/auth?" ^ query in
+      let url = OAuth.Metadata.authorization_endpoint ^ "?" ^ query in
       on_success url
     )
   

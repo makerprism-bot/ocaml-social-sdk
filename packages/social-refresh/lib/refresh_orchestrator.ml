@@ -20,6 +20,8 @@ let merge_refreshed_credentials ~(current : Social_core.credentials) ~(refreshed
     token_type;
   }
 
+let is_blank value = String.trim value = ""
+
 let ensure_valid_access_token
     ?(policy = Refresh_types.default_policy)
     ?(map_load_error = fun err -> Error_types.Network_error (Error_types.Connection_failed err))
@@ -47,14 +49,18 @@ let ensure_valid_access_token
        | Refresh_types.Refresh_required ->
             perform_refresh ~credentials
               (fun refreshed_credentials ->
-                 let merged = merge_refreshed_credentials ~current:credentials ~refreshed:refreshed_credentials in
-                persist_credentials ~account_id ~credentials:merged
-                  (fun () ->
-                     update_health ~account_id ~status:"healthy" ~error_message:None
-                       (fun () -> on_success merged)
-                       (fun err -> on_error (map_health_error err)))
-                  (fun err ->
-                     on_error (map_persist_error err)))
+                 if is_blank refreshed_credentials.Social_core.access_token then
+                   fail_health "refresh_failed" "Refresh response missing access token"
+                     (Error_types.Auth_error (Error_types.Refresh_failed "Refresh response missing access token"))
+                 else
+                  let merged = merge_refreshed_credentials ~current:credentials ~refreshed:refreshed_credentials in
+                  persist_credentials ~account_id ~credentials:merged
+                    (fun () ->
+                       update_health ~account_id ~status:"healthy" ~error_message:None
+                         (fun () -> on_success merged)
+                         (fun err -> on_error (map_health_error err)))
+                    (fun err ->
+                       on_error (map_persist_error err)))
              (fun err ->
                 match err with
                 | Error_types.Auth_error Error_types.Missing_credentials ->

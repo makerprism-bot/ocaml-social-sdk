@@ -5,10 +5,17 @@ open Lwt.Syntax
 (** Convert CPS function to Lwt promise *)
 let cps_to_lwt f =
   let promise, resolver = Lwt.wait () in
-  let _ = f
-    (fun result -> Lwt.wakeup resolver (Ok result))
-    (fun error -> Lwt.wakeup resolver (Error error))
+  let resolved = ref false in
+  let resolve_once value =
+    if (not !resolved) && Lwt.is_sleeping promise then begin
+      resolved := true;
+      Lwt.wakeup_later resolver value
+    end
   in
+  let on_success result = resolve_once (Ok result) in
+  let on_error error = resolve_once (Error error) in
+  (try f on_success on_error
+   with e -> on_error (Printexc.to_string e));
   let* result = promise in
   match result with
   | Ok v -> Lwt.return v

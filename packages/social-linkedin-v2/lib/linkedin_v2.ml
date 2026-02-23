@@ -45,6 +45,45 @@ module OAuth = struct
   let normalize_expires_in seconds =
     if seconds < 0 then 0 else if seconds > 31_536_000 then 31_536_000 else seconds
 
+  let parse_ipv4_host host =
+    let octets = String.split_on_char '.' host in
+    match octets with
+    | [a; b; c; d] ->
+        (try
+           let ai = int_of_string a in
+           let bi = int_of_string b in
+           let ci = int_of_string c in
+           let di = int_of_string d in
+           let in_range x = x >= 0 && x <= 255 in
+           if in_range ai && in_range bi && in_range ci && in_range di then
+             Some (ai, bi, ci, di)
+           else
+             None
+         with _ -> None)
+    | _ -> None
+
+  let is_safe_remote_media_url url =
+    try
+      let uri = Uri.of_string (String.trim url) in
+      match Uri.scheme uri, Uri.host uri with
+      | (Some ("http" | "https"), Some host) ->
+          let lower_host = String.lowercase_ascii host in
+          if lower_host = "localhost" || lower_host = "::1" || String.ends_with ~suffix:".local" lower_host then
+            false
+          else
+            (match parse_ipv4_host lower_host with
+             | Some (a, b, _, _) ->
+                 not (
+                   a = 10
+                   || a = 127
+                   || (a = 169 && b = 254)
+                   || (a = 172 && b >= 16 && b <= 31)
+                   || (a = 192 && b = 168)
+                 )
+             | None -> true)
+      | _ -> false
+    with _ -> false
+
   (** Scope definitions for LinkedIn API v2 *)
   module Scopes = struct
     (** Scopes required for read-only operations (profile info) *)
@@ -1091,8 +1130,11 @@ module Make (Config : CONFIG) = struct
   
   (** Upload image or video to LinkedIn with optional alt text *)
   let upload_media ~access_token ~owner_urn ~media_url ~media_type ~alt_text ?(validate_before_upload=false) ~on_validation_error on_success on_error =
-    (* Download media from URL *)
-    Config.Http.get ~headers:[] media_url
+    if not (OAuth.is_safe_remote_media_url media_url) then
+      on_error "Unsafe media URL; only public http(s) URLs are allowed"
+    else
+      (* Download media from URL *)
+      Config.Http.get ~headers:[] media_url
       (fun media_response ->
         if media_response.status >= 200 && media_response.status < 300 then
           let file_size = String.length media_response.body in
@@ -1132,7 +1174,7 @@ module Make (Config : CONFIG) = struct
                     on_error)
                 on_error)
         else
-          on_error (Printf.sprintf "Failed to download media from %s (%d)" media_url media_response.status))
+          on_error (Printf.sprintf "Failed to download media (%d)" media_response.status))
       on_error
   
   (** Extract first URL from text for link preview *)

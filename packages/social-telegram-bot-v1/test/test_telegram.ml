@@ -19,6 +19,9 @@ module Mock_http = struct
   let set_responses responses =
     response_queue := responses
 
+  let set_errors errors =
+    error_queue := errors
+
   let next_response () =
     match !response_queue with
     | [] -> None
@@ -321,6 +324,52 @@ let test_error_mapping_http_429_prefers_payload_retry_after () =
           print_endline "ok: http 429 payload retry_after preferred"
       | _ -> failwith "expected rate-limited error for HTTP 429")
 
+let test_error_mapping_http_429_falls_back_to_header_retry_after () =
+  setup ();
+  Mock_http.set_responses
+    [
+      {
+        status = 429;
+        headers = [ ("Retry-After", "42") ];
+        body = {|{"ok":false,"error_code":429,"description":"too many requests"}|};
+      };
+    ];
+  Telegram.post_single ~account_id:"acct-1" ~text:"hello" ~media_urls:[]
+    (function
+      | Error_types.Failure (Error_types.Rate_limited info) ->
+          assert (info.retry_after_seconds = Some 42);
+          print_endline "ok: http 429 header retry_after fallback"
+      | _ -> failwith "expected rate-limited error for HTTP 429 header fallback")
+
+let test_error_mapping_http_429_invalid_header_retry_after_none () =
+  setup ();
+  Mock_http.set_responses
+    [
+      {
+        status = 429;
+        headers = [ ("Retry-After", "abc") ];
+        body = {|{"ok":false,"error_code":429,"description":"too many requests"}|};
+      };
+    ];
+  Telegram.post_single ~account_id:"acct-1" ~text:"hello" ~media_urls:[]
+    (function
+      | Error_types.Failure (Error_types.Rate_limited info) ->
+          assert (info.retry_after_seconds = None);
+          print_endline "ok: http 429 invalid header retry_after ignored"
+      | _ -> failwith "expected rate-limited error with no retry_after")
+
+let test_invalid_access_token_format_maps_token_invalid () =
+  setup ();
+  Mock_config.credentials_store :=
+    [ ("acct-1", { default_credentials with access_token = "not-a-bot-token" }) ];
+  Telegram.post_single ~account_id:"acct-1" ~text:"hello" ~media_urls:[]
+    (function
+      | Error_types.Failure (Error_types.Auth_error Error_types.Token_invalid) ->
+          let requests = List.rev !Mock_http.requests in
+          assert (requests = []);
+          print_endline "ok: invalid token format rejected before network"
+      | _ -> failwith "expected token_invalid for malformed bot token")
+
 let test_error_mapping_malformed_success_payload () =
   setup ();
   Mock_http.set_responses
@@ -422,6 +471,103 @@ let test_post_thread_rejects_length_mismatch () =
           print_endline "ok: post_thread length mismatch rejected"
       | _ -> failwith "expected validation failure for post_thread input length mismatch")
 
+let test_resolver_rejects_dm_chat_id_resolution () =
+  setup ();
+  Mock_config.chat_ids := [ ("@bad", "123456") ];
+  Telegram.post_single ~account_id:"acct-1" ~text:"hello" ~media_urls:[] ~target:"@bad"
+    (function
+      | Error_types.Failure (Error_types.Validation_error [ Error_types.Invalid_url _ ]) ->
+          let requests = List.rev !Mock_http.requests in
+          assert (requests = []);
+          print_endline "ok: resolver DM chat-id rejected"
+      | _ -> failwith "expected validation failure for resolver DM target")
+
+let test_missing_credentials_fails_without_network_call () =
+  setup ();
+  Mock_config.credentials_store := [];
+  Telegram.post_single ~account_id:"acct-1" ~text:"hello" ~media_urls:[]
+    (function
+      | Error_types.Failure (Error_types.Auth_error Error_types.Missing_credentials) ->
+          let requests = List.rev !Mock_http.requests in
+          assert (requests = []);
+          print_endline "ok: missing credentials short-circuits network"
+      | _ -> failwith "expected missing credentials auth error")
+
+let test_validate_access_rejects_dm_target_without_network () =
+  setup ();
+  Telegram.validate_access ~account_id:"acct-1" ~target:"123456789"
+    (function
+      | Error_types.Failure (Error_types.Validation_error [ Error_types.Invalid_url _ ]) ->
+          let requests = List.rev !Mock_http.requests in
+          assert (requests = []);
+          print_endline "ok: validate_access rejects dm target"
+      | _ -> failwith "expected validate_access dm-target validation error")
+
+let test_validate_access_maps_401_to_token_invalid () =
+  setup ();
+  Mock_http.set_responses
+    [ { status = 401; headers = []; body = {|{"ok":false,"description":"unauthorized"}|} } ];
+  Telegram.validate_access ~account_id:"acct-1" ~target:"@teamchannel"
+    (function
+      | Error_types.Failure (Error_types.Auth_error Error_types.Token_invalid) ->
+          print_endline "ok: validate_access maps 401 token invalid"
+      | _ -> failwith "expected token_invalid from validate_access")
+
+let test_validate_access_payload_error_maps_api_error () =
+  setup ();
+  Mock_http.set_responses
+    [ { status = 200; headers = []; body = {|{"ok":false,"error_code":400,"description":"bad request"}|} } ];
+  Telegram.validate_access ~account_id:"acct-1" ~target:"@teamchannel"
+    (function
+      | Error_types.Failure (Error_types.Api_error api_err) ->
+          assert (api_err.status_code = 200);
+          assert (string_contains api_err.message "bad request");
+          print_endline "ok: validate_access payload error maps api_error"
+      | _ -> failwith "expected api_error for validate_access payload-level failure")
+
+let test_post_single_network_error_redacts_token () =
+  setup ();
+  Mock_http.set_errors [ "network failure for 12345:ABCDEF_secret_token" ];
+  Telegram.post_single ~account_id:"acct-1" ~text:"hello" ~media_urls:[]
+    (function
+      | Error_types.Failure (Error_types.Network_error (Error_types.Connection_failed msg)) ->
+          assert (string_contains msg "[REDACTED_TOKEN]");
+          assert (not (string_contains msg "ABCDEF_secret_token"));
+          print_endline "ok: network error token redacted"
+      | _ -> failwith "expected redacted network error")
+
+let test_health_status_updated_on_successful_post () =
+  setup ();
+  Mock_http.set_responses
+    [ { status = 200; headers = []; body = {|{"ok":true,"result":{"message_id":777}}|} } ];
+  Telegram.post_single ~account_id:"acct-1" ~text:"hello" ~media_urls:[]
+    (function
+      | Error_types.Success _ ->
+          (match !Mock_config.health_updates with
+           | (account_id, status, error_message) :: _ ->
+               assert (account_id = "acct-1");
+               assert (status = "healthy");
+               assert (error_message = None)
+           | [] -> failwith "expected health status update on success");
+          print_endline "ok: health set healthy on success"
+      | _ -> failwith "expected success for health status test")
+
+let test_health_status_updated_on_auth_failure () =
+  setup ();
+  Mock_http.set_responses
+    [ { status = 401; headers = []; body = {|{"ok":false,"description":"unauthorized"}|} } ];
+  Telegram.post_single ~account_id:"acct-1" ~text:"hello" ~media_urls:[]
+    (function
+      | Error_types.Failure (Error_types.Auth_error Error_types.Token_invalid) ->
+          (match !Mock_config.health_updates with
+           | (account_id, status, error_message) :: _ ->
+               assert (account_id = "acct-1");
+               assert (status = "token_invalid");
+               assert (error_message = Some "Telegram token is invalid")
+           | [] -> failwith "expected health status update on auth failure");
+          print_endline "ok: health set token_invalid on auth failure"
+      | _ -> failwith "expected token_invalid auth failure")
+
 let test_validate_access_preflight_get_me () =
   setup ();
   Mock_http.set_responses
@@ -451,11 +597,22 @@ let () =
   test_error_mapping_403_to_insufficient_permissions ();
   test_error_mapping_429_with_retry_after_payload ();
   test_error_mapping_http_429_prefers_payload_retry_after ();
+  test_error_mapping_http_429_falls_back_to_header_retry_after ();
+  test_error_mapping_http_429_invalid_header_retry_after_none ();
+  test_invalid_access_token_format_maps_token_invalid ();
   test_error_mapping_malformed_success_payload ();
   test_error_redaction_no_token_leakage ();
   test_post_thread_success ();
   test_post_thread_partial_success_on_mid_failure ();
   test_post_thread_first_failure_is_failure ();
   test_post_thread_rejects_length_mismatch ();
+  test_resolver_rejects_dm_chat_id_resolution ();
+  test_missing_credentials_fails_without_network_call ();
+  test_validate_access_rejects_dm_target_without_network ();
+  test_validate_access_maps_401_to_token_invalid ();
+  test_validate_access_payload_error_maps_api_error ();
+  test_post_single_network_error_redacts_token ();
+  test_health_status_updated_on_successful_post ();
+  test_health_status_updated_on_auth_failure ();
   test_validate_access_preflight_get_me ();
   print_endline "All Telegram tests passed"

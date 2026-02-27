@@ -228,6 +228,97 @@ let test_orchestrator_health_transitions () =
   assert (List.mem "healthy" !statuses);
   print_endline "✓ orchestrator healthy transition"
 
+let test_orchestrator_retries_transient_errors () =
+  let attempts = ref 0 in
+  let result = ref None in
+  let load_credentials ~account_id:_ on_success _on_error =
+    on_success (make_credentials ~expires_at:(rfc3339_in_seconds 5) ~refresh_token:"ok" "expired")
+  in
+  let perform_refresh ~credentials:_ on_success on_error =
+    attempts := !attempts + 1;
+    if !attempts < 3 then
+      on_error (Error_types.Network_error (Error_types.Connection_failed "temporary"))
+    else
+      on_success (make_credentials ~expires_at:(rfc3339_in_seconds 3600) "new_access")
+  in
+  let persist_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success () in
+  let update_health ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success () in
+  Social_refresh.Orchestrator.ensure_valid_access_token
+    ~account_id:"acct"
+    ~load_credentials
+    ~perform_refresh
+    ~persist_credentials
+    ~update_health
+    ~max_refresh_attempts:3
+    ~should_retry_refresh_error:(function Error_types.Network_error _ -> true | _ -> false)
+    (fun _ -> result := Some (Ok ()))
+    (fun err -> result := Some (Error err));
+  (match !result with
+   | Some (Ok ()) -> ()
+   | _ -> failwith "Expected retry flow to succeed");
+  assert (!attempts = 3);
+  print_endline "✓ orchestrator transient retry policy"
+
+let test_orchestrator_reloads_latest_credentials_before_refresh () =
+  let refreshed_from_token = ref "" in
+  let result = ref None in
+  let load_credentials ~account_id:_ on_success _on_error =
+    on_success (make_credentials ~expires_at:(rfc3339_in_seconds 5) ~refresh_token:"old_rt" "expired")
+  in
+  let reload_credentials ~account_id:_ on_success _on_error =
+    on_success (make_credentials ~expires_at:(rfc3339_in_seconds 5) ~refresh_token:"new_rt" "expired")
+  in
+  let perform_refresh ~credentials on_success _on_error =
+    refreshed_from_token := (match credentials.Social_core.refresh_token with Some t -> t | None -> "");
+    on_success (make_credentials ~expires_at:(rfc3339_in_seconds 3600) "new_access")
+  in
+  let persist_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success () in
+  let update_health ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success () in
+  Social_refresh.Orchestrator.ensure_valid_access_token
+    ~account_id:"acct"
+    ~load_credentials
+    ~reload_credentials
+    ~perform_refresh
+    ~persist_credentials
+    ~update_health
+    (fun _ -> result := Some (Ok ()))
+    (fun err -> result := Some (Error err));
+  (match !result with
+   | Some (Ok ()) -> ()
+   | _ -> failwith "Expected refresh with reloaded credentials");
+  assert (!refreshed_from_token = "new_rt");
+  print_endline "✓ orchestrator reloads latest credentials"
+
+let test_orchestrator_uses_account_lock_hook () =
+  let lock_calls = ref 0 in
+  let result = ref None in
+  let with_account_lock ~account_id:_ run =
+    lock_calls := !lock_calls + 1;
+    run ()
+  in
+  let load_credentials ~account_id:_ on_success _on_error =
+    on_success (make_credentials ~expires_at:(rfc3339_in_seconds 3600) "valid_access")
+  in
+  let perform_refresh ~credentials:_ _on_success on_error =
+    on_error (Error_types.Internal_error "should not refresh")
+  in
+  let persist_credentials ~account_id:_ ~credentials:_ on_success _on_error = on_success () in
+  let update_health ~account_id:_ ~status:_ ~error_message:_ on_success _on_error = on_success () in
+  Social_refresh.Orchestrator.ensure_valid_access_token
+    ~account_id:"acct"
+    ~with_account_lock
+    ~load_credentials
+    ~perform_refresh
+    ~persist_credentials
+    ~update_health
+    (fun _ -> result := Some (Ok ()))
+    (fun err -> result := Some (Error err));
+  (match !result with
+   | Some (Ok ()) -> ()
+   | _ -> failwith "Expected success via lock wrapper");
+  assert (!lock_calls = 1);
+  print_endline "✓ orchestrator account lock hook"
+
 let () =
   test_refresh_time_boundaries ();
   test_refresh_time_malformed_timestamp ();
@@ -238,4 +329,7 @@ let () =
   test_orchestrator_preserves_expires_at_and_token_type_when_blank ();
   test_orchestrator_failure_keeps_root_error_when_health_update_fails ();
   test_orchestrator_health_transitions ();
+  test_orchestrator_retries_transient_errors ();
+  test_orchestrator_reloads_latest_credentials_before_refresh ();
+  test_orchestrator_uses_account_lock_hook ();
   print_endline "social-refresh tests passed"

@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `refresh_time` RFC3339 and refresh-window helpers
 - `refresh_decision` engine (`Skip` / `Refresh_required`)
 - `refresh_orchestrator` for load -> decide -> refresh -> persist -> health updates
+- Production hardening hooks in `refresh_orchestrator`:
+  `with_account_lock`, `reload_credentials`, refresh retry controls,
+  custom refresh-error to health mapping, and refresh telemetry callbacks
 - Package unit tests for malformed timestamps, boundary windows, refresh failure mapping,
   missing refresh token handling, refresh token preservation, and health transitions
+- Additional unit tests for retry behavior, reload-before-refresh, and lock hook execution
 - Pilot provider integrations in `social-twitter-v2` and `social-threads-v1`

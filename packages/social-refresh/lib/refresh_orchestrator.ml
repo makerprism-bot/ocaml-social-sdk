@@ -27,6 +27,20 @@ let ensure_valid_access_token
     ?(map_load_error = fun err -> Error_types.Network_error (Error_types.Connection_failed err))
     ?(map_persist_error = fun err -> Error_types.Network_error (Error_types.Connection_failed err))
     ?(map_health_error = fun err -> Error_types.Network_error (Error_types.Connection_failed err))
+    ?reload_credentials
+    ?(with_account_lock = fun ~account_id:_ run -> run ())
+    ?(max_refresh_attempts = 1)
+    ?(should_retry_refresh_error = fun _ -> false)
+    ?(sleep_before_retry = fun ~attempt:_ continue -> continue ())
+    ?(map_refresh_error_to_health = fun err ->
+      match err with
+      | Error_types.Auth_error Error_types.Missing_credentials ->
+          ("token_expired", "No refresh token available")
+      | _ ->
+          ("refresh_failed", Error_types.error_to_string err))
+    ?(on_refresh_attempt = fun ~attempt:_ -> ())
+    ?(on_refresh_success = fun ~attempt:_ _credentials -> ())
+    ?(on_refresh_failure = fun ~attempt:_ _error -> ())
     ~account_id
     ~load_credentials
     ~perform_refresh
@@ -39,33 +53,59 @@ let ensure_valid_access_token
       (fun () -> on_error mapped_error)
       (fun _ -> on_error mapped_error)
   in
-  load_credentials ~account_id
-    (fun credentials ->
-       match Refresh_decision.decide ~policy credentials with
-       | Refresh_types.Skip ->
-            update_health ~account_id ~status:"healthy" ~error_message:None
-              (fun () -> on_success credentials)
-              (fun err -> on_error (map_health_error err))
-       | Refresh_types.Refresh_required ->
-            perform_refresh ~credentials
-              (fun refreshed_credentials ->
-                 if is_blank refreshed_credentials.Social_core.access_token then
-                   fail_health "refresh_failed" "Refresh response missing access token"
-                     (Error_types.Auth_error (Error_types.Refresh_failed "Refresh response missing access token"))
-                 else
-                  let merged = merge_refreshed_credentials ~current:credentials ~refreshed:refreshed_credentials in
-                  persist_credentials ~account_id ~credentials:merged
+  let refresh_with_retry ~current_credentials =
+    let attempts = if max_refresh_attempts < 1 then 1 else max_refresh_attempts in
+    let rec loop attempt credentials =
+      on_refresh_attempt ~attempt;
+      perform_refresh ~credentials
+        (fun refreshed_credentials ->
+           if is_blank refreshed_credentials.Social_core.access_token then
+             fail_health "refresh_failed" "Refresh response missing access token"
+               (Error_types.Auth_error (Error_types.Refresh_failed "Refresh response missing access token"))
+           else
+             let merged = merge_refreshed_credentials ~current:credentials ~refreshed:refreshed_credentials in
+             persist_credentials ~account_id ~credentials:merged
+               (fun () ->
+                  update_health ~account_id ~status:"healthy" ~error_message:None
                     (fun () ->
-                       update_health ~account_id ~status:"healthy" ~error_message:None
-                         (fun () -> on_success merged)
-                         (fun err -> on_error (map_health_error err)))
-                    (fun err ->
-                       on_error (map_persist_error err)))
-             (fun err ->
-                match err with
-                | Error_types.Auth_error Error_types.Missing_credentials ->
-                    fail_health "token_expired" "No refresh token available" err
-                | _ ->
-                    fail_health "refresh_failed" (Error_types.error_to_string err) err))
-    (fun err ->
-       on_error (map_load_error err))
+                      on_refresh_success ~attempt merged;
+                      on_success merged)
+                    (fun err -> on_error (map_health_error err)))
+               (fun err ->
+                  on_error (map_persist_error err)))
+        (fun err ->
+           on_refresh_failure ~attempt err;
+           if attempt < attempts && should_retry_refresh_error err then
+             sleep_before_retry ~attempt (fun () -> loop (attempt + 1) credentials)
+           else
+             let status, message = map_refresh_error_to_health err in
+             fail_health status message err)
+    in
+    loop 1 current_credentials
+  in
+  let run_with_loaded_credentials credentials =
+    match Refresh_decision.decide ~policy credentials with
+    | Refresh_types.Skip ->
+        update_health ~account_id ~status:"healthy" ~error_message:None
+          (fun () -> on_success credentials)
+          (fun err -> on_error (map_health_error err))
+    | Refresh_types.Refresh_required ->
+        (match reload_credentials with
+         | None -> refresh_with_retry ~current_credentials:credentials
+         | Some reload ->
+             reload ~account_id
+               (fun latest_credentials ->
+                  match Refresh_decision.decide ~policy latest_credentials with
+                  | Refresh_types.Skip ->
+                      update_health ~account_id ~status:"healthy" ~error_message:None
+                        (fun () -> on_success latest_credentials)
+                        (fun err -> on_error (map_health_error err))
+                  | Refresh_types.Refresh_required ->
+                      refresh_with_retry ~current_credentials:latest_credentials)
+               (fun err -> on_error (map_load_error err)))
+  in
+  with_account_lock ~account_id (fun () ->
+    load_credentials ~account_id
+      run_with_loaded_credentials
+      (fun err ->
+         on_error (map_load_error err)))

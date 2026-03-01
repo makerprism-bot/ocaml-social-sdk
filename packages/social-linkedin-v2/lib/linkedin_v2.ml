@@ -1475,10 +1475,11 @@ module Make (Config : CONFIG) = struct
             "profile";
             "email";
             "w_member_social";
+            "r_member_social";
             "r_organization_admin";
             "w_organization_social";
           ]
-        else ["openid"; "profile"; "email"; "w_member_social"]
+        else ["openid"; "profile"; "email"; "w_member_social"; "r_member_social"]
       in
       let scope_str = String.concat " " scopes in
       

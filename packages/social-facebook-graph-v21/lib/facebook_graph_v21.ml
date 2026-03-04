@@ -887,7 +887,68 @@ module Make (Config : CONFIG) = struct
           (fun page_id -> on_success page_id access_token)
           (fun err -> on_error (Error_types.Internal_error err)))
       on_error
-  
+
+  (** Get published posts from a Facebook Page's feed.
+
+      Fetches posts using cursor-based pagination via the Graph API
+      /{page_id}/feed endpoint. Returns raw JSON with post data and
+      pagination cursors.
+
+      Fields returned: id, message, created_time, full_picture,
+      permalink_url, type, attachments.
+
+      @param account_id Social account ID for credential resolution
+      @param limit Number of posts per page (default 25, max 100)
+      @param after Pagination cursor from previous response
+      @param on_result Continuation receiving Ok(json) or Error(error)
+  *)
+  let get_page_posts ~account_id ?(limit=25) ?(after=None) () on_result =
+    ensure_valid_token ~account_id
+      (fun access_token ->
+        Config.get_page_id ~account_id
+          (fun page_id ->
+            let fields = "id,message,created_time,full_picture,permalink_url,type,attachments{type,media_type,url,media,subattachments}" in
+            let params = [
+              ("fields", [fields]);
+              ("limit", [string_of_int limit]);
+            ] @ (match after with Some c -> [("after", [c])] | None -> []) in
+            let query = Uri.encoded_of_query params in
+            let url = Printf.sprintf "%s/%s/feed?%s" graph_api_base page_id query in
+            let proof = compute_app_secret_proof ~access_token in
+            let auth_params = match proof with
+              | Some p -> [("appsecret_proof", [p])]
+              | None -> []
+            in
+            let final_url =
+              if List.length auth_params > 0 then
+                url ^ "&" ^ Uri.encoded_of_query auth_params
+              else url
+            in
+            let headers = [
+              ("Authorization", Printf.sprintf "Bearer %s" access_token);
+            ] in
+            Config.Http.get ~headers final_url
+              (fun response ->
+                update_rate_limits response;
+                if response.status >= 200 && response.status < 300 then
+                  (try
+                    let json = Yojson.Basic.from_string response.body in
+                    on_result (Ok json)
+                  with e ->
+                    on_result (Error (Error_types.Internal_error
+                      (Printf.sprintf "Failed to parse page posts response: %s"
+                        (Printexc.to_string e)))))
+                else
+                  on_result (Error (parse_api_error_with_permissions
+                    ~required_permissions:["pages_read_engagement"]
+                    ~status_code:response.status
+                    ~response_body:response.body)))
+              (fun err ->
+                on_result (Error (Error_types.Internal_error
+                  (redact_sensitive_text_if_needed err)))))
+          (fun err -> on_result (Error (Error_types.Internal_error err))))
+      (fun err -> on_result (Error err))
+
   (** Upload photo to Facebook Page with optional alt text *)
   let upload_photo ~page_id ~page_access_token ~image_url ~alt_text ?(validate_before_upload=false) on_result =
     (* Download image first *)

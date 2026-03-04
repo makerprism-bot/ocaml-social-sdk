@@ -923,7 +923,8 @@ let test_get_user_media () =
           "media_type": "IMAGE",
           "media_url": "https://example.com/img1.jpg",
           "thumbnail_url": null,
-          "permalink": "https://www.instagram.com/p/abc123/"
+          "permalink": "https://www.instagram.com/p/abc123/",
+          "media_product_type": "FEED"
         },
         {
           "id": "media_2",
@@ -932,9 +933,16 @@ let test_get_user_media () =
           "media_type": "VIDEO",
           "media_url": "https://example.com/vid1.mp4",
           "thumbnail_url": "https://example.com/thumb1.jpg",
-          "permalink": "https://www.instagram.com/p/def456/"
+          "permalink": "https://www.instagram.com/p/def456/",
+          "media_product_type": "REELS"
         }
-      ]
+      ],
+      "paging": {
+        "cursors": {
+          "before": "before_cursor",
+          "after": "next_page_cursor"
+        }
+      }
     }|};
     headers = [];
   };
@@ -943,24 +951,29 @@ let test_get_user_media () =
     ~ig_user_id:"ig_user_123"
     ~access_token:"tok+en/=="
     (handle_result
-      (fun (items : Instagram.media_item list) ->
+      (fun ((items, next_cursor) : Instagram.media_item list * string option) ->
         assert (List.length items = 2);
         let first = List.nth items 0 in
         assert (first.id = "media_1");
         assert (first.caption = Some "First post");
         assert (first.media_type = Some "IMAGE");
         assert (first.permalink = Some "https://www.instagram.com/p/abc123/");
+        assert (first.media_product_type = Some "FEED");
         let second = List.nth items 1 in
         assert (second.id = "media_2");
         assert (second.caption = None);
         assert (second.media_type = Some "VIDEO");
         assert (second.thumbnail_url = Some "https://example.com/thumb1.jpg");
+        assert (second.media_product_type = Some "REELS");
+        (* Verify pagination cursor is returned *)
+        assert (next_cursor = Some "next_page_cursor");
         (* Verify request uses graph.instagram.com *)
         let requests = !Mock_http.requests in
         let has_contract = List.exists (fun (meth, url, _, _) ->
           meth = "GET"
           && string_contains url "graph.instagram.com"
           && string_contains url "/ig_user_123/media"
+          && string_contains url "media_product_type"
         ) requests in
         assert has_contract;
         print_endline "PASS Get user media")
@@ -981,7 +994,8 @@ let test_get_user_media_with_limit () =
     ~access_token:"test_token"
     ~limit:5
     (handle_result
-      (fun _items ->
+      (fun (_items, next_cursor) ->
+        assert (next_cursor = None);
         let requests = !Mock_http.requests in
         let has_limit = List.exists (fun (_, url, _, _) ->
           query_param url "limit" = Some "5"
@@ -989,6 +1003,30 @@ let test_get_user_media_with_limit () =
         assert has_limit;
         print_endline "PASS Get user media with limit")
       (fun err -> failwith ("Get user media with limit failed: " ^ err)))
+
+(** Test: Get user media with pagination cursor *)
+let test_get_user_media_with_pagination () =
+  Mock_config.reset ();
+
+  Mock_http.set_response {
+    status = 200;
+    body = {|{"data": [{"id": "media_3"}]}|};
+    headers = [];
+  };
+
+  Instagram.get_user_media
+    ~ig_user_id:"ig_user_123"
+    ~access_token:"test_token"
+    ~after:"cursor_abc"
+    (handle_result
+      (fun (_items, _next_cursor) ->
+        let requests = !Mock_http.requests in
+        let has_after = List.exists (fun (_, url, _, _) ->
+          query_param url "after" = Some "cursor_abc"
+        ) requests in
+        assert has_after;
+        print_endline "PASS Get user media with pagination")
+      (fun err -> failwith ("Get user media with pagination failed: " ^ err)))
 
 (** {1 Media Deletion Tests (H3)} *)
 
@@ -1286,6 +1324,7 @@ let () =
   print_endline "\n--- Media Listing Tests (H2) ---";
   test_get_user_media ();
   test_get_user_media_with_limit ();
+  test_get_user_media_with_pagination ();
 
   print_endline "\n--- Media Deletion Tests (H3) ---";
   test_delete_media ();

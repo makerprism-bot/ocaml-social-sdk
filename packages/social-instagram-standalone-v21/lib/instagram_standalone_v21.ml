@@ -1536,22 +1536,30 @@ module Make (Config : CONFIG) = struct
     media_url : string option;
     thumbnail_url : string option;
     permalink : string option;
+    media_product_type : string option;
   }
 
-  (** List media for an Instagram user
+  (** List media for an Instagram user with cursor-based pagination.
+
+      Returns a tuple of (media items, next cursor). The next cursor is [None]
+      when there are no more pages.
 
       @param ig_user_id Instagram Business Account ID
       @param access_token Valid access token
-      @param limit Maximum number of items to return (optional, API default applies)
-      @param on_result Continuation receiving api_result with list of media items
+      @param limit Maximum number of items per page (optional, API default applies)
+      @param after Cursor for the next page (from a previous call's second tuple element)
+      @param on_result Continuation receiving api_result with (media_item list * string option)
   *)
-  let get_user_media ~ig_user_id ~access_token ?limit on_result =
+  let get_user_media ~ig_user_id ~access_token ?limit ?after on_result =
     let params = [
-      ("fields", ["id,caption,timestamp,media_type,media_url,thumbnail_url,permalink"]);
+      ("fields", ["id,caption,timestamp,media_type,media_url,thumbnail_url,permalink,media_product_type"]);
       ("access_token", [access_token]);
     ] @
     (match limit with
      | Some n -> [("limit", [string_of_int n])]
+     | None -> []) @
+    (match after with
+     | Some c -> [("after", [c])]
      | None -> []) @
     (match compute_app_secret_proof ~access_token with
      | Some proof -> [("appsecret_proof", [proof])]
@@ -1582,9 +1590,14 @@ module Make (Config : CONFIG) = struct
                 media_url = item |> member "media_url" |> to_string_option;
                 thumbnail_url = item |> member "thumbnail_url" |> to_string_option;
                 permalink = item |> member "permalink" |> to_string_option;
+                media_product_type = item |> member "media_product_type" |> to_string_option;
               }
             ) data in
-            on_result (Ok items)
+            let next_cursor =
+              try Some (json |> member "paging" |> member "cursors" |> member "after" |> to_string)
+              with _ -> None
+            in
+            on_result (Ok (items, next_cursor))
           with e ->
             on_result (Error (Error_types.Internal_error (Printf.sprintf "Failed to parse media listing response: %s" (Printexc.to_string e))))
         else
@@ -1594,15 +1607,16 @@ module Make (Config : CONFIG) = struct
   (** List media for an account (auto-refreshes token)
 
       @param account_id Internal account identifier
-      @param limit Maximum number of items to return (optional)
-      @param on_result Continuation receiving api_result with list of media items
+      @param limit Maximum number of items per page (optional)
+      @param after Cursor for the next page (optional)
+      @param on_result Continuation receiving api_result with (media_item list * string option)
   *)
-  let get_user_media_for_account ~account_id ?limit on_result =
+  let get_user_media_for_account ~account_id ?limit ?after on_result =
     ensure_valid_token ~account_id
       (fun access_token ->
         Config.get_ig_user_id ~account_id
           (fun ig_user_id ->
-            get_user_media ~ig_user_id ~access_token ?limit on_result)
+            get_user_media ~ig_user_id ~access_token ?limit ?after on_result)
           (fun err ->
             on_result (Error (Error_types.Network_error (Error_types.Connection_failed err)))))
       (fun err -> on_result (Error err))

@@ -38,7 +38,7 @@ hooks to make delegation safer in production environments:
 - `social-linkedin-v2` (60d access token, 7d refresh window; Partner Program only)
 - `social-instagram-graph-v21` (60d access token, 7d refresh window)
 - `social-instagram-standalone-v21` (60d access token, 7d refresh window)
-- `social-threads-v1` (configurable refresh window)
+- `social-threads-v1` (60d access token, configurable refresh window)
 
 ## License
 
